@@ -118,12 +118,34 @@ pub struct Conv {
     pub stride: (usize, usize),
     pub pad: (usize, usize),
     pub dil: (usize, usize),
+    /// For stride-1 convolutions along W only (kh = 1, kw > 1): the weights regrouped tap-major,
+    /// (KW * Cout x Cin), so one GEMM computes every tap and the taps are then shift-added -
+    /// instead of materialising a KW-times larger im2col buffer.
+    w_taps: Option<Vec<f32>>,
 }
 
 /// Upper bound on the im2col buffer (floats); larger convolutions are done in column blocks.
 const COL_BLOCK: usize = 1 << 24;
 
 impl Conv {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(w: Vec<f32>, b: Vec<f32>, cin: usize, cout: usize, k: (usize, usize), stride: (usize, usize), pad: (usize, usize), dil: (usize, usize)) -> Self {
+        assert_eq!(w.len(), cout * cin * k.0 * k.1);
+        let w_taps = (k.0 == 1 && k.1 > 1 && stride == (1, 1) && pad.0 == 0).then(|| {
+            let kw = k.1;
+            let mut t = vec![0.0f32; w.len()];
+            for kj in 0..kw {
+                for co in 0..cout {
+                    for ci in 0..cin {
+                        t[(kj * cout + co) * cin + ci] = w[(co * cin + ci) * kw + kj];
+                    }
+                }
+            }
+            t
+        });
+        Conv { w, b, cin, cout, k, stride, pad, dil, w_taps }
+    }
+
     pub fn out_size(&self, h: usize, w: usize) -> (usize, usize) {
         let ho = (h + 2 * self.pad.0 - self.dil.0 * (self.k.0 - 1) - 1) / self.stride.0 + 1;
         let wo = (w + 2 * self.pad.1 - self.dil.1 * (self.k.1 - 1) - 1) / self.stride.1 + 1;
@@ -140,7 +162,34 @@ impl Conv {
         // Bias first, then accumulate the GEMM into it.
         out.par_chunks_mut(n).zip(self.b.par_iter()).for_each(|(row, &b)| row.fill(b));
         let pointwise = self.k == (1, 1) && self.stride == (1, 1) && self.pad == (0, 0);
-        if pointwise {
+        if let Some(wt) = &self.w_taps {
+            // y[kj] = W_kj x for all taps at once, then out[co, h, o] += y[kj, co, h, o + kj*d - p].
+            let kw = self.k.1;
+            let hw = h * w;
+            let mut y = vec![0.0f32; kw * self.cout * hw];
+            sgemm(kw * self.cout, hw, cin, wt, cin, 1, &x.data, hw, 1, &mut y, hw, false);
+            let (d, p) = (self.dil.1 as isize, self.pad.1 as isize);
+            let cout = self.cout;
+            out.par_chunks_mut(n).enumerate().for_each(|(co, orow)| {
+                for kj in 0..kw {
+                    let yp = &y[(kj * cout + co) * hw..(kj * cout + co + 1) * hw];
+                    let shift = kj as isize * d - p;
+                    for hi in 0..h {
+                        let src = &yp[hi * w..(hi + 1) * w];
+                        let dst = &mut orow[hi * wo..(hi + 1) * wo];
+                        // dst[o] += src[o + shift] where 0 <= o + shift < w
+                        let lo = (-shift).max(0) as usize;
+                        let hi_ = ((w as isize - shift).min(wo as isize)).max(0) as usize;
+                        if lo < hi_ {
+                            let s0 = (lo as isize + shift) as usize;
+                            for (o, v) in dst[lo..hi_].iter_mut().zip(&src[s0..s0 + (hi_ - lo)]) {
+                                *o += v;
+                            }
+                        }
+                    }
+                }
+            });
+        } else if pointwise {
             sgemm(self.cout, n, kk, &self.w, kk, 1, &x.data, n, 1, &mut out, n, true);
         } else {
             let block = (COL_BLOCK / kk).max(wo).min(n);
@@ -251,7 +300,7 @@ impl ConvTr {
     }
 }
 
-/// Mean and (biased) variance of a slice, f64 two-pass.
+/// Mean and (biased) variance of a slice, f64 two-pass (for short rows).
 fn stats(xs: impl Iterator<Item = f32> + Clone) -> (f64, f64) {
     let mut n = 0usize;
     let mut s = 0f64;
@@ -268,36 +317,127 @@ fn stats(xs: impl Iterator<Item = f32> + Clone) -> (f64, f64) {
     (mean, v / n as f64)
 }
 
+/// Sum in f64 with 8 independent accumulators (vectorises).
+fn sum64(x: &[f32]) -> f64 {
+    let mut acc = [0f64; 8];
+    let chunks = x.chunks_exact(8);
+    let rest = chunks.remainder();
+    for c in chunks {
+        for i in 0..8 {
+            acc[i] += c[i] as f64;
+        }
+    }
+    acc.iter().sum::<f64>() + rest.iter().map(|&v| v as f64).sum::<f64>()
+}
+
+/// Sum of squared deviations from `m`, in f64 (vectorises).
+fn sqdev64(x: &[f32], m: f64) -> f64 {
+    let mut acc = [0f64; 8];
+    let chunks = x.chunks_exact(8);
+    let rest = chunks.remainder();
+    for c in chunks {
+        for i in 0..8 {
+            let d = c[i] as f64 - m;
+            acc[i] += d * d;
+        }
+    }
+    acc.iter().sum::<f64>() + rest.iter().map(|&v| (v as f64 - m) * (v as f64 - m)).sum::<f64>()
+}
+
+/// Mean and biased variance of a large slice, f64 two-pass, in parallel.
+fn big_stats(x: &[f32]) -> (f64, f64) {
+    const B: usize = 1 << 16;
+    let n = x.len() as f64;
+    let mean = x.par_chunks(B).map(sum64).sum::<f64>() / n;
+    let var = x.par_chunks(B).map(|c| sqdev64(c, mean)).sum::<f64>() / n;
+    (mean, var)
+}
+
 /// Mean and unbiased (N-1) standard deviation, as torch.mean / torch.std.
 pub fn mean_std(x: &[f32]) -> (f32, f32) {
-    let (m, v) = stats(x.iter().copied());
+    let (m, v) = big_stats(x);
     let n = x.len() as f64;
     (m as f32, (v * n / (n - 1.0)).sqrt() as f32)
 }
 
-/// GroupNorm with ONE group over a (C, S, T) tensor where each index s of the middle axis is a
-/// separate sample (PyTorch's batch): statistics over (C, T) per s, then per-channel affine.
-/// (S = 1 for an ordinary (C, T) input.) eps = 1e-5.
-pub fn group_norm1(x: &mut Tensor, gamma: &[f32], beta: &[f32]) {
+/// Per-sample (mean, 1/sqrt(var + 1e-5)) for GroupNorm with ONE group over a (C, S, T) tensor
+/// where each index s of the middle axis is a separate sample (PyTorch's batch): statistics over
+/// (C, T) for each s. (S = 1 for an ordinary (C, T) input.)
+pub fn row_stats(x: &Tensor) -> Vec<(f32, f32)> {
     let (c, s, t) = (x.shape[0], x.shape[1], x.shape[2]);
-    let st: Vec<(f32, f32)> = (0..s)
-        .into_par_iter()
-        .map(|si| {
-            let it = (0..c).flat_map(|ci| x.data[(ci * s + si) * t..(ci * s + si + 1) * t].iter().copied());
-            let (m, v) = stats(it);
-            (m as f32, (1.0 / (v + 1e-5).sqrt()) as f32)
-        })
+    let n = (c * t) as f64;
+    let sums: Vec<Vec<f64>> = x.data.par_chunks(s * t).map(|p| p.chunks(t).map(sum64).collect()).collect();
+    let means: Vec<f64> = (0..s).map(|si| sums.iter().map(|v| v[si]).sum::<f64>() / n).collect();
+    let sq: Vec<Vec<f64>> = x
+        .data
+        .par_chunks(s * t)
+        .map(|p| p.chunks(t).zip(&means).map(|(r, &m)| sqdev64(r, m)).collect())
         .collect();
+    (0..s)
+        .map(|si| {
+            let v = sq.iter().map(|q| q[si]).sum::<f64>() / n;
+            (means[si] as f32, (1.0 / (v + 1e-5).sqrt()) as f32)
+        })
+        .collect()
+}
+
+/// GroupNorm(1) per sample of a (C, S, T) tensor (see `row_stats`), then `f`, in place.
+pub fn group_norm1_then(x: &mut Tensor, gamma: &[f32], beta: &[f32], f: impl Fn(f32) -> f32 + Sync) {
+    let st = row_stats(x);
+    let (s, t) = (x.shape[1], x.shape[2]);
     x.data.par_chunks_mut(s * t).enumerate().for_each(|(ci, plane)| {
-        for (si, row) in plane.chunks_mut(t).enumerate() {
-            let (m, r) = st[si];
+        for (row, &(m, r)) in plane.chunks_mut(t).zip(&st) {
             let scale = r * gamma[ci];
             let shift = beta[ci] - m * scale;
             for v in row {
-                *v = *v * scale + shift;
+                *v = f(*v * scale + shift);
             }
         }
     });
+}
+
+/// GroupNorm(1) per sample of z (2C, S, T), GLU over channels, LayerScale, residual add:
+/// x += ls * (a * sigmoid(b)) with (a, b) the normalised halves of z - the tail of a DConv branch.
+/// If `delta` is given, the added values are also written there.
+pub fn group_norm1_glu_add(z: &Tensor, gamma: &[f32], beta: &[f32], ls: &[f32], x: &mut Tensor, mut delta: Option<&mut Tensor>) {
+    let st = row_stats(z);
+    let (c, s, t) = (x.shape[0], x.shape[1], x.shape[2]);
+    assert_eq!(z.shape, [2 * c, s, t]);
+    let plane = s * t;
+    let one = |ci: usize, xp: &mut [f32], mut dp: Option<&mut [f32]>| {
+        let za = &z.data[ci * plane..(ci + 1) * plane];
+        let zb = &z.data[(c + ci) * plane..(c + ci + 1) * plane];
+        for (si, &(m, r)) in st.iter().enumerate() {
+            let (sa, sb) = (r * gamma[ci], r * gamma[c + ci]);
+            let (ha, hb) = (beta[ci] - m * sa, beta[c + ci] - m * sb);
+            let rg = si * t..(si + 1) * t;
+            let (xa, ya, yb) = (&mut xp[rg.clone()], &za[rg.clone()], &zb[rg.clone()]);
+            match dp.as_deref_mut() {
+                None => {
+                    for i in 0..t {
+                        let d = ls[ci] * ((ya[i] * sa + ha) * sigmoid(yb[i] * sb + hb));
+                        xa[i] += d;
+                    }
+                }
+                Some(dp) => {
+                    for i in 0..t {
+                        let d = ls[ci] * ((ya[i] * sa + ha) * sigmoid(yb[i] * sb + hb));
+                        dp[si * t + i] = d;
+                        xa[i] += d;
+                    }
+                }
+            }
+        }
+    };
+    match delta.as_deref_mut() {
+        None => x.data.par_chunks_mut(plane).enumerate().for_each(|(ci, xp)| one(ci, xp, None)),
+        Some(d) => x
+            .data
+            .par_chunks_mut(plane)
+            .zip(d.data.par_chunks_mut(plane))
+            .enumerate()
+            .for_each(|(ci, (xp, dp))| one(ci, xp, Some(dp))),
+    }
 }
 
 /// LayerNorm over the last axis of (N, C). eps = 1e-5.
@@ -318,7 +458,7 @@ pub fn layer_norm(x: &Tensor, gamma: &[f32], beta: &[f32]) -> Tensor {
 /// one mean / variance for everything, then per-channel affine.
 pub fn group_norm_tokens(x: &mut Tensor, gamma: &[f32], beta: &[f32]) {
     let c = *x.shape.last().unwrap();
-    let (m, v) = stats(x.data.iter().copied());
+    let (m, v) = big_stats(&x.data);
     let r = (1.0 / (v + 1e-5).sqrt()) as f32;
     let m = m as f32;
     x.data.par_chunks_mut(c).for_each(|row| {

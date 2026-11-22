@@ -8,7 +8,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::ops::{gelu, glu, group_norm1, mean_std, Conv, ConvTr};
+use crate::ops::{gelu, gelu1, glu, group_norm1_glu_add, group_norm1_then, mean_std, Conv, ConvTr};
 use crate::stft::Stft;
 use crate::tensor::Tensor;
 use crate::transformer::CrossTransformer;
@@ -20,7 +20,7 @@ fn conv(st: &mut SafeTensors, p: &str, k: (usize, usize), stride: (usize, usize)
     let b = st.take(&format!("{p}.bias")).data;
     let (cout, cin) = (w.shape[0], w.shape[1]);
     assert_eq!(w.numel(), cout * cin * k.0 * k.1, "{p}: kernel shape {:?}", w.shape);
-    Conv { w: w.data, b, cin, cout, k, stride, pad, dil }
+    Conv::new(w.data, b, cin, cout, k, stride, pad, dil)
 }
 
 fn conv_tr(st: &mut SafeTensors, p: &str, k: (usize, usize), stride: (usize, usize)) -> ConvTr {
@@ -69,17 +69,16 @@ impl DConv {
     fn forward(&self, mut x: Tensor, tr: &mut Tracer, p: &str) -> Tensor {
         for (d, l) in self.layers.iter().enumerate() {
             let mut y = l.conv1.forward(&x);
-            group_norm1(&mut y, &l.gn1.0, &l.gn1.1);
-            gelu(&mut y.data);
-            let mut y = l.conv2.forward(&y);
-            group_norm1(&mut y, &l.gn2.0, &l.gn2.1);
-            let mut y = glu(&y);
-            let plane = y.numel() / y.shape[0];
-            y.data.par_chunks_mut(plane).zip(&l.scale).for_each(|(r, &s)| r.iter_mut().for_each(|v| *v *= s));
+            group_norm1_then(&mut y, &l.gn1.0, &l.gn1.1, gelu1);
+            let y = l.conv2.forward(&y);
+            // x = x + LayerScale(GLU(GroupNorm(y))), fused into one pass.
             if tr.on() {
-                tr.emit(&format!("{p}.layers.{d}"), &torch_dconv_layout(&y));
+                let mut delta = Tensor::zeros(&x.shape);
+                group_norm1_glu_add(&y, &l.gn2.0, &l.gn2.1, &l.scale, &mut x, Some(&mut delta));
+                tr.emit(&format!("{p}.layers.{d}"), &torch_dconv_layout(&delta));
+            } else {
+                group_norm1_glu_add(&y, &l.gn2.0, &l.gn2.1, &l.scale, &mut x, None);
             }
-            x.data.par_iter_mut().zip(&y.data).for_each(|(a, b)| *a += b);
         }
         if tr.on() {
             tr.emit(p, &torch_dconv_layout(&x));
