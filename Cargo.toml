@@ -3,13 +3,20 @@ name = "htdemucs"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "htdemucs-rs"
+path = "src/main.rs"
+
 [dependencies]
+flacenc = "0.5.1"
 gemm = { version = "0.19", default-features = false, features = ["std", "rayon"] }
 libm = "0.2.16"
 rayon = "1.12.0"
 realfft = "3.5.1"
+rubato = "5.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+symphonia = { version = "0.6.1", default-features = false, features = ["aac", "isomp4", "mp3", "flac", "wav", "pcm"] }
 
 [features]
 # Use Apple's Accelerate BLAS for matrix products on macOS (Apple silicon AMX units).

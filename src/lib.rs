@@ -1,9 +1,12 @@
 //! htdemucs: Meta's HTDemucs (Demucs v4) music source separation, reimplemented in Rust on the
 //! official pretrained weights. See README.md.
 
+pub mod apply;
+pub mod audio;
 pub mod config;
 pub mod model;
 pub mod ops;
+pub mod pyrandom;
 pub mod stft;
 pub mod tensor;
 pub mod transformer;
