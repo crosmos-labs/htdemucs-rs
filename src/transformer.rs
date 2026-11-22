@@ -156,6 +156,21 @@ impl CrossTransformer {
         }
     }
 
+    pub fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn is_cross(&self, i: usize) -> bool {
+        self.layers[i].cross
+    }
+
+    /// Runs layer `i` of one branch alone on (N, C) tokens (for the parity test's isolated
+    /// per-layer checks); `kv` is the other branch's tokens for a cross layer.
+    pub fn layer(&self, time_branch: bool, i: usize, x: &Tensor, kv: Option<&Tensor>, tr: &mut Tracer) -> Tensor {
+        let (l, p) = if time_branch { (&self.layers_t[i], "layers_t") } else { (&self.layers[i], "layers") };
+        l.forward(x, kv, tr, &format!("crosstransformer.{p}.{i}"))
+    }
+
     /// x: (C, Fr, T1) spectral features; xt: (C, T2) waveform features. Returns both, same shapes.
     pub fn forward(&self, x: &Tensor, xt: &Tensor, tr: &mut Tracer) -> (Tensor, Tensor) {
         let (c, fr, t1) = (x.shape[0], x.shape[1], x.shape[2]);

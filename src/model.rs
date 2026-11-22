@@ -187,7 +187,7 @@ pub struct HTDemucs {
     freq_emb: Option<Tensor>,
     /// channel_upsampler, channel_downsampler, and their _t twins (bottom_channels > 0).
     bottom: Option<[Conv; 4]>,
-    transformer: CrossTransformer,
+    pub transformer: CrossTransformer,
 }
 
 impl HTDemucs {

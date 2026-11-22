@@ -84,7 +84,12 @@ and 54.9 MB.
 | Oasis, Wonderwall: chunk 5 | 126.8 dB | 126.2 dB |
 | Three Days Grace, Never Too Late: last (padded) chunk of a pass shifted by 12345 samples | 130.6 dB | 128.0 dB |
 
-Every intermediate layer is above 95 dB (most 105-135 dB); `parity` prints the full table.
+`parity` prints every layer (~150 per model). All are above 100 dB except the first spectral
+self-attention of htdemucs (84-95 dB): its softmax logits reach ~480 with row ranges ~720, so it
+amplifies the 1e-6-level difference already in its input. Run alone on PyTorch's own input
+(`parity` also does this for every transformer layer) it matches at 119 dB - better than
+PyTorch's own float32 vs float64 difference for that layer, 116 dB - and the error does not
+survive to the output.
 
 Speed, one segment on an M1 Pro (8 threads): PyTorch 2.2.2 CPU 3.4 s (htdemucs) / 3.0 s
 (htdemucs_6s); this crate 1.8 s / 1.7 s with the `gemm` crate, 1.3 s / 1.1 s with Accelerate.

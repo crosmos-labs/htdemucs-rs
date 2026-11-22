@@ -37,6 +37,49 @@ fn compare(name: &str, ours: &Tensor, theirs: &Tensor) -> Row {
     Row { name: name.to_string(), shape: squeeze(&theirs.shape), max_abs, ref_max, snr }
 }
 
+/// Each transformer layer run alone on PyTorch's own input to it: separates the layer's own error
+/// from error propagated from earlier layers (attention with very sharp softmaxes amplifies input
+/// differences, so the propagated figure alone can look worse than the layer is).
+fn isolated_transformer(model: &HTDemucs, r: &SafeTensors) {
+    let get = |n: &str| r.get(n).unwrap_or_else(|| panic!("{n}"));
+    let mut x = get("crosstransformer.norm_in").clone();
+    let pe = get("pos_emb_2d");
+    let (c, fr, t1) = (pe.shape[1], pe.shape[2], pe.shape[3]);
+    let w = model.cfg.t_weight_pos_embed as f32;
+    for ci in 0..c {
+        for f in 0..fr {
+            for t in 0..t1 {
+                x.data[(t * fr + f) * c + ci] += w * pe.data[(ci * fr + f) * t1 + t];
+            }
+        }
+    }
+    let mut xt = get("crosstransformer.norm_in_t").clone();
+    for (v, p) in xt.data.iter_mut().zip(&get("pos_emb_1d").data) {
+        *v += w * p;
+    }
+    let squeeze2 = |t: &Tensor| t.clone().reshape(&[t.numel() / c, c]);
+    let (mut x, mut xt) = (squeeze2(&x), squeeze2(&xt));
+    println!("isolated transformer layers (input = PyTorch's input to that layer):");
+    println!("| layer | attention SNR dB | output SNR dB |\n|---|---|---|");
+    let tf = &model.transformer;
+    for i in 0..tf.n_layers() {
+        for (tb, inp, other) in [(false, &x, &xt), (true, &xt, &x)] {
+            let p = format!("crosstransformer.{}.{i}", if tb { "layers_t" } else { "layers" });
+            let an = format!("{p}.{}", if tf.is_cross(i) { "cross_attn" } else { "self_attn" });
+            let mut att = None;
+            let mut sink = |n: &str, t: &Tensor| {
+                if n == an {
+                    att = Some(compare(n, t, get(n)).snr);
+                }
+            };
+            let out = tf.layer(tb, i, inp, tf.is_cross(i).then_some(other), &mut Tracer(Some(&mut sink)));
+            println!("| {p} | {:.1} | {:.1} |", att.unwrap(), compare(&p, &out, get(&p)).snr);
+        }
+        x = squeeze2(get(&format!("crosstransformer.layers.{i}")));
+        xt = squeeze2(get(&format!("crosstransformer.layers_t.{i}")));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
@@ -87,6 +130,7 @@ fn main() {
         for row in &rows {
             println!("| {} | {:?} | {:.3e} | {:.3e} | {:.1} |", row.name, row.shape, row.max_abs, row.ref_max, row.snr);
         }
+        isolated_transformer(model, &r);
         let out = rows.iter().find(|r| r.name == "output").unwrap();
         println!("final output SNR {:.1} dB, max abs err {:.3e}", out.snr, out.max_abs);
         if out.snr < 80.0 {
