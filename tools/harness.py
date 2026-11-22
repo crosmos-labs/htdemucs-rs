@@ -168,7 +168,8 @@ def main():
     # Positional embeddings of the cross-transformer, from demucs' own functions with the
     # shapes the forward used (B, C, Fr, T1 of the upsampled freq input; T2 of the time input).
     Fr, T1 = dump["encoder.%d" % (model.depth - 1)].shape[-2:]
-    _, C, T2 = dump["channel_upsampler_t"].shape
+    T2 = dump["tencoder.%d" % (model.depth - 1)].shape[-1]
+    C = dump["crosstransformer.norm_in_t"].shape[-1]
     dump["pos_emb_2d"] = create_2d_sin_embedding(C, Fr, T1, "cpu", model.crosstransformer.max_period)
     dump["pos_emb_1d"] = create_sin_embedding(T2, C, shift=0, device="cpu",
                                               max_period=model.crosstransformer.max_period)
