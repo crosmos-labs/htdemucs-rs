@@ -34,8 +34,11 @@ pub fn sgemm(
     assert!(k == 0 || (m - 1) * a_rs + (k - 1) * a_cs < a.len());
     assert!(k == 0 || (k - 1) * b_rs + (n - 1) * b_cs < b.len());
     assert!((m - 1) * c_rs + n <= c.len());
+    #[cfg(all(feature = "accelerate", target_os = "macos"))]
+    accelerate::sgemm(m, n, k, a, a_rs, a_cs, b, b_rs, b_cs, c, c_rs, accumulate);
     // gemm computes dst = alpha * dst + beta * lhs * rhs. It never splits the k dimension across
     // threads, so results do not depend on the thread count.
+    #[cfg(not(all(feature = "accelerate", target_os = "macos")))]
     unsafe {
         gemm::gemm(
             m,
@@ -58,6 +61,49 @@ pub fn sgemm(
             false,
             gemm::Parallelism::Rayon(rayon::current_num_threads()),
         );
+    }
+}
+
+/// Apple's Accelerate BLAS (runs on the AMX units of Apple silicon), behind the `accelerate`
+/// feature on macOS.
+#[cfg(all(feature = "accelerate", target_os = "macos"))]
+mod accelerate {
+    #[allow(non_camel_case_types)]
+    type c_int = i32;
+    const ROW_MAJOR: c_int = 101;
+    const NO_TRANS: c_int = 111;
+    const TRANS: c_int = 112;
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        fn cblas_sgemm(
+            order: c_int, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: f32,
+            a: *const f32, lda: c_int, b: *const f32, ldb: c_int, beta: f32, c: *mut f32, ldc: c_int,
+        );
+    }
+
+    /// A strided view with one unit stride as a BLAS (transpose flag, leading dimension).
+    fn layout(rs: usize, cs: usize, cols: usize) -> (c_int, c_int) {
+        if cs == 1 {
+            (NO_TRANS, rs.max(cols).max(1) as c_int)
+        } else {
+            assert_eq!(rs, 1, "BLAS needs a unit stride");
+            (TRANS, cs as c_int)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sgemm(
+        m: usize, n: usize, k: usize, a: &[f32], a_rs: usize, a_cs: usize, b: &[f32], b_rs: usize,
+        b_cs: usize, c: &mut [f32], c_rs: usize, accumulate: bool,
+    ) {
+        let (ta, lda) = layout(a_rs, a_cs, k);
+        let (tb, ldb) = layout(b_rs, b_cs, n);
+        unsafe {
+            cblas_sgemm(
+                ROW_MAJOR, ta, tb, m as c_int, n as c_int, k as c_int, 1.0, a.as_ptr(), lda,
+                b.as_ptr(), ldb, if accumulate { 1.0 } else { 0.0 }, c.as_mut_ptr(), c_rs as c_int,
+            );
+        }
     }
 }
 
@@ -283,18 +329,55 @@ pub fn group_norm_tokens(x: &mut Tensor, gamma: &[f32], beta: &[f32]) {
     });
 }
 
-#[inline]
+/// exp(x) in f32, ~1 ulp (Cephes expf: Cody-Waite reduction + degree-6 polynomial), written
+/// branch-free so loops over it vectorise. Inputs are clamped to the finite normal range.
+#[inline(always)]
+pub fn exp(x: f32) -> f32 {
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
+    const C1: f32 = 0.693_359_4;
+    const C2: f32 = -2.121_944_4e-4;
+    const ROUND: f32 = 12_582_912.0; // 1.5 * 2^23: (v + ROUND) - ROUND rounds to nearest
+    let x = x.clamp(-87.336_54, 88.722_83);
+    let n = (x * LOG2E + ROUND) - ROUND;
+    let r = x - n * C1 - n * C2;
+    let z = r * r;
+    let p = ((((1.987_569_1e-4 * r + 1.398_199_9e-3) * r + 8.333_452e-3) * r + 4.166_579_6e-2) * r
+        + 1.666_666_5e-1)
+        * r
+        + 5.000_000_1e-1;
+    let y = p * z + r + 1.0;
+    // Scale by 2^n; n + 127 stays in [1, 254] for the clamped range, except n = 128 at the top,
+    // which we split in two.
+    let ni = n as i32;
+    let h = ni >> 1;
+    y * f32::from_bits(((h + 127) << 23) as u32) * f32::from_bits(((ni - h + 127) << 23) as u32)
+}
+
+/// GELU, exact (erf) form: 0.5 x erfc(-x / sqrt 2). erfc from Numerical Recipes' Chebyshev fit,
+/// relative error < 1.2e-7 everywhere (so no cancellation for negative x, unlike 1 + erf).
+#[inline(always)]
 pub fn gelu1(x: f32) -> f32 {
-    0.5 * x * (1.0 + libm::erff(x * std::f32::consts::FRAC_1_SQRT_2))
+    let u = -x * std::f32::consts::FRAC_1_SQRT_2;
+    let z = u.abs();
+    let t = 1.0 / (1.0 + 0.5 * z);
+    let poly = -1.265_512_2
+        + t * (1.000_023_7
+            + t * (0.374_091_96
+                + t * (0.096_784_18
+                    + t * (-0.186_288_06
+                        + t * (0.278_868_07 + t * (-1.135_203_98 + t * (1.488_515_87 + t * (-0.822_152_23 + t * 0.170_872_77))))))));
+    let ans = t * exp(-z * z + poly);
+    let erfc = if u >= 0.0 { ans } else { 2.0 - ans };
+    0.5 * x * erfc
 }
 
 pub fn gelu(x: &mut [f32]) {
-    x.par_chunks_mut(4096).for_each(|c| c.iter_mut().for_each(|v| *v = gelu1(*v)));
+    x.par_chunks_mut(8192).for_each(|c| c.iter_mut().for_each(|v| *v = gelu1(*v)));
 }
 
-#[inline]
+#[inline(always)]
 pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+    1.0 / (1.0 + exp(-x))
 }
 
 /// GLU over the first axis: (2C, ...) -> (C, ...), a * sigmoid(b).
@@ -305,8 +388,8 @@ pub fn glu(x: &Tensor) -> Tensor {
     shape[0] = c2 / 2;
     let (a, b) = x.data.split_at(half);
     let mut out = vec![0.0f32; half];
-    out.par_chunks_mut(4096)
-        .zip(a.par_chunks(4096).zip(b.par_chunks(4096)))
+    out.par_chunks_mut(8192)
+        .zip(a.par_chunks(8192).zip(b.par_chunks(8192)))
         .for_each(|(o, (a, b))| {
             for i in 0..o.len() {
                 o[i] = a[i] * sigmoid(b[i]);
@@ -343,7 +426,9 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> Tensor {
             }
             let mut sum = 0f64;
             for s in row.iter_mut() {
-                *s = (*s * scale - mx).exp();
+                *s = exp(*s * scale - mx);
+            }
+            for s in row.iter() {
                 sum += *s as f64;
             }
             let inv = (1.0 / sum) as f32;
@@ -354,4 +439,38 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> Tensor {
         sgemm(nq, d, nk, &scores, nk, 1, &v.data[h * d..], c, 1, &mut out[h * d..], c, false);
     }
     Tensor::new(&[nq, c], out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exp_accuracy() {
+        let mut worst = 0f64;
+        let mut x = -87.0f32;
+        while x < 88.0 {
+            let e = (x as f64).exp();
+            let rel = ((exp(x) as f64 - e) / e).abs();
+            worst = worst.max(rel);
+            x += 0.001_37;
+        }
+        assert!(worst < 2.5e-7, "exp rel err {worst}");
+    }
+
+    #[test]
+    fn gelu_accuracy() {
+        // Against an f64 reference (libm erfc). Relative error < 2e-6 wherever |gelu| > 1e-4 (in
+        // the far negative tail the f32 rounding of -x^2/2 limits relative accuracy, but the
+        // values themselves are < 1e-4 there).
+        let mut worst = 0f64;
+        let mut x = -12.0f32;
+        while x < 12.0 {
+            let xd = x as f64;
+            let g = 0.5 * xd * libm::erfc(-xd / std::f64::consts::SQRT_2);
+            worst = worst.max((gelu1(x) as f64 - g).abs() / g.abs().max(1e-4));
+            x += 0.000_97;
+        }
+        assert!(worst < 2e-6, "gelu rel err {worst}");
+    }
 }

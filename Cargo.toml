@@ -10,3 +10,13 @@ rayon = "1.12.0"
 realfft = "3.5.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+[features]
+# Use Apple's Accelerate BLAS for matrix products on macOS (Apple silicon AMX units).
+accelerate = []
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = true
