@@ -20,7 +20,11 @@ fn main() {
             ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
         })
         .collect();
-    let _ = model.forward(&mix, &mut Tracer::none());
+    let first = model.forward(&mix, &mut Tracer::none());
+    // Results must not depend on the thread count: compare with a 3-thread run.
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
+    let other = pool.install(|| model.forward(&mix, &mut Tracer::none()));
+    assert!(first.data == other.data, "output differs between thread counts");
     let mut best = f64::MAX;
     for _ in 0..runs {
         let t = Instant::now();

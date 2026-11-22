@@ -28,6 +28,26 @@ pub fn sgemm(
     c_rs: usize,
     accumulate: bool,
 ) {
+    sgemm_par(m, n, k, a, a_rs, a_cs, b, b_rs, b_cs, c, c_rs, accumulate, true)
+}
+
+/// `sgemm`, single-threaded unless `parallel` (for callers that parallelise over many GEMMs).
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_par(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    a_rs: usize,
+    a_cs: usize,
+    b: &[f32],
+    b_rs: usize,
+    b_cs: usize,
+    c: &mut [f32],
+    c_rs: usize,
+    accumulate: bool,
+    parallel: bool,
+) {
     if m == 0 || n == 0 {
         return;
     }
@@ -35,7 +55,10 @@ pub fn sgemm(
     assert!(k == 0 || (k - 1) * b_rs + (n - 1) * b_cs < b.len());
     assert!((m - 1) * c_rs + n <= c.len());
     #[cfg(all(feature = "accelerate", target_os = "macos"))]
-    accelerate::sgemm(m, n, k, a, a_rs, a_cs, b, b_rs, b_cs, c, c_rs, accumulate);
+    {
+        let _ = parallel; // Accelerate manages its own threads
+        accelerate::sgemm(m, n, k, a, a_rs, a_cs, b, b_rs, b_cs, c, c_rs, accumulate);
+    }
     // gemm computes dst = alpha * dst + beta * lhs * rhs. It never splits the k dimension across
     // threads, so results do not depend on the thread count.
     #[cfg(not(all(feature = "accelerate", target_os = "macos")))]
@@ -59,7 +82,7 @@ pub fn sgemm(
             false,
             false,
             false,
-            gemm::Parallelism::Rayon(rayon::current_num_threads()),
+            if parallel { gemm::Parallelism::Rayon(rayon::current_num_threads()) } else { gemm::Parallelism::None },
         );
     }
 }
@@ -344,13 +367,15 @@ fn sqdev64(x: &[f32], m: f64) -> f64 {
     acc.iter().sum::<f64>() + rest.iter().map(|&v| (v as f64 - m) * (v as f64 - m)).sum::<f64>()
 }
 
-/// Mean and biased variance of a large slice, f64 two-pass, in parallel.
+/// Mean and biased variance of a large slice, f64 two-pass, in parallel. Partial sums are
+/// collected and added in a fixed order, so the result does not depend on the thread count.
 fn big_stats(x: &[f32]) -> (f64, f64) {
     const B: usize = 1 << 16;
     let n = x.len() as f64;
-    let mean = x.par_chunks(B).map(sum64).sum::<f64>() / n;
-    let var = x.par_chunks(B).map(|c| sqdev64(c, mean)).sum::<f64>() / n;
-    (mean, var)
+    let parts: Vec<f64> = x.par_chunks(B).map(sum64).collect();
+    let mean = parts.iter().sum::<f64>() / n;
+    let parts: Vec<f64> = x.par_chunks(B).map(|c| sqdev64(c, mean)).collect();
+    (mean, parts.iter().sum::<f64>() / n)
 }
 
 /// Mean and unbiased (N-1) standard deviation, as torch.mean / torch.std.
@@ -549,6 +574,8 @@ pub fn linear(x: &Tensor, w: &[f32], b: &[f32]) -> Tensor {
 }
 
 /// Multi-head scaled dot-product attention. q (Nq, C), k and v (Nk, C), heads split C.
+/// (Head by head with full-width multithreaded GEMMs: measured faster, with both the gemm crate
+/// and Accelerate, than many small single-threaded GEMMs over (head, query block) tasks.)
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> Tensor {
     let (nq, c) = (q.shape[0], q.shape[1]);
     let nk = k.shape[0];
@@ -564,14 +591,10 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> Tensor {
             for &s in row.iter() {
                 mx = mx.max(s * scale);
             }
-            let mut sum = 0f64;
             for s in row.iter_mut() {
                 *s = exp(*s * scale - mx);
             }
-            for s in row.iter() {
-                sum += *s as f64;
-            }
-            let inv = (1.0 / sum) as f32;
+            let inv = (1.0 / sum64(row)) as f32;
             for s in row.iter_mut() {
                 *s *= inv;
             }
