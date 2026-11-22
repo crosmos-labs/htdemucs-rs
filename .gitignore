@@ -1,0 +1,9 @@
+target/
+/weights/
+/ref/
+*.wav
+*.flac
+*.npy
+*.safetensors
+__pycache__/
+.venv/
