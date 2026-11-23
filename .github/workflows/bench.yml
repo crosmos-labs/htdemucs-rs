@@ -7,6 +7,9 @@ name: bench
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: "machine: ubuntu-latest (GitHub, 4 vCPU) or a Blacksmith size, e.g. blacksmith-8vcpu-ubuntu-2404 (counts 4x against the 3000 free 2-vCPU minutes a month)"
+        default: ubuntu-latest
       models:
         description: models to bench
         default: htdemucs
@@ -62,7 +65,7 @@ env:
 
 jobs:
   bench:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

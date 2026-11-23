@@ -9,6 +9,9 @@ name: container
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: "machine: ubuntu-latest (GitHub, 4 vCPU) or a Blacksmith size, e.g. blacksmith-8vcpu-ubuntu-2404 (counts 4x against the 3000 free 2-vCPU minutes a month)"
+        default: ubuntu-latest
       sizing:
         description: time 60 s / 240 s clips for instance sizing
         type: boolean
@@ -45,7 +48,7 @@ env:
 
 jobs:
   container:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4

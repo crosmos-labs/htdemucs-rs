@@ -6,6 +6,9 @@ name: bench-roformer
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: "machine: ubuntu-latest (GitHub, 4 vCPU) or a Blacksmith size, e.g. blacksmith-8vcpu-ubuntu-2404 (counts 4x against the 3000 free 2-vCPU minutes a month)"
+        default: ubuntu-latest
       threads:
         description: thread counts
         default: "1 2"
@@ -41,7 +44,7 @@ env:
 
 jobs:
   bench:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
