@@ -56,3 +56,46 @@ fn segment_count_replays_the_generator_without_moving_it() {
     let mut b = PyRandom::new(0);
     assert_eq!(a.randint(0, 22050), b.randint(0, 22050));
 }
+
+/// The streamed output (taken in uneven pieces, steps interleaved) is bit-identical to
+/// `separate`'s, and leaves the generator where `separate` does: with 3 shifts, where the order of
+/// the passes' sum matters.
+#[test]
+fn streamer_matches_separate() {
+    let Some(m) = model() else { return };
+    let len = 20 * 44100 + 123;
+    let wav: Vec<f32> = (0..2 * len).map(|i| ((i % len) as f32 * 0.013 + (i / len) as f32).sin() * 0.3 + ((i * 7919) % 1000) as f32 * 1e-4).collect();
+    for shifts in [0, 3] {
+        let opts = Options { shifts, ..Default::default() };
+        let mut ra = PyRandom::new(7);
+        let whole = apply::separate(&m, &wav, 2, &opts, &mut ra, &mut || {});
+        let mut rb = PyRandom::new(7);
+        let mut s = apply::Streamer::new(&m, &wav, 2, &opts, &mut rb);
+        let rows = 12;
+        let mut got = vec![vec![]; rows];
+        let mut buf = vec![];
+        let mut piece = 1;
+        loop {
+            let ready = s.ready();
+            if ready > s.taken() {
+                let upto = ready.min(s.taken() + piece * 10_007);
+                let w = upto - s.taken();
+                s.take(upto, &mut buf);
+                for (r, g) in got.iter_mut().enumerate() {
+                    g.extend_from_slice(&buf[r * w..(r + 1) * w]);
+                }
+                piece = piece % 7 + 1;
+                continue;
+            }
+            if s.taken() == len || !s.step(&mut || {}) {
+                break;
+            }
+        }
+        assert_eq!(s.taken(), len, "shifts {shifts}");
+        for (r, g) in got.iter().enumerate() {
+            let w = &whole.stems.data[r * len..(r + 1) * len];
+            assert!(g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()), "shifts {shifts}, row {r} differs");
+        }
+        assert_eq!(ra.randint(0, 1 << 30), rb.randint(0, 1 << 30), "shifts {shifts}: generator state");
+    }
+}

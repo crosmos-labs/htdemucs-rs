@@ -488,6 +488,273 @@ pub fn write(path: &Path, data: &[f32], channels: usize, rate: u32, fmt: Format)
     }
 }
 
+/// demucs.audio.prevent_clip's modes: rescale (divide by max(1.01 * peak, 1), the peak over the
+/// whole stem, all channels), clamp (to +-0.99) or none.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Clip {
+    Rescale,
+    Clamp,
+    None,
+}
+
+impl Clip {
+    pub fn parse(s: &str) -> Option<Clip> {
+        match s {
+            "rescale" => Some(Clip::Rescale),
+            "clamp" => Some(Clip::Clamp),
+            "none" => Some(Clip::None),
+            _ => None,
+        }
+    }
+}
+
+/// One stem written as it is produced, `push`ed in track order (planar: one slice per channel, of
+/// equal length), `finish`ed once every frame has come. Same bytes as `write` on the whole stem
+/// after `prevent_clip`: clamp / none are per sample; rescale needs the stem's peak, so its float
+/// samples go to a temporary file next to the output first (4 bytes a sample) and are divided and
+/// encoded in `finish`. The output is written to `<path>.part` and renamed when finished.
+pub struct StemWriter {
+    path: std::path::PathBuf,
+    part: std::path::PathBuf,
+    clip: Clip,
+    enc: Option<Encoder>,
+    /// Rescale: the float samples so far (interleaved) and their peak.
+    temp: Option<(std::path::PathBuf, BufWriter<File>, f32)>,
+    channels: usize,
+    frames: usize,
+    written: usize,
+}
+
+enum Encoder {
+    Wav { w: BufWriter<File>, float: bool, buf: Vec<u8> },
+    Flac(Box<FlacStream>),
+}
+
+impl StemWriter {
+    /// A stem of `frames` frames (known in advance: WAV's header holds it).
+    pub fn create(path: &Path, channels: usize, frames: usize, rate: u32, fmt: Format, clip: Clip) -> Result<StemWriter, String> {
+        let part = path.with_extension(format!("{}.part", fmt.ext()));
+        let e = |e: std::io::Error| format!("{}: {e}", part.display());
+        let file = BufWriter::with_capacity(1 << 20, File::create(&part).map_err(e)?);
+        let enc = match fmt {
+            Format::WavF32 | Format::Wav16 => {
+                let mut w = file;
+                let float = fmt == Format::WavF32;
+                w.write_all(&wav_header(channels, frames, rate, float)).map_err(e)?;
+                Encoder::Wav { w, float, buf: vec![] }
+            }
+            Format::Flac16 => Encoder::Flac(Box::new(FlacStream::new(file, channels, rate)?)),
+        };
+        let temp = if clip == Clip::Rescale {
+            let t = path.with_extension(format!("{}.f32", fmt.ext()));
+            let f = BufWriter::with_capacity(1 << 20, File::create(&t).map_err(|e| format!("{}: {e}", t.display()))?);
+            Some((t, f, 0f32))
+        } else {
+            None
+        };
+        Ok(StemWriter { path: path.to_path_buf(), part, clip, enc: Some(enc), temp, channels, frames, written: 0 })
+    }
+
+    /// The next frames, one slice per channel.
+    pub fn push(&mut self, planes: &[&[f32]]) -> Result<(), String> {
+        let n = planes[0].len();
+        if self.written + n > self.frames {
+            return Err(format!("{}: more frames than declared", self.path.display()));
+        }
+        self.written += n;
+        if let Some((t, f, peak)) = &mut self.temp {
+            let mut b = Vec::with_capacity(n * self.channels * 4);
+            for i in 0..n {
+                for p in planes {
+                    *peak = peak.max(p[i].abs());
+                    b.extend_from_slice(&p[i].to_le_bytes());
+                }
+            }
+            return f.write_all(&b).map_err(|e| format!("{}: {e}", t.display()));
+        }
+        let mut x = Vec::with_capacity(n * self.channels);
+        for i in 0..n {
+            for p in planes {
+                x.push(match self.clip {
+                    Clip::Clamp => p[i].clamp(-0.99, 0.99),
+                    _ => p[i],
+                });
+            }
+        }
+        self.encode(&x)
+    }
+
+    /// Interleaved samples, clipped already.
+    fn encode(&mut self, x: &[f32]) -> Result<(), String> {
+        let e = |e: std::io::Error| format!("{}: {e}", self.part.display());
+        match self.enc.as_mut().expect("not finished") {
+            Encoder::Wav { w, float, buf } => {
+                buf.clear();
+                for &v in x {
+                    if *float {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    } else {
+                        buf.extend_from_slice(&wav16(v).to_le_bytes());
+                    }
+                }
+                w.write_all(buf).map_err(e)
+            }
+            Encoder::Flac(f) => f.push(x.iter().map(|&v| flac16(v) as i32)).map_err(|m| format!("{}: flac: {m}", self.part.display())),
+        }
+    }
+
+    pub fn finish(mut self) -> Result<(), String> {
+        if self.written != self.frames {
+            return Err(format!("{}: {} of {} frames written", self.path.display(), self.written, self.frames));
+        }
+        if let Some((t, f, peak)) = self.temp.take() {
+            // Rescale: divide by max(1.01 * peak, 1), as prevent_clip does on the whole stem.
+            let te = |e: std::io::Error| format!("{}: {e}", t.display());
+            drop(f.into_inner().map_err(|e| format!("{}: {e}", t.display()))?);
+            let d = (1.01f32 * peak).max(1.0);
+            let mut r = std::io::BufReader::with_capacity(1 << 20, File::open(&t).map_err(te)?);
+            let mut bytes = vec![0u8; 4 * self.channels * 65536];
+            let mut left = self.frames * self.channels;
+            let mut x = Vec::with_capacity(self.channels * 65536);
+            while left > 0 {
+                let k = left.min(self.channels * 65536);
+                r.read_exact(&mut bytes[..4 * k]).map_err(te)?;
+                x.clear();
+                x.extend(bytes[..4 * k].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) / d));
+                self.encode(&x)?;
+                left -= k;
+            }
+            drop(r);
+            std::fs::remove_file(&t).map_err(te)?;
+        }
+        let e = |e: std::io::Error| format!("{}: {e}", self.part.display());
+        match self.enc.take().expect("not finished") {
+            Encoder::Wav { mut w, .. } => w.flush().map_err(e)?,
+            Encoder::Flac(f) => f.finish().map_err(|m| format!("{}: flac: {m}", self.part.display()))?,
+        }
+        std::fs::rename(&self.part, &self.path).map_err(|e| format!("{}: {e}", self.path.display()))
+    }
+}
+
+impl Drop for StemWriter {
+    /// Unfinished (an error on the way): no partial files left behind.
+    fn drop(&mut self) {
+        if let Some((t, _, _)) = &self.temp {
+            let _ = std::fs::remove_file(t);
+        }
+        if self.part.exists() {
+            let _ = std::fs::remove_file(&self.part);
+        }
+    }
+}
+
+fn wav_header(channels: usize, frames: usize, rate: u32, float: bool) -> Vec<u8> {
+    let bytes_ps = if float { 4 } else { 2 };
+    let data_len = (frames * channels * bytes_ps) as u32;
+    let mut h = Vec::with_capacity(44);
+    h.extend_from_slice(b"RIFF");
+    h.extend_from_slice(&(36 + data_len).to_le_bytes());
+    h.extend_from_slice(b"WAVEfmt ");
+    h.extend_from_slice(&16u32.to_le_bytes());
+    h.extend_from_slice(&(if float { 3u16 } else { 1u16 }).to_le_bytes());
+    h.extend_from_slice(&(channels as u16).to_le_bytes());
+    h.extend_from_slice(&rate.to_le_bytes());
+    h.extend_from_slice(&(rate * (channels * bytes_ps) as u32).to_le_bytes());
+    h.extend_from_slice(&((channels * bytes_ps) as u16).to_le_bytes());
+    h.extend_from_slice(&((bytes_ps * 8) as u16).to_le_bytes());
+    h.extend_from_slice(b"data");
+    h.extend_from_slice(&data_len.to_le_bytes());
+    h
+}
+
+/// FLAC written frame by frame: what flacenc's encode_with_fixed_block_size produces (same
+/// frames, numbers, MD5 and STREAMINFO), without holding the encoded stream. The header is
+/// written as a placeholder and rewritten at the end, when the frame sizes and MD5 are known.
+struct FlacStream {
+    file: BufWriter<File>,
+    config: flacenc::error::Verified<flacenc::config::Encoder>,
+    /// A frameless stream: its STREAMINFO, and the header bytes it writes.
+    stream: flacenc::component::Stream,
+    ctx: flacenc::source::Context,
+    channels: usize,
+    block: usize,
+    /// Interleaved samples short of a whole block.
+    pending: Vec<i32>,
+}
+
+impl FlacStream {
+    fn new(mut file: BufWriter<File>, channels: usize, rate: u32) -> Result<FlacStream, String> {
+        use flacenc::error::Verify;
+        let config = flacenc::config::Encoder::default().into_verified().map_err(|e| format!("{e:?}"))?;
+        let block = config.block_size;
+        let mut stream = flacenc::component::Stream::new(rate as usize, channels, 16).map_err(|e| format!("{e:?}"))?;
+        stream.stream_info_mut().set_block_sizes(block, block).map_err(|e| format!("{e:?}"))?;
+        let head = Self::header(&stream)?;
+        file.write_all(&head).map_err(|e| e.to_string())?;
+        Ok(FlacStream { file, config, stream, ctx: flacenc::source::Context::new(16, channels), channels, block, pending: vec![] })
+    }
+
+    fn header(stream: &flacenc::component::Stream) -> Result<Vec<u8>, String> {
+        use flacenc::component::BitRepr;
+        let mut sink = flacenc::bitsink::ByteSink::new();
+        stream.write(&mut sink).map_err(|e| format!("{e:?}"))?;
+        Ok(sink.as_slice().to_vec())
+    }
+
+    fn push(&mut self, x: impl Iterator<Item = i32>) -> Result<(), String> {
+        self.pending.extend(x);
+        let whole = self.pending.len() / (self.block * self.channels);
+        if whole > 0 {
+            let n = whole * self.block * self.channels;
+            let blocks: Vec<i32> = self.pending.drain(..n).collect();
+            self.encode(&blocks)?;
+        }
+        Ok(())
+    }
+
+    /// Encodes interleaved samples as frames of `block` frames (the last may be shorter), the
+    /// frames in parallel, written in order.
+    fn encode(&mut self, x: &[i32]) -> Result<(), String> {
+        use flacenc::component::BitRepr;
+        use flacenc::source::Fill;
+        use rayon::prelude::*;
+        let mut bufs = vec![];
+        for b in x.chunks(self.block * self.channels) {
+            let mut fb = flacenc::source::FrameBuf::with_size(self.channels, self.block).map_err(|e| format!("{e:?}"))?;
+            fb.fill_interleaved(b).map_err(|e| format!("{e:?}"))?;
+            self.ctx.fill_interleaved(b).map_err(|e| format!("{e:?}"))?;
+            bufs.push((fb, self.ctx.current_frame_number().unwrap_or(0)));
+        }
+        let info = self.stream.stream_info().clone();
+        let frames: Vec<_> = bufs
+            .par_iter()
+            .map(|(fb, n)| flacenc::encode_fixed_size_frame(&self.config, fb, *n, &info).map_err(|e| format!("{e:?}")))
+            .collect::<Result<_, _>>()?;
+        for f in frames {
+            self.stream.stream_info_mut().update_frame_info(&f);
+            let mut sink = flacenc::bitsink::ByteSink::new();
+            f.write(&mut sink).map_err(|e| format!("{e:?}"))?;
+            self.file.write_all(sink.as_slice()).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        let rest = std::mem::take(&mut self.pending);
+        if !rest.is_empty() {
+            self.encode(&rest)?;
+        }
+        let total = self.ctx.total_samples();
+        self.stream.stream_info_mut().set_md5_digest(&self.ctx.md5_digest());
+        self.stream.stream_info_mut().set_total_samples(total);
+        let head = Self::header(&self.stream)?;
+        let mut f = self.file.into_inner().map_err(|e| e.to_string())?;
+        f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        f.write_all(&head).map_err(|e| e.to_string())?;
+        f.flush().map_err(|e| e.to_string())
+    }
+}
+
 /// Planar f32 samples as a flacenc source, quantised block by block (no whole-track i32 copy).
 struct PlanarSource<'a> {
     data: &'a [f32],

@@ -4,12 +4,13 @@
 //!
 //! Writes <out>/<model>/<track name>/<source>.<ext>, like demucs.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use htdemucs::apply::{self, Options};
 use htdemucs::audio::{self, Format};
 use htdemucs::{HTDemucs, Tensor};
+use rayon::prelude::*;
 
 const USAGE: &str = "usage: htdemucs-rs separate -n <htdemucs|htdemucs_6s|ensemble|melroformer> [options] <tracks>...
 
@@ -224,58 +225,94 @@ fn run(a: Args) -> Result<(), String> {
                 tqdm_line(done, total, stride_sec, t2.elapsed().as_secs_f64());
             }
         };
-        let mut seps = vec![];
-        for (m, r) in models.iter().zip(rngs.iter_mut()) {
-            seps.push(apply::separate(m, &input.data, ch, &a.opts, r, &mut progress));
+        // Separated as a stream (apply::Streamer): finished samples go to the writers as soon as
+        // every model's overlap-add window has passed them, so nothing track-long is held but
+        // the input. The ensemble is averaged window by window.
+        let mut streams: Vec<apply::Streamer> = models.iter().zip(rngs.iter_mut()).map(|(m, r)| apply::Streamer::new(m, &input.data, ch, &a.opts, r)).collect();
+        if streams[0].silent() {
+            eprintln!("warning: {}: the input is silent (or constant): writing silent stems", track.display());
         }
-        drop(input); // not needed any more: free it before writing
+        let name = track.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+        let set = |folder: &str, sources: &[String], clip: &str| -> Result<Vec<audio::StemWriter>, String> {
+            let dir = a.out.join(folder).join(name);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            let clip = audio::Clip::parse(clip).ok_or(format!("clip mode {clip}"))?;
+            sources.iter().map(|src| audio::StemWriter::create(&dir.join(format!("{src}.{}", a.format.ext())), ch, len, rate, a.format, clip)).collect()
+        };
+        // Writer sets, in the order windows are written: one set, or the ensemble's 4-stem view
+        // and 6-stem set (and htdemucs_6s' own stems).
+        let mut sets = if ensemble {
+            let mut v = vec![set("htdemucs", models[1].sources(), a.clip4.as_deref().unwrap_or(&a.clip))?, set("htdemucs_6s", models[0].sources(), &a.clip)?];
+            if a.own_6s {
+                v.push(set("htdemucs_6s.own", models[0].sources(), &a.clip)?);
+            }
+            v
+        } else {
+            vec![set(a.name.as_str(), models[0].sources(), &a.clip)?]
+        };
+        let stride = apply::stride(&models[0], a.opts.overlap)?;
+        let mut bufs: Vec<Vec<f32>> = vec![vec![]; streams.len()];
+        loop {
+            let ready = streams.iter().map(|s| s.ready()).min().unwrap_or(len);
+            let taken = streams[0].taken();
+            if ready > taken && (ready - taken >= stride || ready == len) {
+                let upto = ready.min(taken + stride);
+                let w = upto - taken;
+                for (s, b) in streams.iter_mut().zip(bufs.iter_mut()) {
+                    s.take(upto, b);
+                }
+                if ensemble {
+                    let (n6, n4) = (models[0].sources().len(), models[1].sources().len());
+                    if a.own_6s {
+                        write_window(&mut sets[2], &bufs[0], ch, w)?;
+                    }
+                    let six = Tensor::new(&[n6, ch, w], std::mem::take(&mut bufs[0]));
+                    let four = Tensor::new(&[n4, ch, w], std::mem::take(&mut bufs[1]));
+                    let (v4, v6) = htdemucs::ensemble::combine_with(four, models[1].sources(), six, models[0].sources(), a.average_four)?;
+                    write_window(&mut sets[0], &v4.data, ch, w)?;
+                    write_window(&mut sets[1], &v6.data, ch, w)?;
+                    (bufs[0], bufs[1]) = (v6.data, v4.data);
+                } else {
+                    write_window(&mut sets[0], &bufs[0], ch, w)?;
+                }
+                continue;
+            }
+            if taken == len {
+                break;
+            }
+            // The model furthest behind runs its next segment.
+            let k = (0..streams.len()).min_by_key(|&k| streams[k].ready()).unwrap_or(0);
+            if !streams[k].step(&mut progress) {
+                return Err("internal: a stream stopped short of the track's end".into());
+            }
+        }
+        drop(streams);
+        drop(input);
         if show {
             eprintln!();
-        }
-        if seps[0].silent {
-            eprintln!("warning: {}: the input is silent (or constant): writing silent stems", track.display());
         }
         if a.verbose {
             eprintln!("  separated in {:.1}s", t2.elapsed().as_secs_f64());
         }
-        // (folder, source names, stems, clip mode): one set, or the ensemble's 4- and 6-stem views.
-        let sets: Vec<(&str, &[String], Tensor, &str)> = if ensemble {
-            let (six, four) = (seps.remove(0).stems, seps.remove(0).stems);
-            if a.own_6s {
-                // htdemucs_6s' own stems, before averaging: one clipped copy of a stem at a time.
-                let dir = a.out.join("htdemucs_6s.own").join(track.file_stem().and_then(|s| s.to_str()).unwrap_or("track"));
-                std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-                for (i, src) in models[0].sources().iter().enumerate() {
-                    let mut x = six.data[i * ch * len..(i + 1) * ch * len].to_vec();
-                    prevent_clip(&mut x, &a.clip);
-                    audio::write(&dir.join(format!("{src}.{}", a.format.ext())), &x, ch, rate, a.format)?;
-                }
-            }
-            let (v4, v6) = htdemucs::ensemble::combine_with(four, models[1].sources(), six, models[0].sources(), a.average_four)?;
-            vec![("htdemucs", models[1].sources(), v4, a.clip4.as_deref().unwrap_or(&a.clip)), ("htdemucs_6s", models[0].sources(), v6, &a.clip)]
-        } else {
-            vec![(a.name.as_str(), models[0].sources(), seps.remove(0).stems, &a.clip)]
-        };
-        let name = track.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
-        let plane = ch * len;
-        for (folder, sources, mut stems, clip) in sets {
-            let dir = a.out.join(folder).join(name);
-            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            for (i, src) in sources.iter().enumerate() {
-                let x = &mut stems.data[i * plane..(i + 1) * plane];
-                prevent_clip(x, clip);
-                let path = dir.join(format!("{src}.{}", a.format.ext()));
-                audio::write(Path::new(&path), x, ch, rate, a.format)?;
-            }
-            if a.verbose {
-                eprintln!("  wrote {} in {:.1}s total", dir.display(), t1.elapsed().as_secs_f64());
-            }
+        // Rescaled stems are divided and encoded now (their peak is known only at the end).
+        let t3 = Instant::now();
+        sets.into_iter().flatten().collect::<Vec<_>>().into_par_iter().try_for_each(|w| w.finish())?;
+        if a.verbose {
+            eprintln!("  finished writing in {:.1}s, {:.1}s total", t3.elapsed().as_secs_f64(), t1.elapsed().as_secs_f64());
         }
     }
     if a.verbose {
         eprintln!("done in {:.1}s, peak RSS {:.0} MB", t0.elapsed().as_secs_f64(), peak_rss_mb());
     }
     Ok(())
+}
+
+/// Hands a window of stems (sources, channels, w) to their writers, stems in parallel.
+fn write_window(writers: &mut [audio::StemWriter], data: &[f32], ch: usize, w: usize) -> Result<(), String> {
+    writers.par_iter_mut().enumerate().try_for_each(|(i, wr)| {
+        let planes: Vec<&[f32]> = (0..ch).map(|c| &data[(i * ch + c) * w..(i * ch + c + 1) * w]).collect();
+        wr.push(&planes)
+    })
 }
 
 /// `-n melroformer`: Kim's Mel-Band RoFormer (src/roformer.rs) with upstream's chunking; writes
