@@ -1,0 +1,5 @@
+# The image needs only the crate sources; weights come in as the named `weights` build context.
+*
+!Cargo.toml
+!Cargo.lock
+!src
