@@ -14,6 +14,8 @@ Uses the upstream inference code, github.com/KimberleyJensen/Mel-Band-Roformer-V
     $PY tools/melroformer.py segment  <repo> <ckpt> <in.wav> <out.safetensors> [--chunk K]
         -> one chunk exactly as demix_track feeds it (input, STFT, band split, every transformer,
            masks, output)
+    $PY tools/melroformer.py bench    <repo> <ckpt> [--threads N] [--runs R]
+        -> CPU and wall time of one chunk forward (PyTorch's baseline), RESULT line
     $PY tools/melroformer.py separate <repo> <ckpt> <in.wav> <out.safetensors> [--threads N]
         -> {"stems": (2, 2, L)} = vocals, instrumental (mix - vocals, as upstream inference.py),
            the format src/bin/compare.rs reads
@@ -183,6 +185,25 @@ def separate(a):
                       "cpu_per_audio_s": round(cpu / audio, 3), "threads": torch.get_num_threads(), "peak_rss_mb": round(rss)}))
 
 
+def bench(a):
+    torch.set_num_threads(a.threads)
+    cfg, model = load(a.repo, a.ckpt)
+    x = torch.randn(1, 2, cfg.inference.chunk_size, generator=torch.Generator().manual_seed(0)) * 0.1
+    model(x)
+    best = float("inf")
+    c0 = time.process_time()
+    for _ in range(a.runs):
+        t = time.perf_counter()
+        model(x)
+        best = min(best, time.perf_counter() - t)
+    cpu = (time.process_time() - c0) / a.runs
+    audio = cfg.inference.chunk_size / 44100
+    print(f"torch {torch.__version__} {a.threads} threads: wall best {best:.2f}s, CPU {cpu:.2f}s per chunk "
+          f"({cpu / audio:.3f} CPU-s per audio-s of chunk)")
+    print(f"RESULT model=melroformer threads={a.threads} wall_best={best:.3f} cpu={cpu:.3f} "
+          f"cpu_per_audio_s={cpu / audio:.4f} impl=torch")
+
+
 if __name__ == "__main__":
     torch.set_grad_enabled(False)
     p = argparse.ArgumentParser()
@@ -195,5 +216,8 @@ if __name__ == "__main__":
     f = sub.add_parser("separate")
     f.add_argument("repo"); f.add_argument("ckpt"); f.add_argument("inp"); f.add_argument("out")
     f.add_argument("--threads", type=int, default=4)
+    b = sub.add_parser("bench")
+    b.add_argument("repo"); b.add_argument("ckpt")
+    b.add_argument("--threads", type=int, default=1); b.add_argument("--runs", type=int, default=2)
     a = p.parse_args()
-    {"convert": convert, "segment": segment, "separate": separate}[a.cmd](a)
+    {"convert": convert, "segment": segment, "separate": separate, "bench": bench}[a.cmd](a)
