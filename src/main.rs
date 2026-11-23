@@ -12,13 +12,15 @@ use htdemucs::audio::{self, Format};
 use htdemucs::{HTDemucs, Tensor};
 use rayon::prelude::*;
 
-const USAGE: &str = "usage: htdemucs-rs separate -n <htdemucs|htdemucs_6s|ensemble|melroformer> [options] <tracks>...
+const USAGE: &str = "usage: htdemucs-rs separate -n <htdemucs|htdemucs_6s|ensemble|melroformer|chain> [options] <tracks>...
 
 options (demucs' names and defaults where they exist):
   -n, --name NAME        model (default htdemucs), or ensemble: htdemucs and htdemucs_6s on one
                          decode, averaged; writes DIR/htdemucs/<track>/ (4 stems) and
                          DIR/htdemucs_6s/<track>/ (6 stems) - see src/ensemble.rs;
-                         or melroformer: Kim's Mel-Band RoFormer, vocals + instrumental
+                         or melroformer: Kim's Mel-Band RoFormer, vocals + instrumental;
+                         or chain: Kim's vocals, then the ensemble (shifts 0) on Kim's
+                         instrumental; same two folders as ensemble - see src/chain.rs
   --weights DIR          converted weights (default $HTDEMUCS_WEIGHTS, else ./weights)
   -o, --out DIR          output root (default separated); files go to DIR/NAME/<track>/<stem>.<ext>
   --shifts N             random time shifts averaged (default 1)
@@ -174,6 +176,9 @@ fn run(a: Args) -> Result<(), String> {
     }
     if a.name == "melroformer" {
         return run_melroformer(a);
+    }
+    if a.name == "chain" {
+        return run_chain(a);
     }
     let t0 = Instant::now();
     // `-n ensemble`: htdemucs_6s and htdemucs on one decode, averaged (src/ensemble.rs).
@@ -373,6 +378,95 @@ fn run_melroformer(a: Args) -> Result<(), String> {
         }
         if a.verbose {
             eprintln!("  wrote {} in {:.1}s total", dir.display(), t1.elapsed().as_secs_f64());
+        }
+    }
+    if a.verbose {
+        eprintln!("done in {:.1}s, peak RSS {:.0} MB", t0.elapsed().as_secs_f64(), peak_rss_mb());
+    }
+    Ok(())
+}
+
+/// `-n chain`: Kim's vocals, then htdemucs + htdemucs_6s at shifts 0 on Kim's instrumental,
+/// averaged (src/chain.rs). Writes the ensemble's two folders: DIR/htdemucs/<track>/ (4-stem view,
+/// --clip-mode-4) and DIR/htdemucs_6s/<track>/ (6 stems), vocals being Kim's in both.
+fn run_chain(a: Args) -> Result<(), String> {
+    use htdemucs::chain;
+    use htdemucs::roformer::{Chunking, Config as KimConfig};
+    if a.opts.shifts > 1 || a.opts.overlap != Options::default().overlap || a.own_6s {
+        return Err("chain takes no --shifts / --overlap / --ensemble-own-6s (Demucs runs at shifts 0, overlap 0.25)".into());
+    }
+    let t0 = Instant::now();
+    let kim_cfg = KimConfig::load(a.weights.join("melroformer.json"))?;
+    let kim_ch = Chunking::new(&kim_cfg, a.num_overlap.unwrap_or(kim_cfg.num_overlap)).map_err(|e| format!("--num-overlap: {e}"))?;
+    let stride = chain::demucs_stride(&a.weights)?;
+    let names = |m: &str| -> Result<Vec<String>, String> { Ok(htdemucs::config::Config::load(a.weights.join(format!("{m}.json")))?.sources) };
+    let (src4, src6) = (names("htdemucs")?, names("htdemucs_6s")?);
+    let rate = kim_cfg.sample_rate as u32;
+    let mut rngs = [htdemucs::pyrandom::PyRandom::new(a.opts.seed), htdemucs::pyrandom::PyRandom::new(a.opts.seed)];
+    for track in &a.tracks {
+        let t1 = Instant::now();
+        let input = audio::decode(track)?;
+        let input = audio::resample(audio::to_channels(input, 2)?, rate)?;
+        let len = input.frames();
+        if a.verbose {
+            eprintln!("{}: {:.1} s of audio, decoded in {:.2}s", track.display(), len as f64 / rate as f64, t1.elapsed().as_secs_f64());
+        }
+        let name = track.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+        let set = |folder: &str, sources: &[String], clip: &str| -> Result<Vec<audio::StemWriter>, String> {
+            let dir = a.out.join(folder).join(name);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            let clip = audio::Clip::parse(clip).ok_or(format!("clip mode {clip}"))?;
+            sources.iter().map(|src| audio::StemWriter::create(&dir.join(format!("{src}.{}", a.format.ext())), 2, len, rate, a.format, clip)).collect()
+        };
+        // Both callbacks write to the same writer sets (vocals first, the rest as Demucs finishes).
+        let sets = std::cell::RefCell::new((set("htdemucs", &src4, a.clip4.as_deref().unwrap_or(&a.clip))?, set("htdemucs_6s", &src6, &a.clip)?));
+        let (v4, v6) = (src4.iter().position(|s| s == "vocals").ok_or("no vocals stem")?, src6.iter().position(|s| s == "vocals").ok_or("no vocals stem")?);
+        let (total, mut done) = (chain::forwards(&kim_ch, stride, len), 0);
+        let (t2, show, step_sec) = (Instant::now(), a.progress, len as f64 / rate as f64 / total.max(1) as f64);
+        if show {
+            tqdm_line(0, total, step_sec, 0.0);
+        }
+        let res = chain::separate(
+            &a.weights,
+            input.data,
+            a.num_overlap,
+            &mut rngs,
+            a.average_four,
+            &mut || {
+                done += 1;
+                if show {
+                    tqdm_line(done, total, step_sec, t2.elapsed().as_secs_f64());
+                }
+            },
+            &mut |l, r| {
+                let (s4, s6) = &mut *sets.borrow_mut();
+                s4[v4].push(&[l, r])?;
+                s6[v6].push(&[l, r])
+            },
+            &mut |four, six| {
+                let (s4, s6) = &mut *sets.borrow_mut();
+                for (t, ws, skip) in [(four, s4, v4), (six, s6, v6)] {
+                    let w = t.shape[2];
+                    for (i, wr) in ws.iter_mut().enumerate().filter(|(i, _)| *i != skip) {
+                        wr.push(&[&t.data[(i * 2) * w..(i * 2 + 1) * w], &t.data[(i * 2 + 1) * w..(i * 2 + 2) * w]])?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if show {
+            eprintln!();
+        }
+        let t3 = Instant::now();
+        let (s4, s6) = sets.into_inner();
+        s4.into_iter().chain(s6).collect::<Vec<_>>().into_par_iter().try_for_each(|w| w.finish())?;
+        if a.verbose {
+            eprintln!(
+                "  separated in {:.1}s, written in {:.1}s; stems sum to the mix within {:.1} dB (residual energy re the mix)",
+                t3.duration_since(t2).as_secs_f64(),
+                t3.elapsed().as_secs_f64(),
+                res.db()
+            );
         }
     }
     if a.verbose {

@@ -3,6 +3,7 @@
 
 pub mod apply;
 pub mod audio;
+pub mod chain;
 pub mod config;
 pub mod ensemble;
 pub mod model;
