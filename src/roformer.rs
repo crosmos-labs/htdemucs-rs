@@ -505,7 +505,7 @@ fn knob(name: &str, cell: &'static std::sync::OnceLock<usize>, default: usize) -
 /// Query rows per attention tile (the score tile is rows x seq_len); MR_ATTN_ROWS overrides.
 fn attn_rows() -> usize {
     static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    knob("MR_ATTN_ROWS", &C, 128)
+    knob("MR_ATTN_ROWS", &C, 256)
 }
 
 impl Block {
@@ -685,17 +685,18 @@ pub struct MelRoformer {
     band_out: Vec<BandOut>,
 }
 
-/// K transposed per head before the QK^T GEMMs (MR_ATTN_KT=0 disables).
+/// K transposed per head before the QK^T GEMMs (MR_ATTN_KT=1; off by default: on the runners
+/// the faster QK^T GEMM about paid for the transposes, no more).
 fn attn_kt() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *C.get_or_init(|| std::env::var("MR_ATTN_KT").as_deref() != Ok("0"))
+    *C.get_or_init(|| std::env::var("MR_ATTN_KT").as_deref() == Ok("1"))
 }
 
 /// Frames per frequency-transformer task (60 bands each): fixed, so results do not depend on
 /// the thread count; MR_FREQ_GROUP overrides.
 fn freq_group() -> usize {
     static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    knob("MR_FREQ_GROUP", &C, 8)
+    knob("MR_FREQ_GROUP", &C, 16)
 }
 
 impl MelRoformer {
