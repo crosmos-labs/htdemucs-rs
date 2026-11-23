@@ -28,7 +28,13 @@ use crate::tensor::Tensor;
 /// Combines one track's htdemucs (`four`, sources `four_names`) and htdemucs_6s (`six`, sources
 /// `six_names`) stems, each (sources, channels, len), in place (no extra copy of either). Returns
 /// (4-stem view in htdemucs' source order, 6-stem set in htdemucs_6s' source order).
-pub fn combine(mut four: Tensor, four_names: &[String], mut six: Tensor, six_names: &[String]) -> Result<(Tensor, Tensor), String> {
+pub fn combine(four: Tensor, four_names: &[String], six: Tensor, six_names: &[String]) -> Result<(Tensor, Tensor), String> {
+    combine_with(four, four_names, six, six_names, true)
+}
+
+/// [`combine`], with `average_four` false leaving the 4-stem view as htdemucs' own stems (the
+/// "hybrid": a 4-stem set from one model, the 6-stem set still the ensemble, at no extra cost).
+pub fn combine_with(mut four: Tensor, four_names: &[String], mut six: Tensor, six_names: &[String], average_four: bool) -> Result<(Tensor, Tensor), String> {
     let plane = four.numel() / four.shape[0].max(1);
     if six.numel() / six.shape[0].max(1) != plane {
         return Err("ensemble: the two models' outputs differ in length".into());
@@ -44,7 +50,9 @@ pub fn combine(mut four: Tensor, four_names: &[String], mut six: Tensor, six_nam
         let (a, b) = (&mut *planes4[i4], &mut *planes6[i6]);
         a.par_iter_mut().zip(b.par_iter_mut()).for_each(|(x, y)| {
             let m = (*x + *y) * 0.5;
-            *x = m;
+            if average_four {
+                *x = m;
+            }
             *y = m;
         });
     }
@@ -59,7 +67,9 @@ pub fn combine(mut four: Tensor, four_names: &[String], mut six: Tensor, six_nam
     let b = &mut *planes6[o6];
     a.par_iter_mut().zip(b.par_iter_mut()).enumerate().for_each(|(k, (x, y))| {
         let other4 = (*x + (gg[k] + pp[k] + *y)) * 0.5;
-        *x = other4;
+        if average_four {
+            *x = other4;
+        }
         *y = other4 - gg[k] - pp[k];
     });
     drop((planes4, planes6));
@@ -87,6 +97,10 @@ mod tests {
                 assert_eq!(a.data[i4 * pl + k], (four.data[i4 * pl + k] + six.data[i6 * pl + k]) * 0.5);
             }
         }
+        // average_four false: the 4-stem view is htdemucs' own, the 6-stem set the same as above.
+        let (a2, b2) = combine_with(four.clone(), &n4, six.clone(), &n6, false).unwrap();
+        assert_eq!(a2.data, four.data);
+        assert_eq!(b2.data, b.data);
         assert_eq!(st(&b, 4), st(&six, 4));
         assert_eq!(st(&b, 5), st(&six, 5));
         for k in 0..pl {

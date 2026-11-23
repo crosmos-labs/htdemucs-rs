@@ -30,6 +30,8 @@ options (demucs' names and defaults where they exist):
   --mp3                  not supported: write FLAC/WAV and encode afterwards
   --clip-mode MODE       rescale (default) | clamp | none
   --clip-mode-4 MODE     ensemble only: clip mode of the 4-stem view (default: --clip-mode)
+  --ensemble-4 VIEW      ensemble only: the 4-stem view is the average (mean, default) or
+                         htdemucs' own stems (htdemucs); the 6-stem set is the ensemble either way
   -q, --quiet            no progress bar (by default a tqdm-style bar on stderr, as demucs prints)
   -v, --verbose          timings and peak memory on stderr";
 
@@ -42,6 +44,7 @@ struct Args {
     format: Format,
     clip: String,
     clip4: Option<String>,
+    average_four: bool,
     num_overlap: Option<usize>,
     verbose: bool,
     progress: bool,
@@ -58,6 +61,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         format: Format::Wav16,
         clip: "rescale".into(),
         clip4: None,
+        average_four: true,
         num_overlap: None,
         verbose: false,
         progress: true,
@@ -90,6 +94,13 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
                     return Err(format!("--clip-mode-4: {m} (rescale, clamp or none)"));
                 }
                 a.clip4 = Some(m);
+            }
+            "--ensemble-4" => {
+                a.average_four = match val(&mut it, &arg)?.as_str() {
+                    "mean" => true,
+                    "htdemucs" => false,
+                    m => return Err(format!("--ensemble-4: {m} (mean or htdemucs)")),
+                };
             }
             "-v" | "--verbose" => a.verbose = true,
             "-q" | "--quiet" => a.progress = false,
@@ -225,7 +236,7 @@ fn run(a: Args) -> Result<(), String> {
         // (folder, source names, stems, clip mode): one set, or the ensemble's 4- and 6-stem views.
         let sets: Vec<(&str, &[String], Tensor, &str)> = if ensemble {
             let (six, four) = (seps.remove(0).stems, seps.remove(0).stems);
-            let (v4, v6) = htdemucs::ensemble::combine(four, models[1].sources(), six, models[0].sources())?;
+            let (v4, v6) = htdemucs::ensemble::combine_with(four, models[1].sources(), six, models[0].sources(), a.average_four)?;
             vec![("htdemucs", models[1].sources(), v4, a.clip4.as_deref().unwrap_or(&a.clip)), ("htdemucs_6s", models[0].sources(), v6, &a.clip)]
         } else {
             vec![(a.name.as_str(), models[0].sources(), seps.remove(0).stems, &a.clip)]
