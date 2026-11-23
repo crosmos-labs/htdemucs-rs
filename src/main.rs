@@ -9,12 +9,14 @@ use std::time::Instant;
 
 use htdemucs::apply::{self, Options};
 use htdemucs::audio::{self, Format};
-use htdemucs::HTDemucs;
+use htdemucs::{HTDemucs, Tensor};
 
 const USAGE: &str = "usage: htdemucs-rs separate -n <htdemucs|htdemucs_6s> [options] <tracks>...
 
 options (demucs' names and defaults where they exist):
-  -n, --name NAME        model (default htdemucs)
+  -n, --name NAME        model (default htdemucs), or ensemble: htdemucs and htdemucs_6s on one
+                         decode, averaged; writes DIR/htdemucs/<track>/ (4 stems) and
+                         DIR/htdemucs_6s/<track>/ (6 stems) - see src/ensemble.rs
   --weights DIR          converted weights (default $HTDEMUCS_WEIGHTS, else ./weights)
   -o, --out DIR          output root (default separated); files go to DIR/NAME/<track>/<stem>.<ext>
   --shifts N             random time shifts averaged (default 1)
@@ -25,6 +27,7 @@ options (demucs' names and defaults where they exist):
   --flac                 write 16-bit FLAC
   --mp3                  not supported: write FLAC/WAV and encode afterwards
   --clip-mode MODE       rescale (default) | clamp | none
+  --clip-mode-4 MODE     ensemble only: clip mode of the 4-stem view (default: --clip-mode)
   -q, --quiet            no progress bar (by default a tqdm-style bar on stderr, as demucs prints)
   -v, --verbose          timings and peak memory on stderr";
 
@@ -36,6 +39,7 @@ struct Args {
     threads: Option<usize>,
     format: Format,
     clip: String,
+    clip4: Option<String>,
     verbose: bool,
     progress: bool,
     tracks: Vec<PathBuf>,
@@ -50,6 +54,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         threads: None,
         format: Format::Wav16,
         clip: "rescale".into(),
+        clip4: None,
         verbose: false,
         progress: true,
         tracks: vec![],
@@ -73,6 +78,13 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
                 if !["rescale", "clamp", "none"].contains(&a.clip.as_str()) {
                     return Err(format!("--clip-mode: {} (rescale, clamp or none)", a.clip));
                 }
+            }
+            "--clip-mode-4" => {
+                let m = val(&mut it, &arg)?;
+                if !["rescale", "clamp", "none"].contains(&m.as_str()) {
+                    return Err(format!("--clip-mode-4: {m} (rescale, clamp or none)"));
+                }
+                a.clip4 = Some(m);
             }
             "-v" | "--verbose" => a.verbose = true,
             "-q" | "--quiet" => a.progress = false,
@@ -153,13 +165,19 @@ fn run(a: Args) -> Result<(), String> {
         rayon::ThreadPoolBuilder::new().num_threads(t).build_global().map_err(|e| e.to_string())?;
     }
     let t0 = Instant::now();
-    let model = HTDemucs::load(&a.weights, &a.name)?;
-    apply::stride(&model, a.opts.overlap).map_err(|e| format!("--overlap: {e}"))?;
-    let rate = model.cfg.samplerate as u32;
-    let ch = model.cfg.audio_channels;
+    // `-n ensemble`: htdemucs_6s and htdemucs on one decode, averaged (src/ensemble.rs).
+    let ensemble = a.name == "ensemble";
+    let names: &[&str] = if ensemble { &["htdemucs_6s", "htdemucs"] } else { &[a.name.as_str()] };
+    let models = names.iter().map(|n| HTDemucs::load(&a.weights, n)).collect::<Result<Vec<_>, _>>()?;
+    for m in &models {
+        apply::stride(m, a.opts.overlap).map_err(|e| format!("--overlap: {e}"))?;
+    }
+    let rate = models[0].cfg.samplerate as u32;
+    let ch = models[0].cfg.audio_channels;
     // Python's `random` as demucs sees it: seeded once, then carried on across the tracks of one
-    // run (demucs.separate separates them one after another with the same generator).
-    let mut rng = htdemucs::pyrandom::PyRandom::new(a.opts.seed);
+    // run (demucs.separate separates them one after another with the same generator). One per
+    // model, so each model's stems are exactly what its own demucs run would give.
+    let mut rngs: Vec<_> = models.iter().map(|_| htdemucs::pyrandom::PyRandom::new(a.opts.seed)).collect();
     for track in &a.tracks {
         let t1 = Instant::now();
         let input = audio::decode(track)?;
@@ -168,11 +186,11 @@ fn run(a: Args) -> Result<(), String> {
         if a.verbose {
             eprintln!("{}: {:.1} s of audio, decoded in {:.2}s", track.display(), len as f64 / rate as f64, t1.elapsed().as_secs_f64());
         }
-        let total = apply::forwards(&model, len, &a.opts, &rng);
+        let total: usize = models.iter().zip(&rngs).map(|(m, r)| apply::forwards(m, len, &a.opts, r)).sum();
         let mut done = 0;
         let t2 = Instant::now();
         let show = a.progress;
-        let stride_sec = ((1.0 - a.opts.overlap) * model.cfg.training_length as f32) as f64 / rate as f64;
+        let stride_sec = ((1.0 - a.opts.overlap) * models[0].cfg.training_length as f32) as f64 / rate as f64;
         if show {
             tqdm_line(0, total, stride_sec, 0.0);
         }
@@ -182,30 +200,43 @@ fn run(a: Args) -> Result<(), String> {
                 tqdm_line(done, total, stride_sec, t2.elapsed().as_secs_f64());
             }
         };
-        let sep = apply::separate(&model, &input.data, ch, &a.opts, &mut rng, &mut progress);
+        let mut seps = vec![];
+        for (m, r) in models.iter().zip(rngs.iter_mut()) {
+            seps.push(apply::separate(m, &input.data, ch, &a.opts, r, &mut progress));
+        }
         drop(input); // not needed any more: free it before writing
-        let mut stems = sep.stems;
         if show {
             eprintln!();
         }
-        if sep.silent {
+        if seps[0].silent {
             eprintln!("warning: {}: the input is silent (or constant): writing silent stems", track.display());
         }
         if a.verbose {
             eprintln!("  separated in {:.1}s", t2.elapsed().as_secs_f64());
         }
+        // (folder, source names, stems, clip mode): one set, or the ensemble's 4- and 6-stem views.
+        let sets: Vec<(&str, &[String], Tensor, &str)> = if ensemble {
+            let (six, four) = (seps.remove(0).stems, seps.remove(0).stems);
+            let (v4, v6) = htdemucs::ensemble::combine(&four, models[1].sources(), &six, models[0].sources())?;
+            drop((four, six));
+            vec![("htdemucs", models[1].sources(), v4, a.clip4.as_deref().unwrap_or(&a.clip)), ("htdemucs_6s", models[0].sources(), v6, &a.clip)]
+        } else {
+            vec![(a.name.as_str(), models[0].sources(), seps.remove(0).stems, &a.clip)]
+        };
         let name = track.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
-        let dir = a.out.join(&a.name).join(name);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let plane = ch * len;
-        for (i, src) in model.sources().iter().enumerate() {
-            let x = &mut stems.data[i * plane..(i + 1) * plane];
-            prevent_clip(x, &a.clip);
-            let path = dir.join(format!("{src}.{}", a.format.ext()));
-            audio::write(Path::new(&path), x, ch, rate, a.format)?;
-        }
-        if a.verbose {
-            eprintln!("  wrote {} in {:.1}s total", dir.display(), t1.elapsed().as_secs_f64());
+        for (folder, sources, mut stems, clip) in sets {
+            let dir = a.out.join(folder).join(name);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            for (i, src) in sources.iter().enumerate() {
+                let x = &mut stems.data[i * plane..(i + 1) * plane];
+                prevent_clip(x, clip);
+                let path = dir.join(format!("{src}.{}", a.format.ext()));
+                audio::write(Path::new(&path), x, ch, rate, a.format)?;
+            }
+            if a.verbose {
+                eprintln!("  wrote {} in {:.1}s total", dir.display(), t1.elapsed().as_secs_f64());
+            }
         }
     }
     if a.verbose {

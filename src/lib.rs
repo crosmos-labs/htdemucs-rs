@@ -4,6 +4,7 @@
 pub mod apply;
 pub mod audio;
 pub mod config;
+pub mod ensemble;
 pub mod model;
 pub mod ops;
 pub mod pyrandom;
