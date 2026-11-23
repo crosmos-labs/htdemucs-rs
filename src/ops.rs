@@ -136,6 +136,28 @@ pub fn avx2_fma() -> bool {
     }
 }
 
+/// True if the CPU has AVX-512 F + VL (x86-64; `HTDEMUCS_NO_AVX512` disables): elementwise kernels
+/// then run in a third version compiled for it (16 lanes). Results are the same as the AVX2+FMA
+/// version's: the kernels are lane-independent or reduce in an order fixed by the source.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn avx512() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    static S: AtomicU8 = AtomicU8::new(0);
+    match S.load(Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("HTDEMUCS_NO_AVX512").is_none()
+                && avx2_fma()
+                && std::is_x86_feature_detected!("avx512f")
+                && std::is_x86_feature_detected!("avx512vl");
+            S.store(if on { 1 } else { 2 }, Relaxed);
+            on
+        }
+    }
+}
+
 /// a * b + c: fused (one rounding) in code compiled for FMA hardware (`Fused`: the AVX2+FMA
 /// versions on x86-64, always on aarch64), else a multiply and an add (`Unfused`; without the
 /// target feature, mul_add would be a slow library call).
@@ -162,8 +184,8 @@ pub type Native = Fused;
 #[cfg(not(target_arch = "aarch64"))]
 pub type Native = Unfused;
 
-/// Defines a function whose body is compiled twice on x86-64 - for the baseline and for
-/// AVX2 + FMA - and picks one at run time (see `avx2_fma`). Elsewhere, just the function. The
+/// Defines a function whose body is compiled three times on x86-64 - for the baseline, AVX2 + FMA
+/// and AVX-512 - and picks one at run time (see `avx2_fma`, `avx512`). Elsewhere, just the function. The
 /// body sees a type `F: MulAdd` (Fused in the AVX2+FMA version and on aarch64).
 macro_rules! simd_fn {
     ($(#[$m:meta])* $vis:vis fn $name:ident($($a:ident : $t:ty),* $(,)?) $(-> $r:ty)? $body:block) => {
@@ -176,10 +198,18 @@ macro_rules! simd_fn {
             fn imp<F: crate::ops::MulAdd>($($a: $t),*) $(-> $r)? $body
             #[cfg(target_arch = "x86_64")]
             {
+                #[target_feature(enable = "avx512f,avx512vl,avx2,fma")]
+                #[allow(clippy::too_many_arguments)]
+                unsafe fn v4($($a: $t),*) $(-> $r)? {
+                    imp::<crate::ops::Fused>($($a),*)
+                }
                 #[target_feature(enable = "avx2,fma")]
                 #[allow(clippy::too_many_arguments)]
                 unsafe fn v3($($a: $t),*) $(-> $r)? {
                     imp::<crate::ops::Fused>($($a),*)
+                }
+                if crate::ops::avx512() {
+                    return unsafe { v4($($a),*) };
                 }
                 if crate::ops::avx2_fma() {
                     return unsafe { v3($($a),*) };

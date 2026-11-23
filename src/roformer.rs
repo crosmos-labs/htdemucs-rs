@@ -438,15 +438,23 @@ impl Rope {
     #[inline]
     fn apply(&self, x: &mut [f32], p: usize, dim_head: usize) {
         let h = dim_head / 2;
-        let (c, s) = (&self.cos[p * h..(p + 1) * h], &self.sin[p * h..(p + 1) * h]);
-        for head in x.chunks_exact_mut(dim_head) {
-            for i in 0..h {
-                let (a, b) = (head[2 * i], head[2 * i + 1]);
-                head[2 * i] = a * c[i] + -b * s[i];
-                head[2 * i + 1] = b * c[i] + a * s[i];
-            }
+        rope_row(x, &self.cos[p * h..(p + 1) * h], &self.sin[p * h..(p + 1) * h]);
+    }
+}
+
+simd_fn! {
+/// One row's heads rotated (see `Rope::apply`): pairs (a, b) -> (a c - b s, b c + a s), each
+/// product rounded, as torch's t * cos + rotate_half(t) * sin.
+fn rope_row(x: &mut [f32], c: &[f32], s: &[f32]) {
+    let h = c.len();
+    for head in x.chunks_exact_mut(2 * h) {
+        for ((pr, &ci), &si) in head.chunks_exact_mut(2).zip(c).zip(s) {
+            let (a, b) = (pr[0], pr[1]);
+            pr[0] = a * ci + -b * si;
+            pr[1] = b * ci + a * si;
         }
     }
+}
 }
 
 /// One `Transformer` of depth 1: Attention (RMSNorm, qkv, rotary, attention, gates, to_out),
@@ -1219,5 +1227,26 @@ mod tests {
         let y = s.istft(&s.stft(&x, len), s.frames(len));
         let err = x.iter().zip(&y).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         assert!(err < 1e-6, "round trip error {err}");
+    }
+}
+
+/// Kernel entry points for micro-benchmarks (examples/).
+#[doc(hidden)]
+pub mod micro {
+    pub fn softmax(rows: &mut [f32], n: usize) {
+        rows.chunks_exact_mut(n).for_each(|r| {
+            super::softmax_unnorm(r, 0.125);
+        });
+    }
+    pub fn bias_gelu(x: &mut [f32], b: &[f32]) {
+        x.chunks_exact_mut(b.len()).for_each(|r| super::bias_gelu_row(r, b));
+    }
+    pub fn bias_tanh(x: &mut [f32], b: &[f32]) {
+        x.chunks_exact_mut(b.len()).for_each(|r| super::bias_tanh_row(r, b));
+    }
+    pub fn rms(x: &[f32], o: &mut [f32], g: &[f32]) {
+        for (a, b) in x.chunks_exact(g.len()).zip(o.chunks_exact_mut(g.len())) {
+            super::rms_norm_row(a, b, 19.6, g);
+        }
     }
 }
