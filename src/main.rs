@@ -25,7 +25,8 @@ options (demucs' names and defaults where they exist):
   --flac                 write 16-bit FLAC
   --mp3                  not supported: write FLAC/WAV and encode afterwards
   --clip-mode MODE       rescale (default) | clamp | none
-  -v, --verbose          progress and timings on stderr";
+  -q, --quiet            no progress bar (by default a tqdm-style bar on stderr, as demucs prints)
+  -v, --verbose          timings and peak memory on stderr";
 
 struct Args {
     name: String,
@@ -36,6 +37,7 @@ struct Args {
     format: Format,
     clip: String,
     verbose: bool,
+    progress: bool,
     tracks: Vec<PathBuf>,
 }
 
@@ -49,6 +51,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         format: Format::Wav16,
         clip: "rescale".into(),
         verbose: false,
+        progress: true,
         tracks: vec![],
     };
     let val = |it: &mut dyn Iterator<Item = String>, flag: &str| it.next().ok_or(format!("{flag} needs a value"));
@@ -72,6 +75,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
                 }
             }
             "-v" | "--verbose" => a.verbose = true,
+            "-q" | "--quiet" => a.progress = false,
             "-h" | "--help" => return Err(String::new()),
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
             _ => a.tracks.push(arg.into()),
@@ -98,6 +102,47 @@ fn prevent_clip(x: &mut [f32], mode: &str) {
         "clamp" => x.iter_mut().for_each(|v| *v = v.clamp(-0.99, 0.99)),
         _ => {}
     }
+}
+
+/// Exactly how many segment forwards `apply::separate` will run: replays the shift offsets with
+/// the same CPython-compatible generator (each pass: randint, then one randrange(1) per segment).
+fn segment_count(model: &HTDemucs, len: usize, opts: &Options) -> usize {
+    let seg = model.cfg.training_length;
+    let stride = ((1.0 - opts.overlap) * seg as f32) as usize;
+    if opts.shifts == 0 {
+        return len.div_ceil(stride);
+    }
+    let ms = model.cfg.samplerate / 2;
+    let mut rng = htdemucs::pyrandom::PyRandom::new(opts.seed);
+    let mut total = 0;
+    for _ in 0..opts.shifts {
+        let offset = rng.randint(0, ms as u32) as usize;
+        let n = (len + ms - offset).div_ceil(stride);
+        for _ in 0..n {
+            rng.randrange(1);
+        }
+        total += n;
+    }
+    total
+}
+
+fn mmss(s: f64) -> String {
+    let s = s.max(0.0).round() as u64;
+    format!("{:02}:{:02}", s / 60, s % 60)
+}
+
+/// One progress line in tqdm's format, as demucs prints it (unit: seconds of audio, a segment
+/// counting as one stride): ` 42%|████▏     | 122.9/292.5 [00:41<00:57,  2.97seconds/s]`.
+/// Fretboard's parser reads the last "done/total [". Unlike demucs, whose bar restarts for each
+/// shift pass, this one bar covers every pass, so it only goes forward.
+fn tqdm_line(done: usize, total: usize, stride_sec: f64, elapsed: f64) {
+    let (d, t) = (done as f64 * stride_sec, total as f64 * stride_sec);
+    let frac = if total > 0 { done as f64 / total as f64 } else { 1.0 };
+    let filled = (frac * 10.0).floor() as usize;
+    let bar: String = "█".repeat(filled) + &" ".repeat(10 - filled.min(10));
+    let rate = if elapsed > 0.0 { d / elapsed } else { 0.0 };
+    let eta = if done > 0 { elapsed / done as f64 * (total - done) as f64 } else { 0.0 };
+    eprint!("\r{:3.0}%|{bar}| {d:.1}/{t:.1} [{}<{}, {rate:6.2}seconds/s]", frac * 100.0, mmss(elapsed), if done > 0 { mmss(eta) } else { "?".into() });
 }
 
 fn peak_rss_mb() -> f64 {
@@ -138,19 +183,26 @@ fn run(a: Args) -> Result<(), String> {
         if a.verbose {
             eprintln!("{}: {:.1} s of audio, decoded in {:.2}s", track.display(), len as f64 / rate as f64, t1.elapsed().as_secs_f64());
         }
-        let total = apply::forwards(&model, len, &a.opts);
+        let total = segment_count(&model, len, &a.opts);
         let mut done = 0;
         let t2 = Instant::now();
-        let verbose = a.verbose;
+        let show = a.progress;
+        let stride_sec = ((1.0 - a.opts.overlap) * model.cfg.training_length as f32) as f64 / rate as f64;
+        if show {
+            tqdm_line(0, total, stride_sec, 0.0);
+        }
         let mut progress = || {
             done += 1;
-            if verbose {
-                eprint!("\r  segment {done} (~{total} total) {:.1}s", t2.elapsed().as_secs_f64());
+            if show {
+                tqdm_line(done, total, stride_sec, t2.elapsed().as_secs_f64());
             }
         };
         let mut stems = apply::separate(&model, &input.data, ch, &a.opts, &mut progress);
+        if show {
+            eprintln!();
+        }
         if a.verbose {
-            eprintln!("\n  separated in {:.1}s", t2.elapsed().as_secs_f64());
+            eprintln!("  separated in {:.1}s", t2.elapsed().as_secs_f64());
         }
         let name = track.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
         let dir = a.out.join(&a.name).join(name);
