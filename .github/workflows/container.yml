@@ -13,6 +13,10 @@ on:
         description: time 60 s / 240 s clips for instance sizing
         type: boolean
         default: true
+      threads_1:
+        description: also time -n ensemble --shifts 2 on the 60 s clip at --threads 1 (one SMT sibling idle)
+        type: boolean
+        default: false
       long_minutes:
         description: "also run -n ensemble --shifts 0 on a clip this long, for memory (0: skip; 22 = Fretboard's limit)"
         default: "0"
@@ -33,6 +37,7 @@ concurrency:
 
 env:
   SIZING: ${{ github.event_name == 'push' || inputs.sizing }}
+  THREADS_1: ${{ inputs.threads_1 || false }}
   LONG_MINUTES: ${{ inputs.long_minutes || '0' }}
   MIN_DB: "90"
 
@@ -175,6 +180,10 @@ jobs:
           .github/container/job.sh htdemucs-rs:distroless "ensemble s0 60s" "name=ensemble&shifts=0&format=flac" clips/synth60.wav out/e0-60 60
           .github/container/job.sh htdemucs-rs:distroless "ensemble s0 240s" "name=ensemble&shifts=0&format=flac" clips/synth240.wav out/e0-240 240
           .github/container/job.sh htdemucs-rs:distroless "htdemucs_6s s0 240s" "name=htdemucs_6s&shifts=0&format=flac" clips/synth240.wav out/s6-240 240
+
+      - name: Sizing, one thread
+        if: env.THREADS_1 == 'true'
+        run: .github/container/job.sh htdemucs-rs:distroless "ensemble s2 60s threads=1" "name=ensemble&shifts=2&threads=1&format=flac" clips/synth60.wav out/e2-60-t1 60
 
       - name: Long clip (memory)
         if: env.LONG_MINUTES != '0'
