@@ -11,7 +11,9 @@ Priorities, in order: quality (match PyTorch Demucs), speed, build size.
 well above 100 dB SNR per stem against PyTorch CPU float32 (see Parity). `-n melroformer` runs
 Kim's Mel-Band RoFormer vocal model (vocals + instrumental; +3.7 dB vocal SDR over htdemucs on
 MUSDB18-HQ), matching its PyTorch inference to 101-135 dB per stem on six full tracks with 37-60%
-less CPU than PyTorch on x86 (see *Mel-Band RoFormer*).
+less CPU than PyTorch on x86 (see *Mel-Band RoFormer*). `-n chain` runs round 3's best recipe -
+Kim's vocals, then the htdemucs + htdemucs_6s ensemble on Kim's instrumental - matching the
+PyTorch pipeline to 108-132 dB per stem (see *Chain*).
 
 ## Usage
 
@@ -133,6 +135,9 @@ src/roformer.rs      Mel-Band RoFormer: config, STFT / iSTFT, forward, upstream 
 tools/melroformer.py its converter, PyTorch references (chunk dump, full song, float64), timing
 tools/mr_parity_songs.sh   its full-song parity + CPU time vs PyTorch
 src/bin/mr_parity.rs, mr_bench.rs   its chunk parity (+ each transformer alone) and chunk timing
+src/chain.rs         -n chain: Kim vocals, then the ensemble on the instrumental (streamed)
+tools/chain_ref.py   its PyTorch reference (round 3's k+chain_avg on CPU float32)
+tools/chain_box.sh, chain_musdb.sh, measure.sh   its parity / uSDR / memory / CPU runs on Linux
 .github/workflows/bench-roformer.yml   its x86 parity / speed runs (settings: .github/bench/mr_run.env)
 ```
 
@@ -280,6 +285,7 @@ accompaniment 18.76 vs 15.08 - `research/round1/round1.md`, round 2).
 ```sh
 PY="uv run --quiet --python 3.11.17 --with-requirements research/round1/kim_env.txt python"
 $PY tools/melroformer.py convert <Mel-Band-Roformer-Vocal-Model repo @25f44ff> MelBandRoformer.ckpt
+#   (float16; add --float32 for the parity checks' melroformer-f32)
 htdemucs-rs separate -n melroformer --flac --clip-mode clamp -o out song.m4a
 # -> out/melroformer/song/{vocals,instrumental}.flac
 ```
@@ -309,11 +315,12 @@ whole-buffer `demix_track`).
 **Weights.** The checkpoint (huggingface.co/KimberleyJSN/melbandroformer, `MelBandRoformer.ckpt`,
 913 MB, sha256 `87201f4d…7559e`; MIT since 2026-04-22, see `research/round1/round1.md` for the
 licence history and the open training-data question) is float32 and **not** float16-exact (none
-of its 684 tensors). So `weights/melroformer.safetensors` stays float32 (913 MB; 228.2 M
-parameters, 88% of them in the 60 mask MLPs). Float16 weights (`convert --half`, 457 MB, loaded
-with `MELROFORMER_WEIGHTS=melroformer-f16`) cost parity: Aerials chunk 10 drops from 128 dB to
-72 dB against PyTorch - inaudible, but it is no longer the same model's output, so float32 is
-the default.
+of its 684 tensors; 228.2 M parameters, 88% of them in the 60 mask MLPs). Float16 weights cost
+parity - Aerials chunk 10 drops from 128 dB to 72 dB against PyTorch float32 - but not separation
+quality: within 0.0004 dB uSDR on every stem of four MUSDB tracks (see *Chain*, float16). So
+`convert` writes `weights/melroformer.safetensors` in **float16 (457 MB)**; `convert --float32`
+writes `melroformer-f32.safetensors` (913 MB), which the parity checks below load
+(`MELROFORMER_WEIGHTS=melroformer-f32`). Weights are widened to float32 on load either way.
 
 ### Parity (vs PyTorch 2.2.2 CPU float32, upstream code)
 
