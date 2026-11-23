@@ -6,9 +6,40 @@ htdemucs_6s, 2 seeded shifts).
 
 Priorities, in order: quality (match PyTorch Demucs), speed, build size.
 
-**Status:** the HTDemucs forward pass for one segment (7.8 s) works for both `htdemucs` (4 stems)
-and `htdemucs_6s` (6 stems) and matches PyTorch CPU float32 at 120-131 dB SNR, layer by layer.
-Full-song separation (segmentation with overlap-add, shifts, normalisation, audio I/O) is next.
+**Status:** `htdemucs-rs separate` separates whole songs with `htdemucs` (4 stems) and
+`htdemucs_6s` (6 stems), reproducing `demucs.separate` - including its seeded random shifts - to
+well above 100 dB SNR per stem against PyTorch CPU float32 (see Parity).
+
+## Usage
+
+```sh
+cargo build --release                         # Linux / any CPU
+cargo build --release --features accelerate   # macOS: Accelerate BLAS (faster)
+htdemucs-rs separate -n htdemucs_6s --shifts 2 --seed 0 --flac --clip-mode clamp -o out song.m4a
+# -> out/htdemucs_6s/song/{drums,bass,other,vocals,guitar,piano}.flac
+```
+
+Same options and defaults as demucs where they exist (`-n`, `--shifts` (1), `--overlap` (0.25),
+`-o` (separated), `--float32`, `--flac`, `--clip-mode` rescale|clamp, output layout), plus
+`--seed` (default 0; equals `random.seed(S); torch.manual_seed(S)` before demucs, as Fretboard's
+`demucs_seeded.py` does), `--threads`, `--weights DIR` (or `$HTDEMUCS_WEIGHTS`), and
+`--clip-mode none`. No `--mp3`: write FLAC/WAV and encode afterwards.
+
+Input: WAV (PCM / float), FLAC, MP3, AAC in MP4/M4A, decoded in pure Rust (symphonia), converted
+like demucs (to 44.1 kHz only if needed, mono duplicated, more than 2 channels: the first two).
+MP4 edit lists are applied as ffmpeg does (symphonia ignores them), so an M4A decodes to the
+same length and alignment as ffmpeg's. Output 16-bit samples are quantised exactly like demucs'
+torchaudio/libsndfile writer (WAV: top 16 bits of round(x * 2^31); FLAC: round-half-even of
+x * 32768).
+
+Reproducing demucs' shifts exactly needs Python's own random numbers: `src/pyrandom.rs` is
+CPython 3.11's MT19937 with `random.seed(int)`, `getrandbits`, `randrange` and `randint`. Each
+shift draws `randint(0, 22050)`, and every segment forward in between draws `randrange(1)`
+(the transformer's positional-embedding shift), which returns 0 but consumes generator output -
+so the second offset depends on the first pass's segment count. With seed 0 the first offset is
+always 12623.
+
+Memory: one segment's activations at a time, plus the output buffers.
 
 ## How it is built, and why
 
@@ -55,7 +86,15 @@ src/model.rs         HTDemucs forward (encoders, decoders, frequency embedding, 
 src/transformer.rs   the cross-domain transformer
 src/stft.rs          HTDemucs' _spec / _ispec
 src/ops.rs           kernels (GEMM wrapper, conv, conv-transpose, norms, activations, attention)
+src/main.rs          the `htdemucs-rs separate` CLI
+src/apply.rs         demucs' separate.py + apply_model: normalisation, shifts, segments, overlap-add
+src/pyrandom.rs      CPython-compatible random (MT19937, randint / randrange)
+src/audio.rs         decode (symphonia + MP4 edit lists), resample, WAV / FLAC writers
 src/bin/parity.rs    per-layer comparison with the reference dumps
+src/bin/compare.rs   full-song stems vs a PyTorch reference
+src/bin/decodecmp.rs our decode vs ffmpeg's
+tools/ref_separate.py, ref_songs.sh   full-song PyTorch references (demucs' own code path)
+tools/parity_songs.sh, decode_effect.sh, docker_x86.sh   full-song parity, decoder effect, x86 check
 src/bin/bench.rs     segment timing (+ HTDEMUCS_PROFILE=1 per-layer profile)
 ```
 
