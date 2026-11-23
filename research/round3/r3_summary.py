@@ -162,3 +162,29 @@ for s in ST:
     cols = [v for v in KEY if any(val(v, t, s) is not None for t in tracks)]
     print(f'\n### {s}\n\n| track | ' + ' | '.join(f'`{v}`' for v in cols) + ' |\n|---|' + '---|' * len(cols))
     for t in tracks: print(f'| {t[:30]} | ' + ' | '.join(f(val(v, t, s)) for v in cols) + ' |')
+
+print('\n## Guitar proxy (htdemucs_6s guitar stem; no guitar reference in MUSDB)\n')
+print('Per 1 s window and channel the guitar estimate is fit by least squares on the reference vocals, drums, bass and other. '
+      'Columns: energy (dB, relative to the guitar estimate) explained by vocals + drums + bass (bleed, lower is better), by other, '
+      'and unexplained; last column = guitar estimate energy relative to the reference other. '
+      '"With guitar" = the 9 tracks whose Cambridge-MT multitracks have guitar tracks (2017 metadata; Cristina Vane unknown, '
+      'AM Contra and Little Chicago\'s Finest have none).\n')
+GT = {}
+for f in glob.glob('data/guitar/*/*.json'):
+    d = json.load(open(f)); GT.setdefault(d['variant'], {})[d['track']] = d
+NOG = ('AM Contra', "Little Chicago's Finest", 'Cristina Vane')
+gtr = [t for t in tracks if not t.startswith(NOG)]
+K4 = ['vdb_bleed_dB', 'other_fit_dB', 'unexplained_dB', 'energy_vs_other_dB']
+print('| variant | tracks | ' + ' | '.join(K4) + ' |\n|---|---|' + '---|' * 4)
+for v in ['6s_s0', '6s_tsw', '6s_tpo', '6s_tswpo', '6s_t4', 'k+chain_6s']:
+    for lab, ts in (('all', tracks), ('with guitar', gtr)):
+        xs = [GT.get(v, {}).get(t) for t in ts]
+        if all(xs): print(f'| `{v}` | {lab} ({len(ts)}) | ' + ' | '.join(f'{np.mean([x[k] for x in xs]):.2f}' for k in K4) + ' |')
+print('\nPaired Δ vs `6s_s0` on the tracks with guitar (negative bleed Δ = less vocals/drums/bass in the guitar stem):\n')
+print('| variant | ' + ' | '.join(K4) + ' |\n|---|' + '---|' * 4)
+for v in ['6s_tsw', '6s_t4', 'k+chain_6s']:
+    cells = []
+    for k in K4:
+        d = np.array([GT[v][t][k] - GT['6s_s0'][t][k] for t in gtr if t in GT.get(v, {}) and t in GT['6s_s0']])
+        cells.append(f'{d.mean():+.2f} ({int((d < 0).sum())}/{len(d)} lower)' if len(d) else '–')
+    print(f'| `{v}` | ' + ' | '.join(cells) + ' |')
