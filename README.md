@@ -270,7 +270,8 @@ centred) -> 60 overlapping mel bands of bins, each RMSNorm + Linear to 384 -> 6 
 transformer over each band's 801 frames, frequency transformer over each frame's 60 bands;
 RoPE, gated attention, 8 x 64 heads, GELU MLP) -> per-band tanh MLP + GLU -> complex mask,
 averaged where bands overlap -> iSTFT. `instrumental` = mix - vocals, as upstream writes it.
-There are no shifts or seeds (`--shifts` / `--overlap` are refused).
+There are no shifts or seeds (`--shifts` / `--overlap` are refused). Output formats and clip
+modes are the Demucs path's (`--float32`, `--flac`, `--clip-mode`).
 
 **How.** `src/roformer.rs` reuses the crate's GEMM (gemm crate, runtime AVX2 / AVX-512 dispatch)
 and its elementwise style. Each transformer runs as tasks of a fixed shape - one band (801 tokens)
@@ -358,10 +359,13 @@ AVX-512 versions of the elementwise kernels; tile sizes from A/B runs. Tried and
 copied per head for the QK^T GEMM (faster GEMM, paid back in copies), 64-row tiles, 8-frame
 frequency tasks (1-3% slower).
 
-Memory: weights 0.91 GB (float32) + input + vocals (2 x 4 bytes x samples each) + one chunk's
-activations (~0.15 GB plus ~10 MB per thread). The safetensors loader now reads tensor by
-tensor (it used to hold the whole file and the tensors at once, ~1.8 GB at load). Peak RSS:
-Aerials, M1 Pro, 4 threads, `2f8583f`: **1.35 GB peak memory footprint** (1.51 GB max RSS; 1.83 GB footprint before the streaming loader), Iss Tarah (5.4 min) 1.30 GB; on the CI clip (Linux) 1.09 GB max RSS. PyTorch: 2.4 GB on Aerials (4 threads), 2.35 GB on the 12 s CI clip vs 1.09 GB here.
+Memory: weights 0.91 GB (float32) + the decoded input (2 x 4 bytes x samples) + one chunk's
+activations (~0.15 GB plus ~10 MB per thread) + a one-chunk overlap-add window; both stems are
+written as they are finalised (`audio::StemWriter`, as the Demucs path), so nothing else grows
+with the track. The safetensors loader now reads tensor by tensor (it used to hold the whole file
+and the tensors at once, ~1.8 GB at load). Aerials, M1 Pro, 4 threads: **1.29 GB peak memory
+footprint** (1.44 GB max RSS); before streaming the loader and the output, 1.83 GB. PyTorch:
+2.4 GB on Aerials (4 threads); on the 12 s CI clip (Linux) 2.35 GB vs 1.09 GB here.
 
 Binary: 2.5 MB (macOS) / 4.4 MB (Linux x86-64) with both models and the AVX-512 kernels.
 
