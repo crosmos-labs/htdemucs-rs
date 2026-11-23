@@ -110,19 +110,19 @@ jobs:
         run: |
           docker pull -q gcr.io/distroless/cc-debian13:nonroot > /dev/null
           docker pull -q debian:trixie-slim > /dev/null
-          row() { # image -> uncompressed MB, gzip MB
-            u=$(docker image inspect -f '{{.Size}}' "$1"); c=$(docker save "$1" | gzip -6 | wc -c)
-            printf '| %s | %.1f | %.1f |\n' "$1" "$(echo "$u/1000000" | bc -l)" "$(echo "$c/1000000" | bc -l)"
-          }
           {
-            echo "### Image sizes (MB = 10^6 bytes; compressed = docker save | gzip -6)"
-            echo "| image | uncompressed | compressed |"
-            echo "|---|---|---|"
-            for i in htdemucs-rs:distroless htdemucs-rs:debian gcr.io/distroless/cc-debian13:nonroot debian:trixie-slim; do row $i; done
+            echo "### Image sizes (MB = 10^6 bytes; from docker save, per layer: uncompressed tar, gzip -6)"
+            echo "| image | layers | uncompressed | compressed | layers > 1 MB (uncompressed/compressed) |"
+            echo "|---|---|---|---|---|"
+            for i in htdemucs-rs:distroless htdemucs-rs:debian gcr.io/distroless/cc-debian13:nonroot debian:trixie-slim; do
+              docker save "$i" | python .github/container/sizes.py "$i"
+            done
             echo
-            echo "Layers (htdemucs-rs:distroless):"
+            echo "docker image inspect .Size (the store's own figure): $(for i in htdemucs-rs:distroless htdemucs-rs:debian; do echo -n "$i $(docker image inspect -f '{{.Size}}' $i) B; "; done)"
+            echo
+            echo "Layers (htdemucs-rs:distroless, docker history):"
             echo '```'
-            docker history --format '{{.Size}}\t{{.CreatedBy}}' htdemucs-rs:distroless | cut -c1-140
+            docker history --format '{{.Size}}\t{{.CreatedBy}}' htdemucs-rs:distroless | cut -c1-100 | head -6
             echo '```'
             id=$(docker create htdemucs-rs:distroless)
             docker cp "$id":/usr/local/bin/htdemucs-rs /tmp/htdemucs-rs; docker cp "$id":/usr/local/bin/htdemucs-serve /tmp/htdemucs-serve; docker rm "$id" > /dev/null
@@ -149,16 +149,17 @@ jobs:
           for m in htdemucs htdemucs_6s ensemble; do
             .github/container/job.sh htdemucs-rs:distroless "smoke $m s2 12s" "name=$m&$q" clips/synth.wav out/$m 12
           done
+          fail=0
           {
             echo "### Parity vs PyTorch on this runner (12 s synthetic clip, shifts 2, seed 0; SNR dB per stem)"
             echo '```'
-            python .github/container/check.py $MIN_DB out/htdemucs/htdemucs clips/ref.htdemucs.s2.safetensors
-            python .github/container/check.py $MIN_DB out/htdemucs_6s/htdemucs_6s clips/ref.htdemucs_6s.s2.safetensors
-            python .github/container/check.py $MIN_DB out/ensemble clips/ref.htdemucs.s2.safetensors clips/ref.htdemucs_6s.s2.safetensors
+            python .github/container/check.py $MIN_DB out/htdemucs/htdemucs clips/ref.htdemucs.s2.safetensors || fail=1
+            python .github/container/check.py $MIN_DB out/htdemucs_6s/htdemucs_6s clips/ref.htdemucs_6s.s2.safetensors || fail=1
+            python .github/container/check.py $MIN_DB out/ensemble clips/ref.htdemucs.s2.safetensors clips/ref.htdemucs_6s.s2.safetensors || fail=1
             echo '```'
           } > parity.md
           cat parity.md; cat parity.md >> "$GITHUB_STEP_SUMMARY"
-          ! grep -q FAIL parity.md
+          [ $fail = 0 ] && ! grep -q -E 'FAIL|Traceback' parity.md
 
       - name: Smoke (debian-slim image, once mode, FLAC)
         run: |
