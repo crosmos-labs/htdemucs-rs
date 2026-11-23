@@ -23,21 +23,19 @@ on:
         description: make PyTorch references and check parity
         type: boolean
         default: true
+  # A push that changes .github/bench/mr_run.env runs with the settings in that file (for branches,
+  # where workflow_dispatch is not available until the workflow is on the default branch).
   push:
     branches: [melroformer]
     paths:
       - .github/workflows/bench-roformer.yml
+      - .github/bench/mr_run.env
 
 concurrency:
   group: bench-roformer-${{ github.run_id }}
 
 env:
   CARGO_TERM_COLOR: never
-  THREADS: ${{ inputs.threads || '1 2' }}
-  RUNS: ${{ inputs.runs || '2' }}
-  VARIANTS: ${{ inputs.variants || 'base:' }}
-  RUN_TORCH: ${{ github.event_name == 'push' || inputs.torch }}
-  RUN_PARITY: ${{ github.event_name == 'push' || inputs.parity }}
   KIM: kim
   CKPT: ckpt/MelBandRoformer.ckpt
 
@@ -47,6 +45,17 @@ jobs:
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
+
+      - name: Settings (inputs, or .github/bench/mr_run.env for push runs)
+        run: |
+          if [ "${{ github.event_name }}" = push ]; then
+            grep -E '^(THREADS|RUNS|VARIANTS|RUN_TORCH|RUN_PARITY)=' .github/bench/mr_run.env >> "$GITHUB_ENV"
+          else
+            {
+              echo "THREADS=${{ inputs.threads }}"; echo "RUNS=${{ inputs.runs }}"; echo "VARIANTS=${{ inputs.variants }}"
+              echo "RUN_TORCH=${{ inputs.torch }}"; echo "RUN_PARITY=${{ inputs.parity }}"
+            } >> "$GITHUB_ENV"
+          fi
 
       - name: CPU
         run: |
@@ -59,35 +68,47 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Checkpoint + converted weights cache
+        id: ckpt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ckpt
+            weights
+          key: melroformer-87201f4d-${{ hashFiles('tools/melroformer.py', 'tools/st.py') }}
+
+      - name: Need Python?
+        run: |
+          if [ "$RUN_TORCH" = true ] || [ "$RUN_PARITY" = true ] || [ "${{ steps.ckpt.outputs.cache-hit }}" != true ]; then
+            echo NEED_PY=true >> "$GITHUB_ENV"
+          fi
+
       - uses: actions/setup-python@v5
+        if: env.NEED_PY == 'true'
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: .github/bench/mr_requirements.txt
 
       - name: Python deps (torch 2.2.2 CPU + upstream's)
+        if: env.NEED_PY == 'true'
         run: pip install -q -r .github/bench/mr_requirements.txt
 
       - name: Upstream inference code (KimberleyJensen/Mel-Band-Roformer-Vocal-Model @25f44ff)
+        if: env.NEED_PY == 'true'
         run: |
           git clone -q https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model $KIM
           git -C $KIM checkout -q 25f44ff
-
-      - name: Checkpoint cache
-        id: ckpt
-        uses: actions/cache@v4
-        with:
-          path: ckpt
-          key: melroformer-ckpt-87201f4d
 
       - name: Download checkpoint (huggingface.co/KimberleyJSN/melbandroformer, MIT)
         if: steps.ckpt.outputs.cache-hit != 'true'
         run: |
           mkdir -p ckpt
-          curl -sSfL -o $CKPT https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt
+          [ -f $CKPT ] || curl -sSfL -o $CKPT https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt
           echo "87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e  $CKPT" | sha256sum -c
 
       - name: Convert weights
+        if: steps.ckpt.outputs.cache-hit != 'true'
         run: python tools/melroformer.py convert $KIM $CKPT && ls -l weights
 
       - name: Rust toolchain

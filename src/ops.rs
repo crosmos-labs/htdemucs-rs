@@ -1029,7 +1029,8 @@ pub fn exp_g<F: MulAdd>(x: f32) -> f32 {
     const C2: f32 = -2.121_944_4e-4;
     const ROUND: f32 = 12_582_912.0; // 1.5 * 2^23: (v + ROUND) - ROUND rounds to nearest
     let x = x.clamp(-87.336_54, 88.722_83);
-    let n = F::fma(x, LOG2E, ROUND) - ROUND;
+    let t = F::fma(x, LOG2E, ROUND);
+    let n = t - ROUND;
     let r = F::fma(-n, C2, F::fma(-n, C1, x));
     let z = r * r;
     let mut p = F::fma(1.987_569_1e-4, r, 1.398_199_9e-3);
@@ -1040,7 +1041,10 @@ pub fn exp_g<F: MulAdd>(x: f32) -> f32 {
     let y = F::fma(p, z, r) + 1.0;
     // Scale by 2^n; n + 127 stays in [1, 254] for the clamped range, except n = 128 at the top,
     // which we split in two.
-    let ni = n as i32;
+    // n as an integer, read from t's bits (t = 1.5 * 2^23 + n, so its low mantissa bits are n)
+    // rather than `n as i32`: Rust's saturating float-to-int cast does not vectorise on x86-64,
+    // which left every loop calling exp scalar there. Same value, so bit-identical results.
+    let ni = (t.to_bits() as i32).wrapping_sub(0x4B40_0000);
     let h = ni >> 1;
     y * f32::from_bits(((h + 127) << 23) as u32) * f32::from_bits(((ni - h + 127) << 23) as u32)
 }
@@ -1342,6 +1346,18 @@ mod tests {
             x += 0.001_37;
         }
         worst
+    }
+
+    #[test]
+    fn exp_integer_part_from_bits() {
+        // The exponent read from the rounding constant's bits equals the saturating cast.
+        let mut x = -100.0f32;
+        while x < 100.0 {
+            let c = x.clamp(-87.336_54, 88.722_83);
+            let t = Fused::fma(c, std::f32::consts::LOG2_E, 12_582_912.0);
+            assert_eq!((t.to_bits() as i32).wrapping_sub(0x4B40_0000), (t - 12_582_912.0) as i32, "{x}");
+            x += 0.003_1;
+        }
     }
 
     #[test]
