@@ -1,0 +1,167 @@
+# Mega 53 BS-RoFormer guitar head (src/roformer.rs, -n megaguitar) on Linux x86-64 runners
+# (Blacksmith 8 vCPU by default: AMD EPYC with AVX-512): PyTorch references on a synthetic clip
+# made on the runner (no copyrighted audio), one-chunk and full-path parity, thread determinism,
+# and CPU time of one chunk forward for this crate and for PyTorch 2.6.0 CPU.
+name: bench-megaguitar
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "machine: a Blacksmith size (blacksmith-8vcpu-ubuntu-2404 counts 4x against the 3000 free 2-vCPU minutes a month) or ubuntu-latest"
+        default: blacksmith-8vcpu-ubuntu-2404
+      threads:
+        description: thread counts
+        default: "1 8"
+      runs:
+        description: timed forwards per thread count
+        default: "1"
+      variants:
+        description: "space-separated label:ENV=V,ENV2=V settings for the Rust bench"
+        default: "base:"
+      torch:
+        description: also time PyTorch (the baseline)
+        type: boolean
+        default: true
+      parity:
+        description: make PyTorch references and check parity
+        type: boolean
+        default: true
+  # A push that changes .github/bench/mg_run.env runs with the settings in that file (for branches,
+  # where workflow_dispatch is not available until the workflow is on the default branch).
+  push:
+    branches: [bsroformer]
+    paths:
+      - .github/bench/mg_run.env
+
+concurrency:
+  group: bench-megaguitar-${{ github.run_id }}
+
+env:
+  CARGO_TERM_COLOR: never
+  MSST: msst
+  CKPT: ckpt/mega53.ckpt
+  CFG: ckpt/mega53.yaml
+  REL: https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/download/v1.0.21
+
+jobs:
+  bench:
+    runs-on: ${{ inputs.runner || 'blacksmith-8vcpu-ubuntu-2404' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Settings (inputs, or .github/bench/mg_run.env for push runs)
+        run: |
+          if [ "${{ github.event_name }}" = push ]; then
+            grep -E '^(THREADS|RUNS|VARIANTS|RUN_TORCH|RUN_PARITY)=' .github/bench/mg_run.env >> "$GITHUB_ENV"
+          else
+            {
+              echo "THREADS=${{ inputs.threads }}"; echo "RUNS=${{ inputs.runs }}"; echo "VARIANTS=${{ inputs.variants }}"
+              echo "RUN_TORCH=${{ inputs.torch }}"; echo "RUN_PARITY=${{ inputs.parity }}"
+            } >> "$GITHUB_ENV"
+          fi
+
+      - name: CPU
+        run: |
+          lscpu; echo "nproc $(nproc)"; free -g
+          {
+            echo "### Runner"
+            echo '```'
+            lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|L2|L3'
+            echo "flags: $(grep -o -w -E 'avx2|fma|avx512f|avx512bw|avx512vl|avx512_bf16|avx512_vnni|amx_tile' /proc/cpuinfo | sort -u | tr '\n' ' ')"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/bench/bsr_requirements.txt
+
+      - name: Python deps (torch 2.6.0 CPU + MSST's bs_roformer deps)
+        run: pip install -q -r .github/bench/bsr_requirements.txt
+
+      - name: MSST (ZFTurbo/Music-Source-Separation-Training @1523206) and the Mega 53 checkpoint (MIT, MSST #245)
+        run: |
+          git clone -q https://github.com/ZFTurbo/Music-Source-Separation-Training $MSST
+          git -C $MSST checkout -q 1523206
+          mkdir -p ckpt
+          curl -sSfL -o $CKPT $REL/mvsep_mega_model_bs_roformer_53_stems_v1.ckpt
+          curl -sSfL -o $CFG $REL/mvsep_mega_model_bs_roformer_53_stems.yaml
+          echo "c62820893bbf86d4e734f966bd142d9157cfc8bb8e79e9d8f9ea553f3ff3519f  $CKPT" | sha256sum -c
+          echo "7e198062a251587088adb91215a4f44ab59e67bd62fcc805cf54d6e7dfc51103  $CFG" | sha256sum -c
+
+      - name: Convert weights (backbone + guitar head, float16)
+        run: python tools/bsroformer.py convert $CKPT $CFG && ls -l weights
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bins && ls -l target/release/htdemucs-rs target/release/mr_bench
+
+      - name: Tests
+        run: cargo test --release -q
+
+      - name: Parity (synthetic 30 s clip; references made here)
+        if: env.RUN_PARITY == 'true'
+        run: |
+          mkdir -p ref/ci
+          python .github/bench/synth.py ref/ci/synth0.wav 30
+          # + a -60 dBFS white-noise floor, as the Mel-RoFormer CI clip (README: a band holding only
+          # FFT rounding noise is normalised up to unit size, where no two float32s agree).
+          python -c "import soundfile as sf, numpy as np; x, r = sf.read('ref/ci/synth0.wav', dtype='float32'); x += (np.random.default_rng(7).standard_normal(x.shape) * 1e-3).astype('float32'); sf.write('ref/ci/synth.wav', x, r, subtype='FLOAT')"
+          python tools/bsroformer.py segment $MSST $CKPT $CFG ref/ci/synth.wav ref/ci/seg.safetensors --chunk 1 --threads $(nproc)
+          ./target/release/mr_parity weights ref/ci/seg.safetensors megaguitar | tee mg-parity.txt
+          rm ref/ci/seg.safetensors
+          python tools/bsroformer.py separate $MSST $CKPT $CFG ref/ci/synth.wav ref/ci/synth.mg.safetensors --threads $(nproc) | tee torch-separate.txt
+          /usr/bin/time -f "separate megaguitar: %e s wall, %U+%S s CPU, peak RSS %M KB" \
+            ./target/release/htdemucs-rs separate -q -n megaguitar --float32 --clip-mode none -o sep ref/ci/synth.wav 2>&1 | tee rust-separate.txt
+          ./target/release/compare ref/ci/synth.mg.safetensors sep/megaguitar/synth | tee compare.txt
+          {
+            echo "### Parity (synthetic 30 s clip)"
+            echo "- chunk: $(grep 'final output' mg-parity.txt)"
+            echo "- full path: $(tail -1 compare.txt)"
+            echo "- PyTorch full path: $(tail -1 torch-separate.txt)"
+            echo "- Rust full path: $(tail -1 rust-separate.txt)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bench (Rust)
+        run: |
+          first=1
+          for v in $VARIANTS; do
+            label=${v%%:*}; envs=$(echo "${v#*:}" | tr ',' ' ')
+            for t in $THREADS; do
+              if [ $first = 1 ]; then check=1,4,8; else check=; fi
+              if [ $t = 1 ]; then prof=1; else prof=; fi
+              echo "== variant $label ($envs) threads $t"
+              env $envs RAYON_NUM_THREADS=$t MR_CHECK_THREADS=$check ${prof:+MR_PROFILE=1} ./target/release/mr_bench weights $RUNS megaguitar \
+                | sed "s/^RESULT /RESULT variant=$label /" | tee -a bench.txt
+              first=0
+            done
+          done
+          { echo "### Rust, one chunk (20 s)"; echo '```'; grep -E '^RESULT|bit-identical' bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bench (PyTorch)
+        if: env.RUN_TORCH == 'true'
+        run: |
+          for t in $THREADS; do
+            python tools/bsroformer.py bench $MSST $CKPT $CFG --threads $t --runs $RUNS 2>/dev/null | tee -a torch.txt
+          done
+          { echo "### PyTorch, one chunk (20 s)"; echo '```'; grep '^RESULT' torch.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-megaguitar-logs
+          path: |
+            bench.txt
+            torch.txt
+            mg-parity.txt
+            compare.txt
+            torch-separate.txt
+            rust-separate.txt
+          if-no-files-found: ignore
