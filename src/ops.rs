@@ -1215,7 +1215,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> Tensor {
 simd_fn! {
 /// softmax(scale * row), in place. (The max is over eight lanes: max is exact, so any order gives
 /// the same result.)
-fn softmax_row(row: &mut [f32], scale: f32) {
+pub fn softmax_row(row: &mut [f32], scale: f32) {
     let mut m8 = [f32::NEG_INFINITY; 8];
     let chunks = row.chunks_exact(8);
     for &s in chunks.remainder() {
@@ -1257,11 +1257,11 @@ fn attn_kt() -> bool {
 /// A raw pointer that may cross threads: tasks write disjoint (row block, head) tiles of one
 /// output matrix, which cannot be expressed as disjoint slices.
 #[derive(Clone, Copy)]
-struct SendPtr(*mut f32);
+pub struct SendPtr(pub *mut f32);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 impl SendPtr {
-    fn get(self) -> *mut f32 {
+    pub fn get(self) -> *mut f32 {
         self.0
     }
 }

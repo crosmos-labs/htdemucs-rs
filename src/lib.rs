@@ -8,6 +8,7 @@ pub mod ensemble;
 pub mod model;
 pub mod ops;
 pub mod pyrandom;
+pub mod roformer;
 pub mod stft;
 pub mod tensor;
 pub mod transformer;
