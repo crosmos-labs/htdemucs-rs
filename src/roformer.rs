@@ -486,6 +486,7 @@ struct Scratch {
     scores: Vec<f32>,
     x: Vec<f32>,
     inv: Vec<f32>,
+    kt: Vec<f32>,
 }
 
 fn grow(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
@@ -556,6 +557,7 @@ impl Block {
         }
         let ao = grow(&mut sc.ao, n * inner);
         let rows = attn_rows();
+        let kt_on = attn_kt();
         let tile = grow(&mut sc.scores, rows.min(len) * len);
         let sm = 1.0 / (dim_head as f32).sqrt();
         for s0 in (0..n).step_by(len) {
@@ -563,12 +565,26 @@ impl Block {
                 let q = &big[s0 * wq + hd * dim_head..];
                 let k = &big[s0 * wq + inner + hd * dim_head..];
                 let v = &big[s0 * wq + 2 * inner + hd * dim_head..];
+                // K^T of this head, (dim_head, len) contiguous, so the QK^T GEMMs read it in place.
+                let (kb, kb_rs, kb_cs) = if kt_on {
+                    let _p = prof::scope(prof::COPY);
+                    let kt = grow(&mut sc.kt, dim_head * len);
+                    for j in 0..len {
+                        let kr = &k[j * wq..j * wq + dim_head];
+                        for (d, &val) in kr.iter().enumerate() {
+                            kt[d * len + j] = val;
+                        }
+                    }
+                    (&sc.kt[..dim_head * len], len, 1)
+                } else {
+                    (k, 1, wq)
+                };
                 for r0 in (0..len).step_by(rows) {
                     let m = rows.min(len - r0);
                     let t = &mut tile[..m * len];
                     {
                         let _p = prof::gemm(prof::QK, m, len, dim_head);
-                        sgemm_par(m, len, dim_head, &q[r0 * wq..], wq, 1, k, 1, wq, t, len, false, false);
+                        sgemm_par(m, len, dim_head, &q[r0 * wq..], wq, 1, kb, kb_rs, kb_cs, t, len, false, false);
                     }
                     let inv = &mut sc.inv;
                     {
@@ -667,6 +683,12 @@ pub struct MelRoformer {
     band_in: Vec<BandIn>,
     layers: Vec<(Block, Block)>,
     band_out: Vec<BandOut>,
+}
+
+/// K transposed per head before the QK^T GEMMs (MR_ATTN_KT=0 disables).
+fn attn_kt() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("MR_ATTN_KT").as_deref() != Ok("0"))
 }
 
 /// Frames per frequency-transformer task (60 bands each): fixed, so results do not depend on
