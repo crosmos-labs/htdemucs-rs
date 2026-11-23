@@ -55,10 +55,16 @@ shift draws `randint(0, 22050)`, and every segment forward in between draws `ran
 so the second offset depends on the first pass's segment count. With seed 0 the first offset is
 always 12623.
 
-Memory: one segment's activations at a time, plus the output buffer (sources x 2 x length) and
-the decoded input. Each shift pass is overlap-added into the output as it goes (a one-segment
-window), and the normalised / padded mix is read on demand, never copied - in the same order of
-operations as before, so the output is bit-identical. See *Speed and memory* for peak RSS.
+Memory: one segment's activations at a time and the decoded input; nothing else grows with the
+track. The normalised / padded mix is read on demand, never copied. The shift passes run side by
+side, each overlap-adding into its own one-segment window (`apply::Streamer`; their offsets are
+drawn up front, moving the generator exactly as one pass after another would). A position goes
+to the writers once every pass (and, for the ensemble, both models) has finalised it, summed in
+pass order. The writers (`audio::StemWriter`) encode WAV / FLAC as samples arrive; FLAC frame by
+frame, its STREAMINFO rewritten at the end. `--clip-mode rescale` needs each stem's peak, so
+those stems go to a float temp file next to the output (4 bytes a sample) and are divided and
+encoded at the end. The same operations in the same order as before, so the output is
+bit-identical. See *Speed and memory* for peak RSS.
 
 **Determinism.** Output is bit-identical whatever the thread count (every parallel reduction is
 summed in a fixed order, and the GEMMs never split their inner dimension), and run to run. It is
@@ -246,8 +252,24 @@ shift - a second pass adds time, not memory):
 | before | 1.31 GB | 1.40 GB | 4.67 GB | 6.41 GB |
 | after | 0.93 GB | 0.91 GB | 2.53 GB | 3.55 GB |
 
-What remains is mostly the output itself (sources x 2 x length float32: 2.8 GB for 6 stems at
+What remained was mostly the output itself (sources x 2 x length float32: 2.8 GB for 6 stems at
 22 min), the decoded input (0.47 GB) and the weights.
+
+Streamed output (`a7c5ba8`): peak RSS on Linux (i5-12450H, gemm build, 8 threads, getrusage of
+the child = VmHWM), the previous build (`ff85811`) against `66c76a4`, FLAC, the ensemble with
+Fretboard's options (`--clip-mode clamp --clip-mode-4 rescale --ensemble-own-6s`, 16 files), the
+single models at the default `rescale`. Every stem is bit-identical (cmp: 78 files, 0 differ):
+
+| | Aerials (4:04) shifts 0 | Aerials shifts 2 | 22 min (`long22`) shifts 0 |
+|---|---|---|---|
+| htdemucs | 1281 -> **843** MiB | 1301 -> **886** MiB | 4036 -> **1213** MiB |
+| htdemucs_6s | 1470 -> **913** MiB | 1491 -> **965** MiB | 4849 -> **1315** MiB |
+| ensemble | 1830 -> **1173** MiB | 1994 -> **1271** MiB | 7203 -> **1561** MiB |
+
+What still grows with length is the decoded input (0.35 MB per second: the 22-minute runs are
+about 0.37 GB above Aerials). The rescale pass costs 7-10 s at 22 minutes (1-3% of the run) and
+4 bytes x 2 channels per sample of temporary disk per rescaled stem (466 MB a stem at 22 min).
+`66c76a4` also has the Mel-RoFormer merge's tensor-by-tensor weight loader.
 
 ## Mel-Band RoFormer (`-n melroformer`)
 
