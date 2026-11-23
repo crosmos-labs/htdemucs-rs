@@ -36,11 +36,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # A push runs the measurements configured here (this one: one-thread timing and a 22-minute
-  # clip; the 60 / 240 s sizing jobs ran on 3d7f61b); workflow_dispatch takes them as inputs.
+  # A push builds, sizes and smoke-tests (about 8 minutes); the timing jobs (about 13 minutes for
+  # sizing, 4 for one thread, 30 for a 22-minute clip) run from workflow_dispatch.
   SIZING: ${{ github.event_name == 'push' && 'false' || inputs.sizing }}
-  THREADS_1: ${{ github.event_name == 'push' && 'true' || inputs.threads_1 }}
-  LONG_MINUTES: ${{ github.event_name == 'push' && '22' || inputs.long_minutes }}
+  THREADS_1: ${{ github.event_name == 'push' && 'false' || inputs.threads_1 }}
+  LONG_MINUTES: ${{ github.event_name == 'push' && '0' || inputs.long_minutes }}
   MIN_DB: "90"
 
 jobs:
