@@ -30,7 +30,7 @@ use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
 use serde::Deserialize;
 
-use crate::ops::{add_assign, exp_g, gelu1_g, sgemm_par, sigmoid_g, simd_fn, softmax_row, MulAdd, SendPtr};
+use crate::ops::{add_assign, exp_g, gelu1_g, sgemm_par, sigmoid_g, simd_fn, MulAdd, SendPtr};
 use crate::tensor::Tensor;
 use crate::weights::SafeTensors;
 use crate::Tracer;
@@ -364,6 +364,43 @@ fn glu_bias_row(o: &mut [f32], a: &[f32], g: &[f32], ba: &[f32], bg: &[f32]) {
 }
 
 simd_fn! {
+/// exp(scale * row - max) in place (weights below e^-40 set to 0, as ops::softmax_row: they
+/// cannot change a float32 sum and would only cost subnormal arithmetic later), returning
+/// 1 / their sum: the caller scales the attention output row instead of the weights (one pass
+/// fewer; PyTorch's CPU flash attention also normalises at the end).
+fn softmax_unnorm(row: &mut [f32], scale: f32) -> f32 {
+    let mut m8 = [f32::NEG_INFINITY; 8];
+    let chunks = row.chunks_exact(8);
+    for &s in chunks.remainder() {
+        m8[0] = m8[0].max(s);
+    }
+    for c in chunks {
+        for i in 0..8 {
+            m8[i] = m8[i].max(c[i]);
+        }
+    }
+    let mx = m8.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) * scale;
+    let mut acc = [0f64; 8];
+    let mut chunks = row.chunks_exact_mut(8);
+    for c in &mut chunks {
+        for i in 0..8 {
+            let x = c[i] * scale - mx;
+            let e = if x < -40.0 { 0.0 } else { exp_g::<F>(x) };
+            c[i] = e;
+            acc[i] += e as f64;
+        }
+    }
+    let mut tail = 0f64;
+    for v in chunks.into_remainder() {
+        let x = *v * scale - mx;
+        *v = if x < -40.0 { 0.0 } else { exp_g::<F>(x) };
+        tail += *v as f64;
+    }
+    (1.0 / (acc.iter().sum::<f64>() + tail)) as f32
+}
+}
+
+simd_fn! {
 /// Attention output of one head scaled by sigmoid(gate + bias), one row.
 fn gate_row(o: &mut [f32], g: f32) {
     let s = sigmoid_g::<F>(g);
@@ -438,6 +475,7 @@ struct Scratch {
     o: Vec<f32>,
     scores: Vec<f32>,
     x: Vec<f32>,
+    inv: Vec<f32>,
 }
 
 fn grow(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
@@ -512,12 +550,21 @@ impl Block {
                         let _p = prof::gemm(prof::QK, m, len, dim_head);
                         sgemm_par(m, len, dim_head, &q[r0 * wq..], wq, 1, k, 1, wq, t, len, false, false);
                     }
+                    let inv = &mut sc.inv;
                     {
                         let _p = prof::scope(prof::SOFTMAX);
-                        t.chunks_exact_mut(len).for_each(|row| softmax_row(row, sm));
+                        inv.clear();
+                        inv.extend(t.chunks_exact_mut(len).map(|row| softmax_unnorm(row, sm)));
                     }
-                    let _p = prof::gemm(prof::AV, m, dim_head, len);
-                    sgemm_par(m, dim_head, len, t, len, 1, v, wq, 1, &mut ao[(s0 + r0) * inner + hd * dim_head..], inner, false, false);
+                    let o = &mut ao[(s0 + r0) * inner + hd * dim_head..];
+                    {
+                        let _p = prof::gemm(prof::AV, m, dim_head, len);
+                        sgemm_par(m, dim_head, len, t, len, 1, v, wq, 1, o, inner, false, false);
+                    }
+                    let _p = prof::scope(prof::SOFTMAX);
+                    for (r, &s) in inv.iter().enumerate() {
+                        o[r * inner..r * inner + dim_head].iter_mut().for_each(|x| *x *= s);
+                    }
                 }
             }
         }
