@@ -25,12 +25,16 @@ Same options and defaults as demucs where they exist (`-n`, `--shifts` (1), `--o
 `demucs_seeded.py` does), `--threads`, `--weights DIR` (or `$HTDEMUCS_WEIGHTS`), and
 `--clip-mode none`. No `--mp3`: write FLAC/WAV and encode afterwards.
 
-Input: WAV (PCM / float), FLAC, MP3, AAC in MP4/M4A, decoded in pure Rust (symphonia), converted
+Input: WAV (PCM / float), FLAC, MP3, AAC-LC in MP4/M4A, decoded in pure Rust (symphonia), converted
 like demucs (to 44.1 kHz only if needed, mono duplicated, more than 2 channels: the first two).
 MP4 edit lists are applied as ffmpeg does (symphonia ignores them), so an M4A decodes to the
 same length and alignment as ffmpeg's. Output 16-bit samples are quantised exactly like demucs'
 torchaudio/libsndfile writer (WAV: top 16 bits of round(x * 2^31); FLAC: round-half-even of
-x * 32768).
+x * 32768). **HE-AAC / HE-AACv2** (SBR / PS) is refused with an error: symphonia decodes only
+the AAC core at half the rate, which would give wrong, late stems; decode such files with ffmpeg
+first (Fretboard always hands over ffmpeg's float WAV). Silent (or constant) input gives silent
+stems and a warning (demucs fails there: it divides by a zero standard deviation). Several
+tracks in one call continue one random sequence, as demucs.separate does.
 
 Reproducing demucs' shifts exactly needs Python's own random numbers: `src/pyrandom.rs` is
 CPython 3.11's MT19937 with `random.seed(int)`, `getrandbits`, `randrange` and `randint`. Each
@@ -39,7 +43,17 @@ shift draws `randint(0, 22050)`, and every segment forward in between draws `ran
 so the second offset depends on the first pass's segment count. With seed 0 the first offset is
 always 12623.
 
-Memory: one segment's activations at a time, plus the output buffers.
+Memory: one segment's activations at a time, plus the output buffer (sources x 2 x length) and
+the decoded input. Each shift pass is overlap-added into the output as it goes (a one-segment
+window), and the normalised / padded mix is read on demand, never copied - in the same order of
+operations as before, so the output is bit-identical. See *Speed and memory* for peak RSS.
+
+**Determinism.** Output is bit-identical whatever the thread count (every parallel reduction is
+summed in a fixed order, and the GEMMs never split their inner dimension), and run to run. It is
+**not** bit-identical across CPU types: x86-64 picks AVX2+FMA or AVX-512 kernels at run time
+(and macOS can use Accelerate), whose roundings differ - e.g. the same commit's synthetic-clip
+parity figure differs by about 2 dB between an AVX2 (Zen 3) and an AVX-512 (Zen 5) runner. All
+of them stay 110+ dB from PyTorch; but stems made on different hosts differ in their last bits.
 
 ## How it is built, and why
 
@@ -67,8 +81,9 @@ Why not a framework, given the priorities:
    is fast but a C++ dependency. Hand-fusing the hot elementwise chains (DConv's
    GroupNorm-GELU and GroupNorm-GLU-LayerScale-residual) is what made the biggest difference after
    the GEMM itself.
-3. **Size.** No C/C++ dependencies, ~60 small crates; the release binaries are **~1.0 MB**
-   (LTO, stripped). Weights are separate files.
+3. **Size.** No C/C++ dependencies, ~60 small crates; the `htdemucs-rs` release binary is
+   **2.3 MB** on macOS and **4.2 MB** on Linux x86-64 (LTO, stripped; with the audio decoders,
+   resampler and FLAC encoder). Weights are separate files (84 MB / 55 MB).
 
 What this gives up: a GPU backend. On the Mac runner PyTorch's MPS backend is ~7x its CPU, so a
 Metal path (for the GEMMs and attention) is the obvious later addition if Mac speed matters; the
@@ -172,9 +187,21 @@ dB SNR. Stems from the m4a decoded by us vs the PyTorch reference from ffmpeg's 
 (htdemucs, shifts 2): 115.3-127.9 dB, within ~1-3 dB of the same-input figures - the decoder
 choice does not matter at this level.
 
-## Speed and memory, full song (indicative)
+## Speed and memory
 
-Aerials (243.6 s), htdemucs, shifts 2, M1 Pro, whole process (`tools/speed.sh`). The machine was
+**x86-64** (GitHub Actions runners, `.github/workflows/bench.yml`; 2 vCPUs = one core with SMT,
+so this is single-core cost; multi-core x86 scaling is not measured yet). CPU seconds per second
+of audio for one segment forward, 1 thread, at `dff89f6`:
+
+| CPU | htdemucs-rs | PyTorch 2.2.2 | |
+|---|---|---|---|
+| AMD EPYC 7763 (Zen 3, AVX2) | 0.72-0.74 | 0.76 | **parity** (within run-to-run noise) |
+| AMD EPYC 9V45 (Zen 5, AVX-512) | 0.33 | 0.51 | **about 36% less CPU** |
+
+A whole song costs about 2.7x that per second of music (overlap 0.25: 7.8 s segments every
+5.85 s; 2 shifts). No Intel or Zen 4 PyTorch baseline yet.
+
+**Apple M1 Pro**, Aerials (243.6 s), htdemucs, shifts 2, whole process (`tools/speed.sh`). The machine was
 shared with other heavy jobs; the 1-minute load average (8 cores) is given for each run, and
 CPU time is the less load-sensitive number. A clean benchmark is still to do.
 
@@ -187,8 +214,22 @@ CPU time is the less load-sensitive number. A clean benchmark is still to do.
 | PyTorch 2.2.2 CPU | 8 | 400 s | 1402 s | 2.2 GB | 15-17 |
 | PyTorch 2.2.2 CPU | 4 | 350 s | 1077 s | 1.8 GB | 10-11 |
 
-Release binary (`htdemucs-rs`, LTO, stripped, with decoders, resampler and FLAC encoder): 2.2 MB
-on macOS. Weights: 84 MB / 55 MB.
+Release binary (`htdemucs-rs`, LTO, stripped, with decoders, resampler and FLAC encoder): 2.3 MB
+on macOS, 4.2 MB on Linux x86-64. Weights: 84 MB / 55 MB.
+
+Peak memory, M1 Pro, 4 threads, Accelerate build (`peak memory footprint` from `/usr/bin/time -l`:
+what the process holds; macOS's "maximum resident set size" is lower when the system compresses
+memory under load, so it is not used here), before and after streaming the overlap-add
+(`4072d30`), on Aerials and on a 22-minute track (Aerials looped; Fretboard's length limit; 1
+shift - a second pass adds time, not memory):
+
+| | Aerials, htdemucs, 2 shifts | Aerials, htdemucs_6s, 2 shifts | 22 min, htdemucs | 22 min, htdemucs_6s |
+|---|---|---|---|---|
+| before | 1.31 GB | 1.40 GB | 4.67 GB | 6.41 GB |
+| after | 0.93 GB | 0.91 GB | 2.53 GB | 3.55 GB |
+
+What remains is mostly the output itself (sources x 2 x length float32: 2.8 GB for 6 stems at
+22 min), the decoded input (0.47 GB) and the weights.
 
 ## Demucs behaviour worth knowing
 

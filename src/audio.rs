@@ -70,7 +70,11 @@ pub fn decode(path: &Path) -> Result<Audio, String> {
         .map_err(err)?;
     let mut rate = params.sample_rate.unwrap_or(0);
     let mut channels = params.channels.as_ref().map(|c| c.count()).unwrap_or(0);
-    let mut inter: Vec<f32> = vec![];
+    // Reserve from the container's frame count (plus room for encoder delay / padding) so the
+    // buffer doesn't grow by doubling: a long track's decode is the largest allocation before
+    // separation.
+    let hint = format.default_track(TrackType::Audio).and_then(|t| t.num_frames).unwrap_or(0) as usize;
+    let mut inter: Vec<f32> = Vec::with_capacity(hint.saturating_add(8192).saturating_mul(channels.max(1)).min(1 << 31));
     let mut buf: Vec<f32> = vec![];
     while let Some(packet) = format.next_packet().map_err(err)? {
         if packet.track_id != track_id {
@@ -103,13 +107,21 @@ pub fn decode(path: &Path) -> Result<Audio, String> {
             frames = keep.map_or(frames - start, |k| k.min(frames - start));
         }
     }
-    let mut data = vec![0.0f32; channels * frames];
-    for c in 0..channels {
+    // Interleaved -> planar mostly in place: channels 1.. go to a side buffer, channel 0 is
+    // compacted to the front (forward, never overtaking its source), then the rest appended.
+    let mut rest = vec![0.0f32; (channels - 1) * frames];
+    for c in 1..channels {
         for i in 0..frames {
-            data[c * frames + i] = inter[(start + i) * channels + c];
+            rest[(c - 1) * frames + i] = inter[(start + i) * channels + c];
         }
     }
-    Ok(Audio { rate, channels, data })
+    for i in 0..frames {
+        inter[i] = inter[(start + i) * channels];
+    }
+    inter.truncate(frames);
+    inter.extend_from_slice(&rest);
+    drop(rest);
+    Ok(Audio { rate, channels, data: inter })
 }
 
 /// demucs' channel conversion: same count: unchanged; 1 -> 2 duplicated; more: the first two.
