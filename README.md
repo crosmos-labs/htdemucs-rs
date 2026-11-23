@@ -310,7 +310,7 @@ song, then the reference stem's level and the error's level):
 | MUSDB18-HQ test: Signe Jakobsen, What Have You Done To Me (177.4 s) | 131.5 dB | 133.9 dB | -23 / -20 dBFS; error -154 dBFS, max 3.4e-7 |
 | MUSDB18-HQ test: Angels In Amplifiers, I'm Alright (179.6 s) | 131.4 dB | 134.5 dB | -23 / -20 dBFS; error -155 dBFS, max 3.4e-7 |
 
-Measured at `a385f13` (the tuned defaults since change only task shapes; chunk parity unchanged at 128.1 dB). The absolute error is -140 to -155 dBFS on five tracks, so the SNR follows each stem's own level; Iss Tarah is the outlier at -115 dBFS (see below).
+Measured at `0227a00` (the tuned defaults since change only task shapes; chunk parity unchanged at 128.1 dB). The absolute error is -140 to -155 dBFS on five tracks, so the SNR follows each stem's own level; Iss Tarah is the outlier at -115 dBFS (see below).
 
 **Where float32 cannot agree.** Each band's features are L2-normalised (RMSNorm) before the band
 projection. A band holding nothing but FFT rounding noise (a synthetic mix with no energy above
@@ -338,9 +338,9 @@ chunks) plus the 4 s of padding at each end.
 
 | CPU | htdemucs-rs | PyTorch 2.2.2 | |
 |---|---|---|---|
-| AMD EPYC 7763 (Zen 3, AVX2), GitHub runner, `687be4c` | 4.90 | 7.76 | **37% less CPU** |
+| AMD EPYC 7763 (Zen 3, AVX2), GitHub runner, `44419c0` | 4.90 | 7.76 | **37% less CPU** |
 | AMD EPYC 9V45 (Zen 5, AVX-512), GitHub runner, `f90a933` (first version) | 2.44 | 6.06 | 60% less |
-| Intel Xeon Platinum 8573C (Emerald Rapids, AVX-512), GitHub runner, `2f8583f` | 2.80 | 5.30 | **47% less CPU** |
+| Intel Xeon Platinum 8573C (Emerald Rapids, AVX-512), GitHub runner, `194a6f8` | 2.80 | 5.30 | **47% less CPU** |
 | Apple M1 Pro, gemm crate (NEON) build, loaded machine | 5.9-6.1 | 3.2-3.4 | **1.8x more CPU**: PyTorch's GEMMs use Accelerate (AMX) |
 
 Whole songs on the M1 Pro (4 threads, machine shared with other jobs at load 15-20, so CPU time
