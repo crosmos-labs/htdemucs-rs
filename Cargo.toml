@@ -24,6 +24,8 @@ symphonia = { version = "0.6.1", default-features = false, features = ["aac", "i
 accelerate = []
 # Link the system OpenBLAS for the matrix products instead of the gemm crate (benchmarking only).
 openblas = []
+# AVX-512 GEMM kernels in the gemm crate (still dispatched at run time; AVX2 machines unaffected).
+avx512 = ["gemm/x86-v4"]
 
 [profile.release]
 codegen-units = 1

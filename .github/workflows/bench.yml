@@ -30,6 +30,9 @@ on:
       features:
         description: extra cargo features for the bench build
         default: ""
+      features_b:
+        description: "features for a second bench build (variants with BIN=b use it)"
+        default: ""
   push:
     branches: [main]
     paths:
@@ -48,6 +51,7 @@ env:
   VARIANTS: ${{ inputs.variants || 'base:' }}
   ROUNDS: ${{ inputs.rounds || '1' }}
   FEATURES: ${{ inputs.features || '' }}
+  FEATURES_B: ${{ inputs.features_b || '' }}
   RUN_TORCH: ${{ github.event_name == 'push' || inputs.torch }}
   RUN_PARITY: ${{ github.event_name == 'push' || inputs.parity }}
 
@@ -109,6 +113,10 @@ jobs:
         run: |
           cargo build --release --bins ${FEATURES:+--features $FEATURES}
           ls -l target/release/htdemucs-rs target/release/bench
+          if [ -n "$FEATURES_B" ]; then
+            cargo build --release --bin bench --features "$FEATURES_B" --target-dir target-b
+            ls -l target-b/release/bench
+          fi
 
       - name: Tests
         run: cargo test --release -q ${FEATURES:+--features $FEATURES}
@@ -146,11 +154,13 @@ jobs:
             for m in $MODELS; do
               for v in $VARIANTS; do
                 label=${v%%:*}; envs=$(echo "${v#*:}" | tr ',' ' ')
+                bin=./target/release/bench
+                case " $envs " in *" BIN=b "*) bin=./target-b/release/bench; envs=$(echo "$envs" | sed 's/BIN=b//') ;; esac
                 for t in $THREADS; do
                   if [ $first = 1 ]; then check=1,2,4,8; else check=; fi
                   if [ $r = 1 ] && [ $t = 1 ]; then prof=1; else prof=; fi
                   echo "== round $r model $m variant $label ($envs) threads $t"
-                  env $envs RAYON_NUM_THREADS=$t OPENBLAS_NUM_THREADS=$t HTDEMUCS_CHECK_THREADS=$check ${prof:+HTDEMUCS_PROFILE=1} ./target/release/bench weights $m 3 \
+                  env $envs RAYON_NUM_THREADS=$t OPENBLAS_NUM_THREADS=$t HTDEMUCS_CHECK_THREADS=$check ${prof:+HTDEMUCS_PROFILE=1} $bin weights $m 3 \
                     | sed "s/^RESULT /RESULT variant=$label round=$r /" | tee -a bench.txt
                   first=0
                 done

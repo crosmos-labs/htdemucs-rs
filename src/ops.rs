@@ -1150,6 +1150,12 @@ fn attn_block() -> usize {
     *B.get_or_init(|| std::env::var("HTDEMUCS_ATTN_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(128))
 }
 
+/// HTDEMUCS_ATTN_KT=1: transpose K per head before the blocked QK^T GEMMs.
+fn attn_kt() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var("HTDEMUCS_ATTN_KT").as_deref() == Ok("1"))
+}
+
 /// A raw pointer that may cross threads: tasks write disjoint (row block, head) tiles of one
 /// output matrix, which cannot be expressed as disjoint slices.
 #[derive(Clone, Copy)]
@@ -1193,6 +1199,17 @@ pub fn attention_into(q: &[f32], q_rs: usize, k: &[f32], k_rs: usize, v: &[f32],
     let nb = nq.div_ceil(bq);
     let optr = SendPtr(out.as_mut_ptr());
     let olen = out.len();
+    // K transposed per head, (heads, d, Nk), so the QK^T GEMMs read it in place instead of
+    // packing a strided K for every task.
+    let kt: Option<Vec<f32>> = attn_kt().then(|| {
+        let mut kt = vec![0.0f32; heads * d * nk];
+        kt.par_chunks_mut(nk).enumerate().for_each(|(hd, row)| {
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = k[j * k_rs + hd];
+            }
+        });
+        kt
+    });
     (0..nb * heads).into_par_iter().for_each_init(
         || vec![0.0f32; bq * nk],
         |scores, task| {
@@ -1200,7 +1217,10 @@ pub fn attention_into(q: &[f32], q_rs: usize, k: &[f32], k_rs: usize, v: &[f32],
             let r0 = b * bq;
             let m = bq.min(nq - r0);
             let s = &mut scores[..m * nk];
-            sgemm_par(m, nk, d, &q[r0 * q_rs + h * d..], q_rs, 1, &k[h * d..], 1, k_rs, s, nk, false, false);
+            match &kt {
+                Some(kt) => sgemm_par(m, nk, d, &q[r0 * q_rs + h * d..], q_rs, 1, &kt[h * d * nk..], nk, 1, s, nk, false, false),
+                None => sgemm_par(m, nk, d, &q[r0 * q_rs + h * d..], q_rs, 1, &k[h * d..], 1, k_rs, s, nk, false, false),
+            }
             s.chunks_mut(nk).for_each(softmax);
             // SAFETY: tile (rows r0..r0+m, cols h*d..h*d+d) of out is in bounds and written by
             // this task only.
