@@ -26,38 +26,44 @@ use rayon::prelude::*;
 use crate::tensor::Tensor;
 
 /// Combines one track's htdemucs (`four`, sources `four_names`) and htdemucs_6s (`six`, sources
-/// `six_names`) stems, each (sources, channels, len). Returns (4-stem view in htdemucs' source
-/// order, 6-stem set in htdemucs_6s' source order).
-pub fn combine(four: &Tensor, four_names: &[String], six: &Tensor, six_names: &[String]) -> Result<(Tensor, Tensor), String> {
-    let plane = four.numel() / four.shape[0];
-    if six.numel() / six.shape[0] != plane {
+/// `six_names`) stems, each (sources, channels, len), in place (no extra copy of either). Returns
+/// (4-stem view in htdemucs' source order, 6-stem set in htdemucs_6s' source order).
+pub fn combine(mut four: Tensor, four_names: &[String], mut six: Tensor, six_names: &[String]) -> Result<(Tensor, Tensor), String> {
+    let plane = four.numel() / four.shape[0].max(1);
+    if six.numel() / six.shape[0].max(1) != plane {
         return Err("ensemble: the two models' outputs differ in length".into());
     }
     let at = |names: &[String], s: &str| names.iter().position(|n| n == s).ok_or(format!("ensemble: no '{s}' stem"));
-    fn f(t: &Tensor, i: usize) -> &[f32] {
-        let plane = t.numel() / t.shape[0];
-        &t.data[i * plane..(i + 1) * plane]
+    let mut planes4: Vec<&mut [f32]> = four.data.chunks_mut(plane.max(1)).collect();
+    let mut planes6: Vec<&mut [f32]> = six.data.chunks_mut(plane.max(1)).collect();
+    if plane == 0 {
+        return Ok((four, six));
     }
-    let mut out4 = Tensor::zeros(&four.shape);
-    let mut out6 = Tensor::zeros(&six.shape);
     for s in ["vocals", "drums", "bass"] {
         let (i4, i6) = (at(four_names, s)?, at(six_names, s)?);
-        let (a, b) = (f(four, i4), f(six, i6));
-        let mut m = vec![0.0f32; plane];
-        m.par_iter_mut().enumerate().for_each(|(k, v)| *v = (a[k] + b[k]) * 0.5);
-        out4.data[i4 * plane..(i4 + 1) * plane].copy_from_slice(&m);
-        out6.data[i6 * plane..(i6 + 1) * plane].copy_from_slice(&m);
+        let (a, b) = (&mut *planes4[i4], &mut *planes6[i6]);
+        a.par_iter_mut().zip(b.par_iter_mut()).for_each(|(x, y)| {
+            let m = (*x + *y) * 0.5;
+            *x = m;
+            *y = m;
+        });
     }
     let (o4, o6, g, p) = (at(four_names, "other")?, at(six_names, "other")?, at(six_names, "guitar")?, at(six_names, "piano")?);
-    let (a, b, gg, pp) = (f(four, o4), f(six, o6), f(six, g), f(six, p));
+    if [o6, g, p].iter().collect::<std::collections::HashSet<_>>().len() != 3 {
+        return Err("ensemble: htdemucs_6s stems are not distinct".into());
+    }
     // 4-stem other = mean(htdemucs other, 6s guitar + piano + other); 6-stem other = that - guitar - piano.
-    let other4: Vec<f32> = (0..plane).into_par_iter().map(|k| (a[k] + (gg[k] + pp[k] + b[k])) * 0.5).collect();
-    let other6: Vec<f32> = (0..plane).into_par_iter().map(|k| other4[k] - gg[k] - pp[k]).collect();
-    out4.data[o4 * plane..(o4 + 1) * plane].copy_from_slice(&other4);
-    out6.data[o6 * plane..(o6 + 1) * plane].copy_from_slice(&other6);
-    out6.data[g * plane..(g + 1) * plane].copy_from_slice(gg);
-    out6.data[p * plane..(p + 1) * plane].copy_from_slice(pp);
-    Ok((out4, out6))
+    let gg: Vec<f32> = planes6[g].to_vec();
+    let pp: &[f32] = &planes6[p].to_vec();
+    let a = &mut *planes4[o4];
+    let b = &mut *planes6[o6];
+    a.par_iter_mut().zip(b.par_iter_mut()).enumerate().for_each(|(k, (x, y))| {
+        let other4 = (*x + (gg[k] + pp[k] + *y)) * 0.5;
+        *x = other4;
+        *y = other4 - gg[k] - pp[k];
+    });
+    drop((planes4, planes6));
+    Ok((four, six))
 }
 
 #[cfg(test)]
@@ -72,7 +78,7 @@ mod tests {
         let v = |seed: f32, i: usize| ((i as f32 + 1.0) * seed).sin();
         let four = Tensor::new(&[4, ch, len], (0..4 * ch * len).map(|i| v(0.37, i)).collect());
         let six = Tensor::new(&[6, ch, len], (0..6 * ch * len).map(|i| v(0.91, i)).collect());
-        let (a, b) = combine(&four, &n4, &six, &n6).unwrap();
+        let (a, b) = combine(four.clone(), &n4, six.clone(), &n6).unwrap();
         let pl = ch * len;
         let st = |t: &Tensor, i: usize| t.data[i * pl..(i + 1) * pl].to_vec();
         for (i4, i6) in [(0, 0), (1, 1), (3, 3)] {
