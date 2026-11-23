@@ -385,7 +385,9 @@ fn softmax_unnorm(row: &mut [f32], scale: f32) -> f32 {
     for c in &mut chunks {
         for i in 0..8 {
             let x = c[i] * scale - mx;
-            let e = if x < -40.0 { 0.0 } else { exp_g::<F>(x) };
+            // exp of the clamped value: vectorised, every lane is computed, and exp below
+            // about -87 would give subnormals (microcode assists on x86).
+            let e = if x < -40.0 { 0.0 } else { exp_g::<F>(x.max(-40.0)) };
             c[i] = e;
             acc[i] += e as f64;
         }
@@ -393,7 +395,7 @@ fn softmax_unnorm(row: &mut [f32], scale: f32) -> f32 {
     let mut tail = 0f64;
     for v in chunks.into_remainder() {
         let x = *v * scale - mx;
-        *v = if x < -40.0 { 0.0 } else { exp_g::<F>(x) };
+        *v = if x < -40.0 { 0.0 } else { exp_g::<F>(x.max(-40.0)) };
         tail += *v as f64;
     }
     (1.0 / (acc.iter().sum::<f64>() + tail)) as f32

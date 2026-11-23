@@ -1266,7 +1266,9 @@ pub fn softmax_row(row: &mut [f32], scale: f32) {
     // Intel CPUs a microcode assist per operation (attention ran ~6x slower on a Xeon).
     for s in row.iter_mut() {
         let x = *s * scale - mx;
-        *s = if x < -40.0 { 0.0 } else { exp_g::<F>(x) };
+        // exp of the clamped value: once vectorised, every lane computes exp, and far below
+        // -40 it would produce subnormals (microcode assists); those lanes are 0 anyway.
+        *s = if x < -40.0 { 0.0 } else { exp_g::<F>(x.max(-40.0)) };
     }
     let inv = (1.0 / sum64(row)) as f32;
     for s in row.iter_mut() {
