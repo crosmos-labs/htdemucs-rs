@@ -32,6 +32,8 @@ options (demucs' names and defaults where they exist):
   --clip-mode-4 MODE     ensemble only: clip mode of the 4-stem view (default: --clip-mode)
   --ensemble-4 VIEW      ensemble only: the 4-stem view is the average (mean, default) or
                          htdemucs' own stems (htdemucs); the 6-stem set is the ensemble either way
+  --ensemble-own-6s      ensemble only: also write htdemucs_6s' own stems (not averaged) to
+                         DIR/htdemucs_6s.own/<track>/ (--clip-mode)
   -q, --quiet            no progress bar (by default a tqdm-style bar on stderr, as demucs prints)
   -v, --verbose          timings and peak memory on stderr";
 
@@ -45,6 +47,7 @@ struct Args {
     clip: String,
     clip4: Option<String>,
     average_four: bool,
+    own_6s: bool,
     num_overlap: Option<usize>,
     verbose: bool,
     progress: bool,
@@ -62,6 +65,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         clip: "rescale".into(),
         clip4: None,
         average_four: true,
+        own_6s: false,
         num_overlap: None,
         verbose: false,
         progress: true,
@@ -95,6 +99,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
                 }
                 a.clip4 = Some(m);
             }
+            "--ensemble-own-6s" => a.own_6s = true,
             "--ensemble-4" => {
                 a.average_four = match val(&mut it, &arg)?.as_str() {
                     "mean" => true,
@@ -236,6 +241,16 @@ fn run(a: Args) -> Result<(), String> {
         // (folder, source names, stems, clip mode): one set, or the ensemble's 4- and 6-stem views.
         let sets: Vec<(&str, &[String], Tensor, &str)> = if ensemble {
             let (six, four) = (seps.remove(0).stems, seps.remove(0).stems);
+            if a.own_6s {
+                // htdemucs_6s' own stems, before averaging: one clipped copy of a stem at a time.
+                let dir = a.out.join("htdemucs_6s.own").join(track.file_stem().and_then(|s| s.to_str()).unwrap_or("track"));
+                std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                for (i, src) in models[0].sources().iter().enumerate() {
+                    let mut x = six.data[i * ch * len..(i + 1) * ch * len].to_vec();
+                    prevent_clip(&mut x, &a.clip);
+                    audio::write(&dir.join(format!("{src}.{}", a.format.ext())), &x, ch, rate, a.format)?;
+                }
+            }
             let (v4, v6) = htdemucs::ensemble::combine_with(four, models[1].sources(), six, models[0].sources(), a.average_four)?;
             vec![("htdemucs", models[1].sources(), v4, a.clip4.as_deref().unwrap_or(&a.clip)), ("htdemucs_6s", models[0].sources(), v6, &a.clip)]
         } else {
