@@ -267,7 +267,7 @@ single models at the default `rescale`. Every stem is bit-identical (cmp: 78 fil
 | ensemble | 1830 -> **1173** MiB | 1994 -> **1271** MiB | 7203 -> **1561** MiB |
 
 What still grows with length is the decoded input (0.35 MB per second: the 22-minute runs are
-about 0.37 GB above Aerials). The rescale pass costs 7-10 s at 22 minutes (1-3% of the run) and
+about 0.37 GB above Aerials). The rescale pass costs 7-10 s at 22 minutes (1-4% of the run) and
 4 bytes x 2 channels per sample of temporary disk per rescaled stem (466 MB a stem at 22 min).
 `66c76a4` also has the Mel-RoFormer merge's tensor-by-tensor weight loader.
 

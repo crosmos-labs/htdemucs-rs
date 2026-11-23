@@ -18,7 +18,7 @@ child process.
 | C library | glibc (Debian 13, 2.41) | The CLI's malloc tuning (`HTDEMUCS_MALLOC_TUNE`, `src/model.rs`) is glibc's `mallopt`, and musl's allocator is slow for this workload. |
 | weights | baked into the image, in their own layer | 139 MB is 0.7–7% of the image limit. Cold starts need no download and no network access. A code change re-ships only the 4.9 MB binary layer. |
 | entrypoint | `htdemucs-serve`: an HTTP job server on :8080 | A song can take longer than any single request should be held open, so the interface is async: POST the audio, poll the status, GET a tar of the stems. One job per container. |
-| instance | `standard-4` (4 vCPU, 12 GiB, 20 GB), one job per instance | It is the only predefined type that holds a 22-minute ensemble (7.0 GiB measured) with headroom. It also gives the shortest wall time, which is what memory is billed on. See *Sizing*. |
+| instance | `standard-4` (4 vCPU, 12 GiB, 20 GB), one job per instance | It gives the shortest wall time, which is what memory is billed on, so it is the cheapest per song. Memory no longer decides it: since the streamed output (`a7c5ba8`), a 22-minute ensemble peaks at 1.5 GiB (7.0 GiB before), which every type from `standard-1` up holds. See *Sizing*. |
 
 ## Image layout
 
@@ -321,7 +321,21 @@ All sizing numbers below are from the EPYC 9V74.
   Shifts add time, not memory (60 s: 1055 MiB at shifts 2, 1056 at shifts 0). The 22-minute
   figure is above the 5.3 GB measured on macOS (README, footprint). One plausible cause is the
   glibc tuning that keeps freed memory in the heap; this was not measured.
-  `HTDEMUCS_MALLOC_TUNE=0` is the thing to try (open question 4).
+- **Since the streamed output (`a7c5ba8`) memory hardly grows with length.** The stems go to the
+  writers as the overlap-add window passes them, so only the decoded input (0.35 MB per second)
+  grows. Peak RSS on bare-metal Linux (i5-12450H, 8 threads, the same glibc tuning; not yet
+  measured in the container), the build before against `66c76a4`, all stems bit-identical:
+
+  | | Aerials (4:04), shifts 2 | 22 min, shifts 0 |
+  |---|---|---|
+  | htdemucs | 1301 -> 886 MiB | 4036 -> 1213 MiB |
+  | htdemucs_6s | 1491 -> 965 MiB | 4849 -> 1315 MiB |
+  | ensemble (Fretboard's options) | 1994 -> 1271 MiB | **7203 -> 1561 MiB** |
+
+  The "before" 22-minute ensemble (7203 MiB) matches the container's 7131 MiB, so the container
+  should now need about 1.6 GiB plus its 20–130 MiB of page cache. `--clip-mode rescale` stems
+  also need temporary disk: 4 bytes x 2 channels per sample per rescaled stem (Fretboard's 4-stem
+  view: 4 x 466 MB at 22 min), well inside every type's disk.
 
 ## Sizing
 
@@ -370,8 +384,9 @@ container as soon as the result is fetched matters.
   rates.
 
 Per song, at the measured 2-thread rates (EPYC 9V74). The memory needs used for "fits?" are
-1.83 GiB (4 min) and 6.96 GiB (22 min); "tight" means more than 80% of the instance's memory.
-`standard-1` is left out for 22-minute songs.
+those of the streamed output, about 1.3 GiB (4 min) and 1.6 GiB (22 min) plus page cache, so
+every type from `standard-1` up holds every song. (Before `a7c5ba8` they were 1.83 and 6.96 GiB:
+22-minute songs did not fit `standard-2` and only just fit `standard-3`.)
 
 | recipe | song | instance | fits? | CPU / song | wall / song | memory / song | songs in the $5 inclusion (binding) | cost per extra song |
 |---|---|---|---|---|---|---|---|---|
@@ -379,15 +394,17 @@ Per song, at the measured 2-thread rates (EPYC 9V74). The memory needs used for 
 | Fretboard recipe: both models, shifts 2 | 4 min | standard-2 | yes | 21.7 vCPU-min | 22.2 min | 2.22 GiB-h | 11.3 (memory) | $0.047 |
 | Fretboard recipe: both models, shifts 2 | 4 min | standard-3 | yes | 21.7 vCPU-min | 12.6 min | 1.68 GiB-h | 14.9 (memory) | $0.042 |
 | Fretboard recipe: both models, shifts 2 | 4 min | standard-4 | yes | 21.7 vCPU-min | 6.5 min | 1.31 GiB-h | 17.3 (CPU) | $0.038 |
-| Fretboard recipe: both models, shifts 2 | 22 min | standard-2 | **no** | 119.5 vCPU-min | 120.0 min | 12.00 GiB-h | 2.1 (memory) | $0.257 |
-| Fretboard recipe: both models, shifts 2 | 22 min | standard-3 | tight | 119.5 vCPU-min | 66.9 min | 8.92 GiB-h | 2.8 (memory) | $0.228 |
+| Fretboard recipe: both models, shifts 2 | 22 min | standard-1 | yes | 119.5 vCPU-min | 239.5 min | 15.97 GiB-h | 1.6 (memory) | $0.295 |
+| Fretboard recipe: both models, shifts 2 | 22 min | standard-2 | yes | 119.5 vCPU-min | 120.0 min | 12.00 GiB-h | 2.1 (memory) | $0.257 |
+| Fretboard recipe: both models, shifts 2 | 22 min | standard-3 | yes | 119.5 vCPU-min | 66.9 min | 8.92 GiB-h | 2.8 (memory) | $0.228 |
 | Fretboard recipe: both models, shifts 2 | 22 min | standard-4 | yes | 119.5 vCPU-min | 33.7 min | 6.74 GiB-h | 3.1 (CPU) | $0.207 |
 | Ensemble, shifts 0 | 4 min | standard-1 | yes | 11.1 vCPU-min | 22.7 min | 1.52 GiB-h | 16.5 (memory) | $0.028 |
 | Ensemble, shifts 0 | 4 min | standard-2 | yes | 11.1 vCPU-min | 11.6 min | 1.16 GiB-h | 21.5 (memory) | $0.024 |
 | Ensemble, shifts 0 | 4 min | standard-3 | yes | 11.1 vCPU-min | 6.7 min | 0.89 GiB-h | 28.1 (memory) | $0.022 |
 | Ensemble, shifts 0 | 4 min | standard-4 | yes | 11.1 vCPU-min | 3.6 min | 0.72 GiB-h | 33.7 (CPU) | $0.020 |
-| Ensemble, shifts 0 | 22 min | standard-2 | **no** | 61.2 vCPU-min | 61.7 min | 6.17 GiB-h | 4.1 (memory) | $0.132 |
-| Ensemble, shifts 0 | 22 min | standard-3 | tight | 61.2 vCPU-min | 34.5 min | 4.60 GiB-h | 5.4 (memory) | $0.117 |
+| Ensemble, shifts 0 | 22 min | standard-1 | yes | 61.2 vCPU-min | 122.9 min | 8.19 GiB-h | 3.1 (memory) | $0.151 |
+| Ensemble, shifts 0 | 22 min | standard-2 | yes | 61.2 vCPU-min | 61.7 min | 6.17 GiB-h | 4.1 (memory) | $0.132 |
+| Ensemble, shifts 0 | 22 min | standard-3 | yes | 61.2 vCPU-min | 34.5 min | 4.60 GiB-h | 5.4 (memory) | $0.117 |
 | Ensemble, shifts 0 | 22 min | standard-4 | yes | 61.2 vCPU-min | 17.5 min | 3.50 GiB-h | 6.1 (CPU) | $0.106 |
 
 If a Cloudflare vCPU turns out to be a whole core (the `threads=1` rate), CPU per song drops by
@@ -398,12 +415,12 @@ inside the inclusion), and a shifts-0 ensemble song about 7 vCPU-minutes (about 
 
 - **Instance: `standard-4`** (4 vCPU, 12 GiB, 20 GB), **one job per instance**, a pool of 1–2
   Durable Object names, and `max_instances: 2`.
-  - It is the only predefined type that holds a 22-minute song (7.0 GiB) with headroom.
-    `standard-3` would hold it with under 1 GiB to spare, and `standard-2` not at all.
-  - Memory is billed on wall time, so the fastest instance is also the cheapest per song.
+  - Memory is billed on wall time, so the fastest instance is also the cheapest per song. Every
+    type now holds a 22-minute song (about 1.6 GiB since the streamed output, against 7.0 GiB
+    before), so this is a cost choice, not a memory one.
     Inside the inclusion, `standard-4` is the only type where CPU, not memory, runs out first.
-  - One job per instance because the work is CPU-bound and memory scales with length. Two jobs
-    in one container would only share the 4 vCPUs and add their memory.
+  - One job per instance because the work is CPU-bound. Two jobs in one container would only
+    share the 4 vCPUs and add their memory.
   - The DO should stop the container as soon as it has the result (`signal(15)`, or `destroy()`),
     not wait for an inactivity timeout: every idle minute bills 12 GiB.
 - **Fretboard's recipe** (htdemucs + htdemucs_6s at shifts 2), songs up to 22 minutes:
@@ -417,9 +434,10 @@ inside the inclusion), and a shifts-0 ensemble song about 7 vCPU-minutes (about 
   - about **$0.020 per extra song** ($0.11 at 22 minutes);
   - about 3.6 minutes of wall time.
 - **Cheaper still, if needed:**
-  - With the `durable_object` scheduling policy, `start()` can pick a smaller custom instance per
-    song. For example, `{vcpu: 4, memoryMib: 3072}` for songs under 6 minutes cuts the memory
-    part of a 4-minute recipe song from $0.012 to $0.003. CPU, the bigger part, stays.
+  - A custom type with 4 vCPUs and less memory: with the streamed output,
+    `{vcpu: 4, memoryMib: 3072}` holds any song up to 22 minutes (1.6 GiB peak), and cuts the
+    memory part of a 4-minute recipe song from $0.012 to $0.003. CPU, the bigger part, stays.
+    Confirm the peak in the container first (open question 4).
   - Measure `--threads` against Cloudflare's real vCPUs first (open question 1).
 
 ## Open questions
@@ -439,14 +457,10 @@ inside the inclusion), and a shifts-0 ensemble song about 7 vCPU-minutes (about 
    its own cap is not documented. If it does, have Fretboard upload m4a or FLAC rather than float
    WAV, or let the container fetch from and upload to presigned R2 URLs (needs
    `enableInternet: true`).
-4. **Memory at 22 minutes.** The ensemble peaks at 7.0 GiB in the container, against 5.3 GB
-   measured on macOS. That fits `standard-4` (12 GiB), only just fits `standard-3` (8 GiB), and
-   does not fit `standard-2` (6 GiB).
-   - To try: `HTDEMUCS_MALLOC_TUNE=0` (glibc's defaults, which may trim the heap at some CPU
-     cost), and running the two models as separate processes (htdemucs_6s alone was 1418 MiB at
-     4 min against the ensemble's 1878).
-   - Under the `durable_object` scheduling policy, `start()` takes the instance type per job, so
-     short songs could get a smaller, cheaper instance.
+4. **Memory in the container since the streamed output.** Before `a7c5ba8`, the 22-minute
+   ensemble peaked at 7.0 GiB in the container. On bare-metal Linux it now peaks at 1561 MiB
+   (7203 before), and 1271 MiB on a 4-minute song at shifts 2. The container sizing job should be
+   rerun to confirm, with its cgroup `memory.peak`, before choosing a smaller instance.
 5. **Image storage across deploys.** It is 141 MB per version against 50 GB per account. Whether
    unchanged layers (the weights) are stored once across versions is not documented.
 6. **Mel-RoFormer** adds 456 MB of weights (fp16) and its own CPU and memory profile. None of it
