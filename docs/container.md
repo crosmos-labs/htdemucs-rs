@@ -332,8 +332,15 @@ All sizing numbers below are from the EPYC 9V74.
   | htdemucs_6s | 1491 -> 965 MiB | 4849 -> 1315 MiB |
   | ensemble (Fretboard's options) | 1994 -> 1271 MiB | **7203 -> 1561 MiB** |
 
-  The "before" 22-minute ensemble (7203 MiB) matches the container's 7131 MiB, so the container
-  should now need about 1.6 GiB plus its 20–130 MiB of page cache. `--clip-mode rescale` stems
+  The "before" 22-minute ensemble (7203 MiB) matches the container's 7131 MiB. **In the
+  container** (Blacksmith 4 vCPU AMD EPYC, run 45279954503, `main` at `9ce5c33`, distroless, the
+  same 22-minute clip, `-n ensemble --shifts 0 --flac`): **peak RSS 1388 MiB** (was 7131), 589 s
+  wall, 1743 CPU s (1.32 CPU s per audio s at 4 threads on Zen 5). Its cgroup `memory.peak` was
+  6694 MiB, but that is page cache: the job ran at the default `--clip-mode rescale`, so all 10
+  stems went through float temp files (4.7 GB written and read back), plus the 466 MB input and
+  the 0.6 GB result and tar. Page cache is reclaimed under the cgroup's limit rather than
+  causing an OOM; Fretboard's options rescale only the 4-stem view (1.9 GB of temp files at 22
+  minutes) and `clamp` needs none. `--clip-mode rescale` stems
   also need temporary disk: 4 bytes x 2 channels per sample per rescaled stem (Fretboard's 4-stem
   view: 4 x 466 MB at 22 min), well inside every type's disk.
 
@@ -439,9 +446,10 @@ inside the inclusion), and a shifts-0 ensemble song about 7 vCPU-minutes (about 
   - about 4.1 minutes of wall time.
 - **Cheaper still, if needed:**
   - A custom type with 4 vCPUs and less memory: with the streamed output,
-    `{vcpu: 4, memoryMib: 3072}` holds any song up to 22 minutes (1.6 GiB peak), and cuts the
-    memory part of a 4-minute recipe song from $0.013 to $0.003. CPU, the bigger part, stays.
-    Confirm the peak in the container first (open question 4).
+    `{vcpu: 4, memoryMib: 3072}` holds any song up to 22 minutes (separator peak 1.4 GiB in the
+    container), and cuts the memory part of a 4-minute recipe song from $0.013 to $0.003. CPU,
+    the bigger part, stays. The page cache of the rescale temp files is the one thing to watch
+    (open question 4).
   - Measure `--threads` against Cloudflare's real vCPUs first (open question 1).
 
 ## Open questions
@@ -463,10 +471,12 @@ inside the inclusion), and a shifts-0 ensemble song about 7 vCPU-minutes (about 
    its own cap is not documented. If it does, have Fretboard upload m4a or FLAC rather than float
    WAV, or let the container fetch from and upload to presigned R2 URLs (needs
    `enableInternet: true`).
-4. **Memory in the container since the streamed output.** Before `a7c5ba8`, the 22-minute
-   ensemble peaked at 7.0 GiB in the container. On bare-metal Linux it now peaks at 1561 MiB
-   (7203 before), and 1271 MiB on a 4-minute song at shifts 2. The container sizing job should be
-   rerun to confirm, with its cgroup `memory.peak`, before choosing a smaller instance.
+4. **Memory in the container since the streamed output: answered.** The 22-minute ensemble's
+   separator peaks at 1388 MiB in the container (7131 before; bare-metal Linux 1561 with
+   Fretboard's options). Left open: the cgroup peak is mostly reclaimable page cache from the
+   rescale temp files (6694 MiB at the default clip mode); a run on a real 3–6 GiB instance
+   would show whether Cloudflare's limit treats it that way. If not, drop the temp files' pages
+   as they are written (`posix_fadvise(DONTNEED)`), or use `--clip-mode clamp`.
 5. **Image storage across deploys.** It is 141 MB per version against 50 GB per account. Whether
    unchanged layers (the weights) are stored once across versions is not documented.
 6. **Mel-RoFormer** adds 456 MB of weights (fp16) and its own CPU and memory profile. None of it
