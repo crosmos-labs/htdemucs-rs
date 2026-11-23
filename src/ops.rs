@@ -17,7 +17,7 @@ pub mod prof {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
     use std::time::Instant;
 
-    pub const CLASSES: [&str; 15] = [
+    pub const CLASSES: [&str; 17] = [
         "conv gemm",
         "conv im2col / tap shift-add",
         "conv bias fill",
@@ -33,6 +33,8 @@ pub mod prof {
         "stft",
         "istft",
         "other (layout, copies, adds, standardise)",
+        "DConv, frequency rows fused",
+        "attention, blocked (QK^T, softmax, AV)",
     ];
     pub const CONV: usize = 0;
     pub const IM2COL: usize = 1;
@@ -49,6 +51,8 @@ pub mod prof {
     pub const STFT: usize = 12;
     pub const ISTFT: usize = 13;
     pub const COPY: usize = 14;
+    pub const DCONV: usize = 15;
+    pub const ATTN: usize = 16;
     pub const BRANCHES: [&str; 3] = ["freq", "time", "transformer"];
     const N: usize = CLASSES.len() * BRANCHES.len();
 
@@ -204,14 +208,14 @@ pub fn sgemm_par(
     assert!(k == 0 || (k - 1) * b_rs + (n - 1) * b_cs < b.len());
     assert!((m - 1) * c_rs + n <= c.len());
     prof::gemm_flops(m, n, k);
-    #[cfg(all(feature = "accelerate", target_os = "macos"))]
+    #[cfg(any(all(feature = "accelerate", target_os = "macos"), feature = "openblas"))]
     {
-        let _ = parallel; // Accelerate manages its own threads
-        accelerate::sgemm(m, n, k, a, a_rs, a_cs, b, b_rs, b_cs, c, c_rs, accumulate);
+        let _ = parallel; // the BLAS manages its own threads
+        cblas::sgemm(m, n, k, a, a_rs, a_cs, b, b_rs, b_cs, c, c_rs, accumulate);
     }
     // gemm computes dst = alpha * dst + beta * lhs * rhs. It never splits the k dimension across
     // threads, so results do not depend on the thread count.
-    #[cfg(not(all(feature = "accelerate", target_os = "macos")))]
+    #[cfg(not(any(all(feature = "accelerate", target_os = "macos"), feature = "openblas")))]
     unsafe {
         gemm::gemm(
             m,
@@ -237,16 +241,17 @@ pub fn sgemm_par(
     }
 }
 
-/// Apple's Accelerate BLAS (runs on the AMX units of Apple silicon), behind the `accelerate`
-/// feature on macOS.
-#[cfg(all(feature = "accelerate", target_os = "macos"))]
-mod accelerate {
+/// A CBLAS sgemm: Apple's Accelerate (runs on the AMX units of Apple silicon) with the
+/// `accelerate` feature on macOS, or OpenBLAS (`openblas`, for speed comparisons on x86).
+#[cfg(any(all(feature = "accelerate", target_os = "macos"), feature = "openblas"))]
+mod cblas {
     #[allow(non_camel_case_types)]
     type c_int = i32;
     const ROW_MAJOR: c_int = 101;
     const NO_TRANS: c_int = 111;
     const TRANS: c_int = 112;
-    #[link(name = "Accelerate", kind = "framework")]
+    #[cfg_attr(all(feature = "accelerate", target_os = "macos"), link(name = "Accelerate", kind = "framework"))]
+    #[cfg_attr(feature = "openblas", link(name = "openblas"))]
     unsafe extern "C" {
         fn cblas_sgemm(
             order: c_int, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: f32,
@@ -297,6 +302,139 @@ pub struct Conv {
     w_taps: Option<Vec<f32>>,
 }
 
+/// One DConv residual branch on a (C, F, T) input whose GroupNorms are per frequency row f (the
+/// frequency branch, where PyTorch runs DConv on (B*F, C, T)): dilated conv (k = 3) -> GroupNorm
+/// -> GELU -> 1x1 conv -> GroupNorm -> GLU -> LayerScale, added to x. Row f's result depends on
+/// row f only, so each row is one task with every intermediate in cache: no (2C, F, T) buffers.
+/// Same operations in the same order as the layer-by-layer path. `delta` (tracing) receives the
+/// added values.
+#[allow(clippy::too_many_arguments)]
+pub fn dconv_rows(
+    x: &mut Tensor,
+    conv1: &Conv,
+    gn1: (&[f32], &[f32]),
+    conv2: &Conv,
+    gn2: (&[f32], &[f32]),
+    ls: &[f32],
+    delta: Option<&mut Tensor>,
+) {
+    let (c, fr, t) = (x.shape[0], x.shape[1], x.shape[2]);
+    let cm = conv1.cout;
+    assert_eq!((conv1.cin, conv2.cin, conv2.cout), (c, cm, 2 * c));
+    assert_eq!((conv1.k, conv1.stride, conv1.pad.0, conv1.pad.1), ((1, 3), (1, 1), 0, conv1.dil.1));
+    assert!(conv2.k == (1, 1) && conv2.stride == (1, 1) && conv2.pad == (0, 0));
+    let _sc = prof::scope(prof::DCONV);
+    let xp = SendPtr(x.data.as_mut_ptr());
+    let dp = delta.map(|d| {
+        assert_eq!(d.shape, x.shape);
+        SendPtr(d.data.as_mut_ptr())
+    });
+    (0..fr).into_par_iter().for_each_init(
+        || (vec![0.0f32; c * t], vec![0.0f32; 3 * cm * t], vec![0.0f32; cm * t], vec![0.0f32; 2 * c * t]),
+        |(xr, yt, y1, z), f| {
+            // SAFETY: task f reads and writes only rows (ci, f) of x and delta.
+            let row = |p: SendPtr, ci: usize| unsafe { std::slice::from_raw_parts_mut(p.get().add((ci * fr + f) * t), t) };
+            for ci in 0..c {
+                xr[ci * t..(ci + 1) * t].copy_from_slice(row(xp, ci));
+            }
+            dconv_row(xr, yt, y1, z, t, conv1, gn1, conv2, gn2, ls);
+            // x += ls * GLU(GroupNorm(z + b2)), as `glu_add_plane`.
+            for ci in 0..c {
+                let d = dp.map(|p| row(p, ci));
+                glu_add_row(row(xp, ci), d, &z[ci * t..(ci + 1) * t], &z[(c + ci) * t..(c + ci + 1) * t], ci, c, &conv2.b, gn2, ls, y1[0], y1[1]);
+            }
+        },
+    );
+}
+
+simd_fn! {
+/// `dconv_rows` for one row up to z = W2 y (2C, T) without its bias; leaves GroupNorm-2's
+/// (mean, 1/std) of z + b2 in y1[0], y1[1].
+fn dconv_row(xr: &[f32], yt: &mut [f32], y1: &mut [f32], z: &mut [f32], t: usize, conv1: &Conv, gn1: (&[f32], &[f32]), conv2: &Conv, gn2: (&[f32], &[f32]), ls: &[f32]) {
+    let _ = (gn2, ls);
+    let c = conv1.cin;
+    let cm = conv1.cout;
+    let wt = conv1.w_taps.as_ref().unwrap();
+    sgemm_par(3 * cm, t, c, wt, c, 1, xr, t, 1, yt, t, false, false);
+    // y1[co] = b1 + sum_kj taps shifted, as Conv's tap path.
+    let (d, p) = (conv1.dil.1 as isize, conv1.pad.1 as isize);
+    for co in 0..cm {
+        let dst = &mut y1[co * t..(co + 1) * t];
+        dst.fill(conv1.b[co]);
+        for kj in 0..3 {
+            let src = &yt[(kj * cm + co) * t..(kj * cm + co + 1) * t];
+            let shift = kj as isize * d - p;
+            let lo = (-shift).max(0) as usize;
+            let hi = ((t as isize - shift).min(t as isize)).max(0) as usize;
+            if lo < hi {
+                let s0 = (lo as isize + shift) as usize;
+                for (o, v) in dst[lo..hi].iter_mut().zip(&src[s0..s0 + (hi - lo)]) {
+                    *o += v;
+                }
+            }
+        }
+    }
+    // GroupNorm-1 over (Cm, T) + GELU, as row_stats + gn_plane.
+    let n = (cm * t) as f64;
+    let mut s = 0f64;
+    for co in 0..cm {
+        s += sum64(&y1[co * t..(co + 1) * t]);
+    }
+    let mean = s / n;
+    let mut q = 0f64;
+    for co in 0..cm {
+        q += sqdev64(&y1[co * t..(co + 1) * t], mean);
+    }
+    let (m, r) = (mean as f32, (1.0 / (q / n + 1e-5).sqrt()) as f32);
+    for co in 0..cm {
+        let scale = r * gn1.0[co];
+        let shift = gn1.1[co] - m * scale;
+        for v in &mut y1[co * t..(co + 1) * t] {
+            *v = gelu1(*v * scale + shift);
+        }
+    }
+    sgemm_par(2 * c, t, cm, &conv2.w, cm, 1, y1, t, 1, z, t, false, false);
+    // GroupNorm-2 statistics of z + b2 over (2C, T).
+    let n = (2 * c * t) as f64;
+    let mut s = 0f64;
+    for ci in 0..2 * c {
+        s += sum64b(&z[ci * t..(ci + 1) * t], conv2.b[ci]);
+    }
+    let mean = s / n;
+    let mut q = 0f64;
+    for ci in 0..2 * c {
+        q += sqdev64b(&z[ci * t..(ci + 1) * t], conv2.b[ci], mean);
+    }
+    y1[0] = mean as f32;
+    y1[1] = (1.0 / (q / n + 1e-5).sqrt()) as f32;
+}
+}
+
+simd_fn! {
+/// x += ls[ci] * ((za + ba) * sa + ha) * sigmoid((zb + bb) * sb + hb), one row (see `glu_add_plane`).
+fn glu_add_row(x: &mut [f32], d: Option<&mut [f32]>, za: &[f32], zb: &[f32], ci: usize, c: usize, b2: &[f32], gn2: (&[f32], &[f32]), ls: &[f32], m: f32, r: f32) {
+    let (gamma, beta) = gn2;
+    let (sa, sb) = (r * gamma[ci], r * gamma[c + ci]);
+    let (ha, hb) = (beta[ci] - m * sa, beta[c + ci] - m * sb);
+    let (ba, bb) = (b2[ci], b2[c + ci]);
+    match d {
+        None => {
+            for i in 0..x.len() {
+                let v = ls[ci] * (((za[i] + ba) * sa + ha) * sigmoid((zb[i] + bb) * sb + hb));
+                x[i] += v;
+            }
+        }
+        Some(dd) => {
+            for i in 0..x.len() {
+                let v = ls[ci] * (((za[i] + ba) * sa + ha) * sigmoid((zb[i] + bb) * sb + hb));
+                dd[i] = v;
+                x[i] += v;
+            }
+        }
+    }
+}
+}
+
 /// Upper bound on the im2col buffer (floats); larger convolutions are done in column blocks.
 const COL_BLOCK: usize = 1 << 24;
 
@@ -326,19 +464,25 @@ impl Conv {
     }
 
     pub fn forward(&self, x: &Tensor) -> Tensor {
+        self.run(x, true)
+    }
+
+    /// The convolution without its bias: callers add `self.b` in their next elementwise pass
+    /// (`bias_gelu`, `glu_bias`, `group_norm1_glu_add_b`).
+    pub fn forward_raw(&self, x: &Tensor) -> Tensor {
+        self.run(x, false)
+    }
+
+    fn run(&self, x: &Tensor, bias: bool) -> Tensor {
         let (cin, h, w) = (x.shape[0], x.shape[1], x.shape[2]);
         assert_eq!(cin, self.cin, "conv input channels");
         let (ho, wo) = self.out_size(h, w);
         let n = ho * wo;
         let kk = cin * self.k.0 * self.k.1;
-        let sc = prof::scope(prof::BIAS);
         let mut out = vec![0.0f32; self.cout * n];
-        // Bias first, then accumulate the GEMM into it.
-        out.par_chunks_mut(n).zip(self.b.par_iter()).for_each(|(row, &b)| row.fill(b));
-        drop(sc);
         let pointwise = self.k == (1, 1) && self.stride == (1, 1) && self.pad == (0, 0);
         if let Some(wt) = &self.w_taps {
-            // y[kj] = W_kj x for all taps at once, then out[co, h, o] += y[kj, co, h, o + kj*d - p].
+            // y[kj] = W_kj x for all taps at once, then out[co, h, o] = b + sum_kj y[kj, co, h, o + kj*d - p].
             let kw = self.k.1;
             let hw = h * w;
             let sc = prof::scope(prof::CONV);
@@ -349,6 +493,7 @@ impl Conv {
             let (d, p) = (self.dil.1 as isize, self.pad.1 as isize);
             let cout = self.cout;
             out.par_chunks_mut(n).enumerate().for_each(|(co, orow)| {
+                orow.fill(if bias { self.b[co] } else { 0.0 });
                 for kj in 0..kw {
                     let yp = &y[(kj * cout + co) * hw..(kj * cout + co + 1) * hw];
                     let shift = kj as isize * d - p;
@@ -360,28 +505,33 @@ impl Conv {
                         let hi_ = ((w as isize - shift).min(wo as isize)).max(0) as usize;
                         if lo < hi_ {
                             let s0 = (lo as isize + shift) as usize;
-                            for (o, v) in dst[lo..hi_].iter_mut().zip(&src[s0..s0 + (hi_ - lo)]) {
-                                *o += v;
-                            }
+                            add_assign(&mut dst[lo..hi_], &src[s0..s0 + (hi_ - lo)]);
                         }
                     }
                 }
             });
-        } else if pointwise {
-            let _sc = prof::scope(prof::CONV);
-            sgemm(self.cout, n, kk, &self.w, kk, 1, &x.data, n, 1, &mut out, n, true);
         } else {
-            let block = (COL_BLOCK / kk).max(wo).min(n);
-            let mut col = vec![0.0f32; kk * block];
-            let mut j0 = 0;
-            while j0 < n {
-                let nb = block.min(n - j0);
-                let sc = prof::scope(prof::IM2COL);
-                self.im2col(x, ho, wo, j0, nb, &mut col[..kk * nb]);
-                drop(sc);
+            if bias {
+                // Bias first, then accumulate the GEMM into it.
+                let _sc = prof::scope(prof::BIAS);
+                out.par_chunks_mut(n).zip(self.b.par_iter()).for_each(|(row, &b)| row.fill(b));
+            }
+            if pointwise {
                 let _sc = prof::scope(prof::CONV);
-                sgemm(self.cout, nb, kk, &self.w, kk, 1, &col, nb, 1, &mut out[j0..], n, true);
-                j0 += nb;
+                sgemm(self.cout, n, kk, &self.w, kk, 1, &x.data, n, 1, &mut out, n, bias);
+            } else {
+                let block = (COL_BLOCK / kk).max(wo).min(n);
+                let mut col = vec![0.0f32; kk * block];
+                let mut j0 = 0;
+                while j0 < n {
+                    let nb = block.min(n - j0);
+                    let sc = prof::scope(prof::IM2COL);
+                    self.im2col(x, ho, wo, j0, nb, &mut col[..kk * nb]);
+                    drop(sc);
+                    let _sc = prof::scope(prof::CONV);
+                    sgemm(self.cout, nb, kk, &self.w, kk, 1, &col, nb, 1, &mut out[j0..], n, bias);
+                    j0 += nb;
+                }
             }
         }
         Tensor::new(&[self.cout, ho, wo], out)
@@ -415,10 +565,15 @@ impl Conv {
                     let base = kj * dw - pw;
                     if sw == 1 {
                         // Contiguous: copy the in-range span, zero the rest.
-                        for (t, d) in dst.iter_mut().enumerate() {
-                            let iw = (ow0 + t) as isize + base;
-                            *d = if iw >= 0 && iw < w { src[iw as usize] } else { 0.0 };
+                        let first = ow0 as isize + base; // input index of dst[0]
+                        let lo = (-first).clamp(0, run as isize) as usize;
+                        let hi = (w - first).clamp(lo as isize, run as isize) as usize;
+                        dst[..lo].fill(0.0);
+                        if lo < hi {
+                            let s0 = (first + lo as isize) as usize;
+                            dst[lo..hi].copy_from_slice(&src[s0..s0 + (hi - lo)]);
                         }
+                        dst[hi..].fill(0.0);
                     } else {
                         for (t, d) in dst.iter_mut().enumerate() {
                             let iw = (ow0 + t) as isize * sw + base;
@@ -469,9 +624,7 @@ impl ConvTr {
                         let orow = &mut plane[(ih * sh + ki) * wo..(ih * sh + ki + 1) * wo];
                         let srow = &src[ih * w..(ih + 1) * w];
                         if sw == 1 {
-                            for (o, s) in orow[kj..kj + w].iter_mut().zip(srow) {
-                                *o += s;
-                            }
+                            add_assign(&mut orow[kj..kj + w], srow);
                         } else {
                             for (iw, s) in srow.iter().enumerate() {
                                 orow[iw * sw + kj] += s;
@@ -497,6 +650,37 @@ fn sum64(x: &[f32]) -> f64 {
         }
     }
     acc.iter().sum::<f64>() + rest.iter().map(|&v| v as f64).sum::<f64>()
+}
+}
+
+simd_fn! {
+/// Sum of (x + b) in f64 (x + b rounded to f32 first, as if stored).
+fn sum64b(x: &[f32], b: f32) -> f64 {
+    let mut acc = [0f64; 8];
+    let chunks = x.chunks_exact(8);
+    let rest = chunks.remainder();
+    for c in chunks {
+        for i in 0..8 {
+            acc[i] += (c[i] + b) as f64;
+        }
+    }
+    acc.iter().sum::<f64>() + rest.iter().map(|&v| (v + b) as f64).sum::<f64>()
+}
+}
+
+simd_fn! {
+/// Sum of squared deviations of (x + b) from `m`, in f64.
+fn sqdev64b(x: &[f32], b: f32, m: f64) -> f64 {
+    let mut acc = [0f64; 8];
+    let chunks = x.chunks_exact(8);
+    let rest = chunks.remainder();
+    for c in chunks {
+        for i in 0..8 {
+            let d = (c[i] + b) as f64 - m;
+            acc[i] += d * d;
+        }
+    }
+    acc.iter().sum::<f64>() + rest.iter().map(|&v| ((v + b) as f64 - m) * ((v + b) as f64 - m)).sum::<f64>()
 }
 }
 
@@ -538,14 +722,22 @@ pub fn mean_std(x: &[f32]) -> (f32, f32) {
 /// where each index s of the middle axis is a separate sample (PyTorch's batch): statistics over
 /// (C, T) for each s. (S = 1 for an ordinary (C, T) input.)
 pub fn row_stats(x: &Tensor) -> Vec<(f32, f32)> {
+    row_stats_b(x, None)
+}
+
+/// `row_stats` of x + bias[c] (a convolution output given without its bias).
+pub fn row_stats_b(x: &Tensor, bias: Option<&[f32]>) -> Vec<(f32, f32)> {
     let (c, s, t) = (x.shape[0], x.shape[1], x.shape[2]);
     let n = (c * t) as f64;
-    let sums: Vec<Vec<f64>> = x.data.par_chunks(s * t).map(|p| p.chunks(t).map(sum64).collect()).collect();
+    let bc = |ci: usize| bias.map_or(0.0, |b| b[ci]);
+    let sums: Vec<Vec<f64>> =
+        x.data.par_chunks(s * t).enumerate().map(|(ci, p)| p.chunks(t).map(|r| sum64b(r, bc(ci))).collect()).collect();
     let means: Vec<f64> = (0..s).map(|si| sums.iter().map(|v| v[si]).sum::<f64>() / n).collect();
     let sq: Vec<Vec<f64>> = x
         .data
         .par_chunks(s * t)
-        .map(|p| p.chunks(t).zip(&means).map(|(r, &m)| sqdev64(r, m)).collect())
+        .enumerate()
+        .map(|(ci, p)| p.chunks(t).zip(&means).map(|(r, &m)| sqdev64b(r, bc(ci), m)).collect())
         .collect();
     (0..s)
         .map(|si| {
@@ -578,25 +770,40 @@ fn gn_plane(plane: &mut [f32], t: usize, st: &[(f32, f32)], g: f32, b: f32, f: &
 /// GroupNorm(1) per sample of z (2C, S, T), GLU over channels, LayerScale, residual add:
 /// x += ls * (a * sigmoid(b)) with (a, b) the normalised halves of z - the tail of a DConv branch.
 /// If `delta` is given, the added values are also written there.
-pub fn group_norm1_glu_add(z: &Tensor, gamma: &[f32], beta: &[f32], ls: &[f32], x: &mut Tensor, mut delta: Option<&mut Tensor>) {
+pub fn group_norm1_glu_add(z: &Tensor, gamma: &[f32], beta: &[f32], ls: &[f32], x: &mut Tensor, delta: Option<&mut Tensor>) {
+    group_norm1_glu_add_b(z, None, gamma, beta, ls, x, delta)
+}
+
+/// `group_norm1_glu_add` on z + zbias[c] (a convolution output given without its bias).
+pub fn group_norm1_glu_add_b(
+    z: &Tensor,
+    zbias: Option<&[f32]>,
+    gamma: &[f32],
+    beta: &[f32],
+    ls: &[f32],
+    x: &mut Tensor,
+    mut delta: Option<&mut Tensor>,
+) {
     let _sc = prof::scope(prof::GROUPNORM);
-    let st = row_stats(z);
+    let st = row_stats_b(z, zbias);
+    let zero = vec![0.0f32; z.shape[0]];
+    let zb = zbias.unwrap_or(&zero);
     let (c, s, t) = (x.shape[0], x.shape[1], x.shape[2]);
     assert_eq!(z.shape, [2 * c, s, t]);
     let plane = s * t;
     match delta.as_deref_mut() {
-        None => x.data.par_chunks_mut(plane).enumerate().for_each(|(ci, xp)| glu_add_plane(ci, c, t, xp, None, &z.data, &st, gamma, beta, ls)),
+        None => x.data.par_chunks_mut(plane).enumerate().for_each(|(ci, xp)| glu_add_plane(ci, c, t, xp, None, &z.data, zb, &st, gamma, beta, ls)),
         Some(d) => x
             .data
             .par_chunks_mut(plane)
             .zip(d.data.par_chunks_mut(plane))
             .enumerate()
-            .for_each(|(ci, (xp, dp))| glu_add_plane(ci, c, t, xp, Some(dp), &z.data, &st, gamma, beta, ls)),
+            .for_each(|(ci, (xp, dp))| glu_add_plane(ci, c, t, xp, Some(dp), &z.data, zb, &st, gamma, beta, ls)),
     }
 }
 
 simd_fn! {
-fn glu_add_plane(ci: usize, c: usize, t: usize, xp: &mut [f32], dp: Option<&mut [f32]>, z: &[f32], st: &[(f32, f32)], gamma: &[f32], beta: &[f32], ls: &[f32]) {
+fn glu_add_plane(ci: usize, c: usize, t: usize, xp: &mut [f32], dp: Option<&mut [f32]>, z: &[f32], zbias: &[f32], st: &[(f32, f32)], gamma: &[f32], beta: &[f32], ls: &[f32]) {
     let mut dp = dp;
     let plane = xp.len();
     let za = &z[ci * plane..(ci + 1) * plane];
@@ -604,18 +811,19 @@ fn glu_add_plane(ci: usize, c: usize, t: usize, xp: &mut [f32], dp: Option<&mut 
     for (si, &(m, r)) in st.iter().enumerate() {
         let (sa, sb) = (r * gamma[ci], r * gamma[c + ci]);
         let (ha, hb) = (beta[ci] - m * sa, beta[c + ci] - m * sb);
+        let (ba, bb) = (zbias[ci], zbias[c + ci]);
         let rg = si * t..(si + 1) * t;
         let (xa, ya, yb) = (&mut xp[rg.clone()], &za[rg.clone()], &zb[rg.clone()]);
         match dp.as_deref_mut() {
             None => {
                 for i in 0..t {
-                    let d = ls[ci] * ((ya[i] * sa + ha) * sigmoid(yb[i] * sb + hb));
+                    let d = ls[ci] * (((ya[i] + ba) * sa + ha) * sigmoid((yb[i] + bb) * sb + hb));
                     xa[i] += d;
                 }
             }
             Some(dp) => {
                 for i in 0..t {
-                    let d = ls[ci] * ((ya[i] * sa + ha) * sigmoid(yb[i] * sb + hb));
+                    let d = ls[ci] * (((ya[i] + ba) * sa + ha) * sigmoid((yb[i] + bb) * sb + hb));
                     dp[si * t + i] = d;
                     xa[i] += d;
                 }
@@ -750,6 +958,18 @@ fn glu_slice(o: &mut [f32], a: &[f32], b: &[f32]) {
 }
 }
 
+/// y = x W^T for x (N, Cin), W (Cout, Cin): nn.Linear without its bias (callers fuse the bias into
+/// the next elementwise pass; adding it afterwards gives the same bits as starting from it when
+/// the GEMM sums k in one block).
+pub fn matmul_t(x: &Tensor, w: &[f32], cout: usize) -> Tensor {
+    let _sc = prof::scope(prof::LINEAR);
+    let (n, cin) = (x.shape[0], x.shape[1]);
+    assert_eq!(w.len(), cout * cin);
+    let mut out = vec![0.0f32; n * cout];
+    sgemm(n, cout, cin, &x.data, cin, 1, w, 1, cin, &mut out, cout, false);
+    Tensor::new(&[n, cout], out)
+}
+
 /// y = x W^T + b for x (N, Cin), W (Cout, Cin) (nn.Linear).
 pub fn linear(x: &Tensor, w: &[f32], b: &[f32]) -> Tensor {
     let _sc = prof::scope(prof::LINEAR);
@@ -759,6 +979,68 @@ pub fn linear(x: &Tensor, w: &[f32], b: &[f32]) -> Tensor {
     out.par_chunks_mut(cout).for_each(|row| row.copy_from_slice(b));
     sgemm(n, cout, cin, &x.data, cin, 1, w, 1, cin, &mut out, cout, true);
     Tensor::new(&[n, cout], out)
+}
+
+simd_fn! {
+/// dst += src.
+pub fn add_assign(dst: &mut [f32], src: &[f32]) {
+    for (o, v) in dst.iter_mut().zip(src) {
+        *o += v;
+    }
+}
+}
+
+simd_fn! {
+/// v = GELU(v + b) over a slice.
+fn bias_gelu_slice(x: &mut [f32], b: f32) {
+    for v in x.iter_mut() {
+        *v = gelu1(*v + b);
+    }
+}
+}
+
+/// x[c, ...] = GELU(x[c, ...] + b[c]) - a convolution's bias and the GELU after it, one pass.
+pub fn bias_gelu(x: &mut Tensor, b: &[f32]) {
+    let _sc = prof::scope(prof::ACT);
+    let plane = x.numel() / x.shape[0];
+    assert_eq!(b.len(), x.shape[0]);
+    x.data.par_chunks_mut(plane).zip(b.par_iter()).for_each(|(p, &bc)| p.par_chunks_mut(8192).for_each(|c| bias_gelu_slice(c, bc)));
+}
+
+/// GLU over the first axis of a convolution output given without its bias:
+/// (2C, ...) -> (C, ...), (a + ba) * sigmoid(b + bb).
+pub fn glu_bias(x: &Tensor, bias: &[f32]) -> Tensor {
+    let _sc = prof::scope(prof::ACT);
+    let c = x.shape[0] / 2;
+    assert_eq!(bias.len(), 2 * c);
+    let plane = x.numel() / x.shape[0];
+    let mut shape = x.shape.clone();
+    shape[0] = c;
+    let (a, b) = x.data.split_at(c * plane);
+    let mut out = vec![0.0f32; c * plane];
+    out.par_chunks_mut(plane).zip(a.par_chunks(plane).zip(b.par_chunks(plane))).enumerate().for_each(|(ci, (o, (a, b)))| {
+        let (ba, bb) = (bias[ci], bias[c + ci]);
+        o.par_chunks_mut(8192)
+            .zip(a.par_chunks(8192).zip(b.par_chunks(8192)))
+            .for_each(|(o, (a, b))| glu_bias_slice(o, a, b, ba, bb));
+    });
+    Tensor::new(&shape, out)
+}
+
+simd_fn! {
+fn glu_bias_slice(o: &mut [f32], a: &[f32], b: &[f32], ba: f32, bb: f32) {
+    for i in 0..o.len() {
+        o[i] = (a[i] + ba) * sigmoid(b[i] + bb);
+    }
+}
+}
+
+/// A copy of x with b[c] added to every value of channel c (for tracing un-fused values).
+pub fn plus_channel_bias(x: &Tensor, b: &[f32]) -> Tensor {
+    let mut o = x.clone();
+    let plane = x.numel() / x.shape[0];
+    o.data.par_chunks_mut(plane).zip(b.par_iter()).for_each(|(p, &bc)| p.iter_mut().for_each(|v| *v += bc));
+    o
 }
 
 /// Multi-head scaled dot-product attention. q (Nq, C), k and v (Nk, C), heads split C.
@@ -841,7 +1123,7 @@ pub fn attention_into(q: &[f32], q_rs: usize, k: &[f32], k_rs: usize, v: &[f32],
         }
         return;
     }
-    let _sc = prof::scope(prof::QK);
+    let _sc = prof::scope(prof::ATTN);
     let nb = nq.div_ceil(bq);
     let optr = SendPtr(out.as_mut_ptr());
     let olen = out.len();

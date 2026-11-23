@@ -22,6 +22,8 @@ symphonia = { version = "0.6.1", default-features = false, features = ["aac", "i
 [features]
 # Use Apple's Accelerate BLAS for matrix products on macOS (Apple silicon AMX units).
 accelerate = []
+# Link the system OpenBLAS for the matrix products instead of the gemm crate (benchmarking only).
+openblas = []
 
 [profile.release]
 codegen-units = 1

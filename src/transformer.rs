@@ -3,7 +3,11 @@
 //! tokens `x`, waveform tokens `xt`) with its own weights; norm_first, LayerScale, GELU
 //! feed-forward, and a GroupNorm(1) "norm_out" over the WHOLE sequence after every layer.
 
-use crate::ops::{attention, gelu, group_norm_tokens, layer_norm, linear};
+use std::sync::{Arc, Mutex};
+
+use rayon::prelude::*;
+
+use crate::ops::{attention_into, group_norm_tokens, layer_norm, layer_norm_row, linear, matmul_t, prof, simd_fn};
 use crate::tensor::Tensor;
 use crate::weights::SafeTensors;
 use crate::Tracer;
@@ -21,41 +25,47 @@ impl Norm {
 
 /// nn.MultiheadAttention (packed in_proj; q from one sequence, k = v from another).
 struct Mha {
-    wq: Vec<f32>,
-    wk: Vec<f32>,
-    wv: Vec<f32>,
-    bq: Vec<f32>,
-    bk: Vec<f32>,
-    bv: Vec<f32>,
+    /// in_proj: (3C, C) rows q, k, v - so self-attention is one GEMM, and k, v one for cross.
+    w_in: Vec<f32>,
+    b_in: Vec<f32>,
     w_out: Vec<f32>,
     b_out: Vec<f32>,
     heads: usize,
+    dim: usize,
 }
 
 impl Mha {
     fn load(st: &mut SafeTensors, p: &str, dim: usize, heads: usize) -> Self {
-        let w = st.take(&format!("{p}.in_proj_weight")).data;
-        let b = st.take(&format!("{p}.in_proj_bias")).data;
-        let n = dim * dim;
         Mha {
-            wq: w[..n].to_vec(),
-            wk: w[n..2 * n].to_vec(),
-            wv: w[2 * n..].to_vec(),
-            bq: b[..dim].to_vec(),
-            bk: b[dim..2 * dim].to_vec(),
-            bv: b[2 * dim..].to_vec(),
+            w_in: st.take(&format!("{p}.in_proj_weight")).data,
+            b_in: st.take(&format!("{p}.in_proj_bias")).data,
             w_out: st.take(&format!("{p}.out_proj.weight")).data,
             b_out: st.take(&format!("{p}.out_proj.bias")).data,
             heads,
+            dim,
         }
     }
 
-    fn forward(&self, q: &Tensor, kv: &Tensor) -> Tensor {
-        let qp = linear(q, &self.wq, &self.bq);
-        let kp = linear(kv, &self.wk, &self.bk);
-        let vp = linear(kv, &self.wv, &self.bv);
-        let a = attention(&qp, &kp, &vp, self.heads);
-        linear(&a, &self.w_out, &self.b_out)
+    /// The attention heads' output, before out_proj: (Nq, C). `kv` None: self-attention.
+    fn attend(&self, q: &Tensor, kv: Option<&Tensor>) -> Tensor {
+        let c = self.dim;
+        let nq = q.shape[0];
+        let mut out = vec![0.0f32; nq * c];
+        match kv {
+            None => {
+                let qkv = linear(q, &self.w_in, &self.b_in);
+                let d = &qkv.data;
+                attention_into(d, 3 * c, &d[c..], 3 * c, &d[2 * c..], 3 * c, nq, nq, c, self.heads, &mut out);
+            }
+            Some(kv) => {
+                let nk = kv.shape[0];
+                let qp = linear(q, &self.w_in[..c * c], &self.b_in[..c]);
+                let kvp = linear(kv, &self.w_in[c * c..], &self.b_in[c..]);
+                let d = &kvp.data;
+                attention_into(&qp.data, c, d, 2 * c, &d[c..], 2 * c, nq, nk, c, self.heads, &mut out);
+            }
+        }
+        Tensor::new(&[nq, c], out)
     }
 }
 
@@ -71,6 +81,42 @@ struct Layer {
     norm_out: Norm,
     gamma1: Vec<f32>,
     gamma2: Vec<f32>,
+}
+
+simd_fn! {
+/// x1 = x + g * (o + b), then h = LayerNorm(x1) - the attention residual and the feed-forward
+/// input, one row.
+fn residual_ln_row(x: &[f32], o: &[f32], b: &[f32], g: &[f32], x1: &mut [f32], h: &mut [f32], nw: &[f32], nb: &[f32]) {
+    for i in 0..x.len() {
+        x1[i] = x[i] + g[i] * (o[i] + b[i]);
+    }
+    layer_norm_row(x1, h, nw, nb);
+}
+}
+
+simd_fn! {
+/// x += g * (o + b), one row.
+fn residual_row(x: &mut [f32], o: &[f32], b: &[f32], g: &[f32]) {
+    for i in 0..x.len() {
+        x[i] += g[i] * (o[i] + b[i]);
+    }
+}
+}
+
+simd_fn! {
+/// f = GELU(f + b), one row.
+fn bias_gelu_row(f: &mut [f32], b: &[f32]) {
+    for i in 0..f.len() {
+        f[i] = crate::ops::gelu1(f[i] + b[i]);
+    }
+}
+}
+
+/// t + bias per row (for tracing the un-fused values).
+fn plus_bias(t: &Tensor, b: &[f32]) -> Tensor {
+    let mut o = t.clone();
+    o.data.par_chunks_mut(b.len()).for_each(|r| r.iter_mut().zip(b).for_each(|(v, b)| *v += b));
+    o
 }
 
 impl Layer {
@@ -91,37 +137,55 @@ impl Layer {
     }
 
     /// x: (N, C) tokens; kv: the other branch's tokens for a cross layer.
+    /// Biases are added in the elementwise passes after each GEMM (residual + LayerScale +
+    /// LayerNorm in one pass, bias + GELU in one pass).
     fn forward(&self, x: &Tensor, kv: Option<&Tensor>, tr: &mut Tracer, p: &str) -> Tensor {
+        let (n, c) = (x.shape[0], x.shape[1]);
         let h = layer_norm(x, &self.norm1.w, &self.norm1.b);
         let a = if self.cross {
             let k = layer_norm(kv.unwrap(), &self.norm2.w, &self.norm2.b);
-            self.attn.forward(&h, &k)
+            self.attn.attend(&h, Some(&k))
         } else {
-            self.attn.forward(&h, &h)
+            self.attn.attend(&h, None)
         };
-        tr.emit(&format!("{p}.{}", if self.cross { "cross_attn" } else { "self_attn" }), &a);
-        let mut x = x.clone();
-        add_scaled(&mut x, &a, &self.gamma1);
-        let n = if self.cross { self.norm3.as_ref().unwrap() } else { &self.norm2 };
-        let h = layer_norm(&x, &n.w, &n.b);
-        let mut f = linear(&h, &self.linear1.0, &self.linear1.1);
-        gelu(&mut f.data);
-        let f = linear(&f, &self.linear2.0, &self.linear2.1);
-        tr.emit(&format!("{p}.linear2"), &f);
-        add_scaled(&mut x, &f, &self.gamma2);
+        drop(h);
+        let o = matmul_t(&a, &self.attn.w_out, c);
+        drop(a);
+        if tr.on() {
+            tr.emit(&format!("{p}.{}", if self.cross { "cross_attn" } else { "self_attn" }), &plus_bias(&o, &self.attn.b_out));
+        }
+        let nrm = if self.cross { self.norm3.as_ref().unwrap() } else { &self.norm2 };
+        let mut x1 = vec![0.0f32; n * c];
+        let mut h2 = vec![0.0f32; n * c];
+        {
+            let _sc = prof::scope(prof::LAYERNORM);
+            x1.par_chunks_mut(c)
+                .zip(h2.par_chunks_mut(c))
+                .zip(x.data.par_chunks(c).zip(o.data.par_chunks(c)))
+                .for_each(|((x1r, hr), (xr, or))| residual_ln_row(xr, or, &self.attn.b_out, &self.gamma1, x1r, hr, &nrm.w, &nrm.b));
+        }
+        drop(o);
+        let h2 = Tensor::new(&[n, c], h2);
+        let hidden = self.linear1.1.len();
+        let mut f = matmul_t(&h2, &self.linear1.0, hidden);
+        drop(h2);
+        {
+            let _sc = prof::scope(prof::ACT);
+            f.data.par_chunks_mut(hidden).for_each(|r| bias_gelu_row(r, &self.linear1.1));
+        }
+        let o2 = matmul_t(&f, &self.linear2.0, c);
+        drop(f);
+        if tr.on() {
+            tr.emit(&format!("{p}.linear2"), &plus_bias(&o2, &self.linear2.1));
+        }
+        {
+            let _sc = prof::scope(prof::COPY);
+            x1.par_chunks_mut(c).zip(o2.data.par_chunks(c)).for_each(|(xr, or)| residual_row(xr, or, &self.linear2.1, &self.gamma2));
+        }
+        let mut x = Tensor::new(&[n, c], x1);
         group_norm_tokens(&mut x, &self.norm_out.w, &self.norm_out.b);
         tr.emit(&format!("{p}.norm_out"), &x);
         x
-    }
-}
-
-/// x += gamma (per channel) * y, for (N, C) tokens.
-fn add_scaled(x: &mut Tensor, y: &Tensor, gamma: &[f32]) {
-    let c = gamma.len();
-    for (xr, yr) in x.data.chunks_mut(c).zip(y.data.chunks(c)) {
-        for i in 0..c {
-            xr[i] += gamma[i] * yr[i];
-        }
     }
 }
 
@@ -133,6 +197,50 @@ pub struct CrossTransformer {
     norm_in_t: Norm,
     layers: Vec<Layer>,
     layers_t: Vec<Layer>,
+    /// weight_pos_embed * the positional embeddings in token layout, for the last shapes seen:
+    /// ((C, Fr, T1), 2-D embedding (T1 * Fr, C)) and ((C, T2), 1-D embedding (T2, C)).
+    pe_cache: Mutex<PeCache>,
+}
+
+type PeCache = (Option<((usize, usize, usize), Arc<Vec<f32>>)>, Option<((usize, usize), Arc<Vec<f32>>)>);
+
+/// (A, B, C) -> (C, B, A) permutation for the token layouts (A = channels): out[(c * B + b) * A + a]
+/// = x[(a * B + b) * C + c], in parallel over blocks of the last axis.
+fn tokens_from_channels(x: &[f32], a: usize, b: usize, c: usize) -> Vec<f32> {
+    const BT: usize = 16;
+    let mut out = vec![0.0f32; a * b * c];
+    out.par_chunks_mut(BT * b * a).enumerate().for_each(|(blk, o)| {
+        let c0 = blk * BT;
+        let nc = (c - c0).min(BT);
+        for ai in 0..a {
+            for bi in 0..b {
+                let src = &x[(ai * b + bi) * c + c0..(ai * b + bi) * c + c0 + nc];
+                for (k, &v) in src.iter().enumerate() {
+                    o[(k * b + bi) * a + ai] = v;
+                }
+            }
+        }
+    });
+    out
+}
+
+/// The inverse of `tokens_from_channels`: tokens (C, B, A) -> (A, B, C).
+fn channels_from_tokens(t: &[f32], a: usize, b: usize, c: usize) -> Vec<f32> {
+    const BA: usize = 16;
+    let mut out = vec![0.0f32; a * b * c];
+    out.par_chunks_mut(BA * b * c).enumerate().for_each(|(blk, o)| {
+        let a0 = blk * BA;
+        let na = (a - a0).min(BA);
+        for ci in 0..c {
+            for bi in 0..b {
+                let row = &t[(ci * b + bi) * a + a0..(ci * b + bi) * a + a0 + na];
+                for (k, &v) in row.iter().enumerate() {
+                    o[(k * b + bi) * c + ci] = v;
+                }
+            }
+        }
+    });
+    out
 }
 
 impl CrossTransformer {
@@ -153,6 +261,7 @@ impl CrossTransformer {
             norm_in_t: Norm::load(st, &format!("{p}.norm_in_t")),
             layers,
             layers_t,
+            pe_cache: Mutex::new((None, None)),
         }
     }
 
@@ -171,44 +280,64 @@ impl CrossTransformer {
         l.forward(x, kv, tr, &format!("crosstransformer.{p}.{i}"))
     }
 
+    /// weight_pos_embed * pos_emb_2d in token layout (T1 * Fr, C), cached.
+    fn pe2(&self, c: usize, fr: usize, t1: usize) -> Arc<Vec<f32>> {
+        let mut g = self.pe_cache.lock().unwrap();
+        if let Some((k, v)) = &g.0 {
+            if *k == (c, fr, t1) {
+                return v.clone();
+            }
+        }
+        let pe = pos_emb_2d(c, fr, t1, self.max_period);
+        let w = self.weight_pos_embed;
+        let mut v = tokens_from_channels(&pe.data, c, fr, t1);
+        v.iter_mut().for_each(|x| *x *= w);
+        let v = Arc::new(v);
+        g.0 = Some(((c, fr, t1), v.clone()));
+        v
+    }
+
+    /// weight_pos_embed * pos_emb_1d, (T2, C), cached.
+    fn pe1(&self, c: usize, t2: usize) -> Arc<Vec<f32>> {
+        let mut g = self.pe_cache.lock().unwrap();
+        if let Some((k, v)) = &g.1 {
+            if *k == (c, t2) {
+                return v.clone();
+            }
+        }
+        let w = self.weight_pos_embed;
+        let v = Arc::new(pos_emb_1d(t2, c, self.max_period).data.iter().map(|x| w * x).collect::<Vec<f32>>());
+        g.1 = Some(((c, t2), v.clone()));
+        v
+    }
+
     /// x: (C, Fr, T1) spectral features; xt: (C, T2) waveform features. Returns both, same shapes.
     pub fn forward(&self, x: &Tensor, xt: &Tensor, tr: &mut Tracer) -> (Tensor, Tensor) {
         let (c, fr, t1) = (x.shape[0], x.shape[1], x.shape[2]);
         let t2 = xt.shape[1];
         assert_eq!(c, self.dim);
-        // "b c fr t1 -> b (t1 fr) c": token index t * Fr + f.
-        let mut tok = Tensor::zeros(&[t1 * fr, c]);
-        for ci in 0..c {
-            for f in 0..fr {
-                for t in 0..t1 {
-                    tok.data[(t * fr + f) * c + ci] = x.data[(ci * fr + f) * t1 + t];
-                }
-            }
-        }
-        let mut xs = layer_norm(&tok, &self.norm_in.w, &self.norm_in.b);
+        // "b c fr t1 -> b (t1 fr) c": token index t * Fr + f; then norm_in and the embedding.
+        let sc = prof::scope(prof::LAYERNORM);
+        let tok = tokens_from_channels(&x.data, c, fr, t1);
+        let mut xs = layer_norm(&Tensor::new(&[t1 * fr, c], tok), &self.norm_in.w, &self.norm_in.b);
+        drop(sc);
         tr.emit("crosstransformer.norm_in", &xs);
-        let pe2 = pos_emb_2d(c, fr, t1, self.max_period);
         if tr.on() {
-            tr.emit("pos_emb_2d", &pe2);
+            tr.emit("pos_emb_2d", &pos_emb_2d(c, fr, t1, self.max_period));
         }
-        // pe2 is (C, Fr, T1); add it in token order.
-        for ci in 0..c {
-            for f in 0..fr {
-                for t in 0..t1 {
-                    xs.data[(t * fr + f) * c + ci] += self.weight_pos_embed * pe2.data[(ci * fr + f) * t1 + t];
-                }
-            }
-        }
+        let pe2 = self.pe2(c, fr, t1);
+        xs.data.par_chunks_mut(c).zip(pe2.par_chunks(c)).for_each(|(r, p)| r.iter_mut().zip(p).for_each(|(v, p)| *v += p));
 
-        let mut xts = layer_norm(&xt.t(), &self.norm_in_t.w, &self.norm_in_t.b);
+        let sc = prof::scope(prof::LAYERNORM);
+        let tok = tokens_from_channels(&xt.data, c, 1, t2);
+        let mut xts = layer_norm(&Tensor::new(&[t2, c], tok), &self.norm_in_t.w, &self.norm_in_t.b);
+        drop(sc);
         tr.emit("crosstransformer.norm_in_t", &xts);
-        let pe1 = pos_emb_1d(t2, c, self.max_period);
         if tr.on() {
-            tr.emit("pos_emb_1d", &pe1);
+            tr.emit("pos_emb_1d", &pos_emb_1d(t2, c, self.max_period));
         }
-        for (v, p) in xts.data.iter_mut().zip(&pe1.data) {
-            *v += self.weight_pos_embed * p;
-        }
+        let pe1 = self.pe1(c, t2);
+        xts.data.par_chunks_mut(c).zip(pe1.par_chunks(c)).for_each(|(r, p)| r.iter_mut().zip(p).for_each(|(v, p)| *v += p));
 
         for (i, (l, lt)) in self.layers.iter().zip(&self.layers_t).enumerate() {
             let p = format!("crosstransformer.layers.{i}");
@@ -226,15 +355,9 @@ impl CrossTransformer {
         }
 
         // "b (t1 fr) c -> b c fr t1"
-        let mut out = Tensor::zeros(&[c, fr, t1]);
-        for ci in 0..c {
-            for f in 0..fr {
-                for t in 0..t1 {
-                    out.data[(ci * fr + f) * t1 + t] = xs.data[(t * fr + f) * c + ci];
-                }
-            }
-        }
-        (out, xts.t())
+        let out = Tensor::new(&[c, fr, t1], channels_from_tokens(&xs.data, c, fr, t1));
+        let outt = Tensor::new(&[c, t2], channels_from_tokens(&xts.data, c, 1, t2));
+        (out, outt)
     }
 }
 

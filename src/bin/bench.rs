@@ -70,6 +70,22 @@ fn main() {
         })
         .collect();
     let first = model.forward(&mix, &mut Tracer::none());
+    // HTDEMUCS_SAVE_OUT=path: save the output (raw f32); HTDEMUCS_CMP_OUT=path: SNR against one.
+    if let Ok(path) = std::env::var("HTDEMUCS_SAVE_OUT") {
+        std::fs::write(&path, first.data.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    }
+    if let Ok(path) = std::env::var("HTDEMUCS_CMP_OUT") {
+        let bytes = std::fs::read(&path).unwrap();
+        let theirs: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        let (mut sig, mut err, mut mx) = (0f64, 0f64, 0f64);
+        for (&a, &b) in first.data.iter().zip(&theirs) {
+            let d = a as f64 - b as f64;
+            sig += b as f64 * b as f64;
+            err += d * d;
+            mx = mx.max(d.abs());
+        }
+        println!("vs {path}: SNR {:.1} dB, max abs diff {mx:.2e}", 10.0 * (sig / err.max(1e-300)).log10());
+    }
     // Results must not depend on the thread count.
     let check = std::env::var("HTDEMUCS_CHECK_THREADS").unwrap_or_else(|_| "3".into());
     for t in check.split(',').filter(|t| !t.is_empty()) {

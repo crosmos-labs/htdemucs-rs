@@ -8,7 +8,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::ops::{gelu, gelu1, glu, group_norm1_glu_add, group_norm1_then, mean_std, prof, Conv, ConvTr};
+use crate::ops::{bias_gelu, dconv_rows, gelu, gelu1, glu_bias, group_norm1_glu_add_b, group_norm1_then, mean_std, plus_channel_bias, prof, Conv, ConvTr};
 use crate::stft::Stft;
 use crate::tensor::Tensor;
 use crate::transformer::CrossTransformer;
@@ -67,17 +67,37 @@ impl DConv {
     }
 
     fn forward(&self, mut x: Tensor, tr: &mut Tracer, p: &str) -> Tensor {
+        // Frequency branch (F > 1): each frequency row is its own GroupNorm sample, so the whole
+        // branch runs row by row (ops::dconv_rows). The choice depends only on the shape.
+        if x.shape[1] > 1 {
+            for (d, l) in self.layers.iter().enumerate() {
+                let g1 = (&l.gn1.0[..], &l.gn1.1[..]);
+                let g2 = (&l.gn2.0[..], &l.gn2.1[..]);
+                if tr.on() {
+                    let mut delta = Tensor::zeros(&x.shape);
+                    dconv_rows(&mut x, &l.conv1, g1, &l.conv2, g2, &l.scale, Some(&mut delta));
+                    tr.emit(&format!("{p}.layers.{d}"), &torch_dconv_layout(&delta));
+                } else {
+                    dconv_rows(&mut x, &l.conv1, g1, &l.conv2, g2, &l.scale, None);
+                }
+            }
+            if tr.on() {
+                tr.emit(p, &torch_dconv_layout(&x));
+            }
+            return x;
+        }
         for (d, l) in self.layers.iter().enumerate() {
             let mut y = l.conv1.forward(&x);
             group_norm1_then(&mut y, &l.gn1.0, &l.gn1.1, gelu1);
-            let y = l.conv2.forward(&y);
-            // x = x + LayerScale(GLU(GroupNorm(y))), fused into one pass.
+            let y = l.conv2.forward_raw(&y);
+            // x = x + LayerScale(GLU(GroupNorm(y + bias))), fused into one pass.
+            let b = Some(&l.conv2.b[..]);
             if tr.on() {
                 let mut delta = Tensor::zeros(&x.shape);
-                group_norm1_glu_add(&y, &l.gn2.0, &l.gn2.1, &l.scale, &mut x, Some(&mut delta));
+                group_norm1_glu_add_b(&y, b, &l.gn2.0, &l.gn2.1, &l.scale, &mut x, Some(&mut delta));
                 tr.emit(&format!("{p}.layers.{d}"), &torch_dconv_layout(&delta));
             } else {
-                group_norm1_glu_add(&y, &l.gn2.0, &l.gn2.1, &l.scale, &mut x, None);
+                group_norm1_glu_add_b(&y, b, &l.gn2.0, &l.gn2.1, &l.scale, &mut x, None);
             }
         }
         if tr.on() {
@@ -110,20 +130,24 @@ impl EncLayer {
             let (c, t) = (x.shape[0], x.shape[2]);
             let tp = t + self.stride - t % self.stride;
             xin = Tensor::zeros(&[c, 1, tp]);
-            for ci in 0..c {
-                xin.data[ci * tp..ci * tp + t].copy_from_slice(&x.data[ci * t..(ci + 1) * t]);
-            }
+            xin.data.par_chunks_mut(tp).zip(x.data.par_chunks(t)).for_each(|(o, i)| o[..t].copy_from_slice(i));
             &xin
         } else {
             x
         };
-        let mut y = self.conv.forward(x);
-        tr.emit(&format!("{p}.conv"), &y);
-        gelu(&mut y.data);
+        // Convolution biases are added in the following elementwise pass (GELU, GLU).
+        let mut y = self.conv.forward_raw(x);
+        if tr.on() {
+            tr.emit(&format!("{p}.conv"), &plus_channel_bias(&y, &self.conv.b));
+        }
+        bias_gelu(&mut y, &self.conv.b);
         let y = self.dconv.forward(y, tr, &format!("{p}.dconv"));
-        let z = self.rewrite.forward(&y);
-        tr.emit(&format!("{p}.rewrite"), &z);
-        let z = glu(&z);
+        let z = self.rewrite.forward_raw(&y);
+        drop(y);
+        if tr.on() {
+            tr.emit(&format!("{p}.rewrite"), &plus_channel_bias(&z, &self.rewrite.b));
+        }
+        let z = glu_bias(&z, &self.rewrite.b);
         tr.emit(p, &z);
         z
     }
@@ -141,12 +165,16 @@ struct DecLayer {
 }
 
 impl DecLayer {
-    fn forward(&self, x: &Tensor, skip: &Tensor, length: usize, tr: &mut Tracer, p: &str) -> Tensor {
-        let mut x = x.clone();
-        x.data.par_iter_mut().zip(&skip.data).for_each(|(a, b)| *a += b);
-        let y = self.rewrite.forward(&x);
-        tr.emit(&format!("{p}.rewrite"), &y);
-        let y = glu(&y);
+    fn forward(&self, x: &Tensor, skip: Tensor, length: usize, tr: &mut Tracer, p: &str) -> Tensor {
+        // x + skip, into the skip's buffer.
+        let mut x_in = skip;
+        x_in.data.par_chunks_mut(8192).zip(x.data.par_chunks(8192)).for_each(|(a, b)| crate::ops::add_assign(a, b));
+        let y = self.rewrite.forward_raw(&x_in);
+        drop(x_in);
+        if tr.on() {
+            tr.emit(&format!("{p}.rewrite"), &plus_channel_bias(&y, &self.rewrite.b));
+        }
+        let y = glu_bias(&y, &self.rewrite.b);
         let y = self.dconv.forward(y, tr, &format!("{p}.dconv"));
         let z = self.conv_tr.forward(&y);
         tr.emit(&format!("{p}.conv_tr"), &z);
@@ -155,17 +183,16 @@ impl DecLayer {
             // z[..., pad:-pad, :] along F
             let ho = h - 2 * self.pad;
             let mut out = vec![0.0f32; c * ho * w];
-            for ci in 0..c {
-                out[ci * ho * w..(ci + 1) * ho * w]
-                    .copy_from_slice(&z.data[(ci * h + self.pad) * w..(ci * h + self.pad + ho) * w]);
-            }
+            let pad = self.pad;
+            out.par_chunks_mut(ho * w)
+                .zip(z.data.par_chunks(h * w))
+                .for_each(|(o, i)| o.copy_from_slice(&i[pad * w..(pad + ho) * w]));
             Tensor::new(&[c, ho, w], out)
         } else {
             // z[..., pad:pad + length] along T
             let mut out = vec![0.0f32; c * length];
-            for ci in 0..c {
-                out[ci * length..(ci + 1) * length].copy_from_slice(&z.data[ci * w + self.pad..ci * w + self.pad + length]);
-            }
+            let pad = self.pad;
+            out.par_chunks_mut(length).zip(z.data.par_chunks(w)).for_each(|(o, i)| o.copy_from_slice(&i[pad..pad + length]));
             Tensor::new(&[c, 1, length], out)
         };
         if !self.last {
@@ -306,13 +333,16 @@ impl HTDemucs {
             tr.emit("spec", &Tensor::new(&[ch, bins, frames, 2], z));
         }
         let mut mag = Tensor::zeros(&[2 * ch, bins, frames]);
-        for (c, (s, _)) in specs.iter().enumerate() {
-            let plane = bins * frames;
-            for i in 0..plane {
-                mag.data[(2 * c) * plane + i] = s[2 * i];
-                mag.data[(2 * c + 1) * plane + i] = s[2 * i + 1];
+        let plane = bins * frames;
+        mag.data.par_chunks_mut(frames).enumerate().for_each(|(r, row)| {
+            // row r = (channel c, re/im part, bin b)
+            let (c, part, b) = (r / (2 * bins), (r / bins) % 2, r % bins);
+            let s = &specs[c].0[b * frames * 2..(b + 1) * frames * 2];
+            for (f, v) in row.iter_mut().enumerate() {
+                *v = s[2 * f + part];
             }
-        }
+        });
+        let _ = plane;
         tr.emit("mag", &mag);
 
         // --- Standardise both branch inputs (torch .std is unbiased; eps added to std).
@@ -321,7 +351,7 @@ impl HTDemucs {
         x.data.par_iter_mut().for_each(|v| *v = (*v - mean) / (1e-5 + std));
         tr.emit("x_norm", &x);
         let (meant, stdt) = mean_std(mix);
-        let mut xt = Tensor::new(&[ch, 1, len], mix.iter().map(|v| (v - meant) / (1e-5 + stdt)).collect());
+        let mut xt = Tensor::new(&[ch, 1, len], mix.par_iter().map(|v| (v - meant) / (1e-5 + stdt)).collect());
         tr.emit("xt_norm", &xt);
 
         // --- Encoders.
@@ -329,12 +359,15 @@ impl HTDemucs {
         let mut saved_t = vec![];
         let mut lengths_t = vec![];
         for (i, (enc, tenc)) in self.encoder.iter().zip(&self.tencoder).enumerate() {
-            lengths_t.push(xt.shape[2]);
+            // Each layer's output is kept as the decoder's skip and read from there.
+            let xt_in: &Tensor = if i == 0 { &xt } else { &saved_t[i - 1] };
+            lengths_t.push(xt_in.shape[2]);
             prof::branch(1);
-            xt = tenc.forward(&xt, tr, &format!("tencoder.{i}"));
-            saved_t.push(xt.clone());
+            let yt = tenc.forward(xt_in, tr, &format!("tencoder.{i}"));
+            saved_t.push(yt);
             prof::branch(0);
-            x = enc.forward(&x, tr, &format!("encoder.{i}"));
+            let x_in: &Tensor = if i == 0 { &x } else { &saved[i - 1] };
+            let mut x = enc.forward(x_in, tr, &format!("encoder.{i}"));
             if i == 0 {
                 if let Some(emb) = &self.freq_emb {
                     // x[c, f, t] += emb[f, c]
@@ -349,8 +382,10 @@ impl HTDemucs {
                     tr.emit("encoder.0+emb", &x);
                 }
             }
-            saved.push(x.clone());
+            saved.push(x);
         }
+        x = saved.last().unwrap().clone();
+        xt = saved_t.last().unwrap().clone();
 
         // --- Cross-transformer (with 1x1 channel up/down-sampling around it if bottom_channels).
         let (fr, t1) = (x.shape[1], x.shape[2]);
@@ -378,11 +413,11 @@ impl HTDemucs {
         for (i, (dec, tdec)) in self.decoder.iter().zip(&self.tdecoder).enumerate() {
             let skip = saved.pop().unwrap();
             prof::branch(0);
-            x = dec.forward(&x, &skip, 0, tr, &format!("decoder.{i}"));
+            x = dec.forward(&x, skip, 0, tr, &format!("decoder.{i}"));
             let skip_t = saved_t.pop().unwrap();
             let lt = lengths_t.pop().unwrap();
             prof::branch(1);
-            xt = tdec.forward(&xt, &skip_t, lt, tr, &format!("tdecoder.{i}"));
+            xt = tdec.forward(&xt, skip_t, lt, tr, &format!("tdecoder.{i}"));
         }
 
         // --- Frequency branch output: un-standardise, complex-as-channels -> iSTFT.
@@ -412,9 +447,7 @@ impl HTDemucs {
             .collect();
         drop(sc);
         let mut out = Tensor::zeros(&[nsrc, ch, len]);
-        for (sc, w) in wav.iter().enumerate() {
-            out.data[sc * len..(sc + 1) * len].copy_from_slice(w);
-        }
+        out.data.par_chunks_mut(len).zip(wav.par_iter()).for_each(|(o, w)| o.copy_from_slice(w));
         tr.emit("ispec", &out);
 
         // --- Time branch output, un-standardised, plus the spectral estimate: x = xt + x.

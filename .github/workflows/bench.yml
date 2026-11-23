@@ -12,7 +12,13 @@ on:
         default: htdemucs
       threads:
         description: thread counts
-        default: "1 2 4"
+        default: "1 2"
+      variants:
+        description: "space-separated label:ENV=V,ENV2=V settings, each benched (interleaved over rounds)"
+        default: "base:"
+      rounds:
+        description: rounds over the variants (the summary gives the median)
+        default: "1"
       torch:
         description: also time PyTorch (the baseline)
         type: boolean
@@ -38,7 +44,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: never
   MODELS: ${{ inputs.models || 'htdemucs' }}
-  THREADS: ${{ inputs.threads || '1 2 4' }}
+  THREADS: ${{ inputs.threads || '1 2' }}
+  VARIANTS: ${{ inputs.variants || 'base:' }}
+  ROUNDS: ${{ inputs.rounds || '1' }}
   FEATURES: ${{ inputs.features || '' }}
   RUN_TORCH: ${{ github.event_name == 'push' || inputs.torch }}
   RUN_PARITY: ${{ github.event_name == 'push' || inputs.parity }}
@@ -93,6 +101,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: OpenBLAS
+        if: contains(env.FEATURES, 'openblas')
+        run: sudo apt-get install -y -q libopenblas-dev && dpkg -l | grep -i openblas
+
       - name: Build
         run: |
           cargo build --release --bins ${FEATURES:+--features $FEATURES}
@@ -126,15 +138,29 @@ jobs:
 
       - name: Bench (Rust)
         run: |
-          echo "### Rust, one segment" >> "$GITHUB_STEP_SUMMARY"
           first=1
-          for m in $MODELS; do
-            for t in $THREADS; do
-              if [ $first = 1 ]; then check=1,2,4,8; first=0; else check=; fi
-              RAYON_NUM_THREADS=$t HTDEMUCS_CHECK_THREADS=$check HTDEMUCS_PROFILE=1 ./target/release/bench weights $m 3 | tee -a bench.txt
+          for r in $(seq 1 $ROUNDS); do
+            for m in $MODELS; do
+              for v in $VARIANTS; do
+                label=${v%%:*}; envs=$(echo "${v#*:}" | tr ',' ' ')
+                for t in $THREADS; do
+                  if [ $first = 1 ]; then check=1,2,4,8; else check=; fi
+                  if [ $r = 1 ] && [ $t = 1 ]; then prof=1; else prof=; fi
+                  echo "== round $r model $m variant $label ($envs) threads $t"
+                  env $envs RAYON_NUM_THREADS=$t OPENBLAS_NUM_THREADS=$t HTDEMUCS_CHECK_THREADS=$check ${prof:+HTDEMUCS_PROFILE=1} ./target/release/bench weights $m 3 \
+                    | sed "s/^RESULT /RESULT variant=$label round=$r /" | tee -a bench.txt
+                  first=0
+                done
+              done
             done
           done
-          grep '^RESULT' bench.txt | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Rust ${FEATURES:+($FEATURES) }one segment: CPU s per forward (each round), best wall s"
+            echo '```'
+            grep '^RESULT' bench.txt | sed -E 's/.*variant=([^ ]*) round=[^ ]* model=([^ ]*) threads=([^ ]*) .*wall_best=([^ ]*) .*cpu=([^ ]*) .*/\2 \1 t\3 \5 \4/' \
+              | sort | awk '{k=$1" "$2" "$3; c[k]=c[k]" "$4; w[k]=w[k]" "$5} END {for (k in c) print k, "cpu", c[k], "| wall_best", w[k]}' | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Bench (PyTorch)
         if: env.RUN_TORCH == 'true'
