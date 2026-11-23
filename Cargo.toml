@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 flacenc = "0.5.1"
 gemm = { version = "0.19", default-features = false, features = ["std", "rayon"] }
+libc = "0.2"
 libm = "0.2.16"
 rayon = "1.12.0"
 realfft = "3.5.1"

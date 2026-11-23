@@ -8,7 +8,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::ops::{gelu, gelu1, glu, group_norm1_glu_add, group_norm1_then, mean_std, Conv, ConvTr};
+use crate::ops::{gelu, gelu1, glu, group_norm1_glu_add, group_norm1_then, mean_std, prof, Conv, ConvTr};
 use crate::stft::Stft;
 use crate::tensor::Tensor;
 use crate::transformer::CrossTransformer;
@@ -292,7 +292,10 @@ impl HTDemucs {
         let nsrc = cfg.sources.len();
 
         // --- Spectrogram (complex as channels): (2*ch, F, T), channel order [c0 re, c0 im, c1 re, ...]
+        prof::branch(0);
+        let sc = prof::scope(prof::STFT);
         let specs: Vec<(Vec<f32>, usize)> = (0..ch).into_par_iter().map(|c| self.stft.spec(&mix[c * len..(c + 1) * len])).collect();
+        drop(sc);
         let bins = cfg.nfft / 2;
         let frames = specs[0].1;
         if tr.on() {
@@ -327,8 +330,10 @@ impl HTDemucs {
         let mut lengths_t = vec![];
         for (i, (enc, tenc)) in self.encoder.iter().zip(&self.tencoder).enumerate() {
             lengths_t.push(xt.shape[2]);
+            prof::branch(1);
             xt = tenc.forward(&xt, tr, &format!("tencoder.{i}"));
             saved_t.push(xt.clone());
+            prof::branch(0);
             x = enc.forward(&x, tr, &format!("encoder.{i}"));
             if i == 0 {
                 if let Some(emb) = &self.freq_emb {
@@ -349,6 +354,7 @@ impl HTDemucs {
 
         // --- Cross-transformer (with 1x1 channel up/down-sampling around it if bottom_channels).
         let (fr, t1) = (x.shape[1], x.shape[2]);
+        prof::branch(2);
         if let Some([up, _, up_t, _]) = &self.bottom {
             // rearrange "b c f t -> b c (f t)" then a 1x1 conv: layout-agnostic for us.
             x = up.forward(&x);
@@ -371,14 +377,17 @@ impl HTDemucs {
         // --- Decoders.
         for (i, (dec, tdec)) in self.decoder.iter().zip(&self.tdecoder).enumerate() {
             let skip = saved.pop().unwrap();
+            prof::branch(0);
             x = dec.forward(&x, &skip, 0, tr, &format!("decoder.{i}"));
             let skip_t = saved_t.pop().unwrap();
             let lt = lengths_t.pop().unwrap();
+            prof::branch(1);
             xt = tdec.forward(&xt, &skip_t, lt, tr, &format!("tdecoder.{i}"));
         }
 
         // --- Frequency branch output: un-standardise, complex-as-channels -> iSTFT.
         // x is (S * 2*ch, F, T) with channel order (source, audio channel, re/im).
+        prof::branch(0);
         x.data.par_iter_mut().for_each(|v| *v = *v * std + mean);
         tr.emit("mask_in", &x);
         let plane = bins * frames;
@@ -392,6 +401,7 @@ impl HTDemucs {
             }
             tr.emit("zout", &Tensor::new(&[nsrc, ch, bins, frames, 2], z));
         }
+        let sc = prof::scope(prof::ISTFT);
         let wav: Vec<Vec<f32>> = (0..nsrc * ch)
             .into_par_iter()
             .map(|sc| {
@@ -400,6 +410,7 @@ impl HTDemucs {
                 self.stft.ispec(re, im, frames, len)
             })
             .collect();
+        drop(sc);
         let mut out = Tensor::zeros(&[nsrc, ch, len]);
         for (sc, w) in wav.iter().enumerate() {
             out.data[sc * len..(sc + 1) * len].copy_from_slice(w);

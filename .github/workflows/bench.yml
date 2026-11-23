@@ -1,0 +1,159 @@
+# x86-64 speed and parity on GitHub's Linux runners (the deployment target is a Linux x86-64 CPU
+# container). Builds the release binaries, makes PyTorch references on a synthetic clip (no
+# copyrighted audio), checks segment and full-path parity, times one segment forward at 1/2/4
+# threads, and times PyTorch CPU (torch 2.2.2, demucs 4.0.1) on the same runner as the baseline.
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: models to bench
+        default: htdemucs
+      threads:
+        description: thread counts
+        default: "1 2 4"
+      torch:
+        description: also time PyTorch (the baseline)
+        type: boolean
+        default: true
+      parity:
+        description: make PyTorch references and check parity
+        type: boolean
+        default: true
+      features:
+        description: extra cargo features for the bench build
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/bench.yml
+      - .github/bench/**
+      - src/bin/bench.rs
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  MODELS: ${{ inputs.models || 'htdemucs' }}
+  THREADS: ${{ inputs.threads || '1 2 4' }}
+  FEATURES: ${{ inputs.features || '' }}
+  RUN_TORCH: ${{ github.event_name == 'push' || inputs.torch }}
+  RUN_PARITY: ${{ github.event_name == 'push' || inputs.parity }}
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CPU
+        run: |
+          lscpu
+          echo "nproc $(nproc)"; free -g
+          echo "x86 SIMD flags: $(grep -o -w -E 'avx2|fma|avx512f|avx512bw|avx512vl|avx512_bf16|avx512_vnni|amx_tile' /proc/cpuinfo | sort -u | tr '\n' ' ')"
+          {
+            echo "### Runner"
+            echo '```'
+            lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|L2|L3'
+            echo "flags: $(grep -o -w -E 'avx2|fma|avx512f|avx512bw|avx512vl|avx512_bf16|avx512_vnni|amx_tile' /proc/cpuinfo | sort -u | tr '\n' ' ')"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/bench/requirements.txt
+
+      - name: Python deps (torch 2.2.2 CPU, demucs 4.0.1)
+        if: env.RUN_TORCH == 'true' || env.RUN_PARITY == 'true'
+        run: pip install -q -r .github/bench/requirements.txt
+
+      - name: Weights cache
+        id: weights
+        uses: actions/cache@v4
+        with:
+          path: |
+            weights
+            ~/.cache/torch/hub/checkpoints
+          key: weights-${{ hashFiles('tools/convert.py', 'tools/st.py') }}-v1
+
+      - name: Convert weights (demucs' own checkpoint download)
+        if: steps.weights.outputs.cache-hit != 'true'
+        run: |
+          pip install -q -r .github/bench/requirements.txt
+          python tools/convert.py htdemucs htdemucs_6s
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: |
+          cargo build --release --bins ${FEATURES:+--features $FEATURES}
+          ls -l target/release/htdemucs-rs target/release/bench
+
+      - name: Tests
+        run: cargo test --release -q ${FEATURES:+--features $FEATURES}
+
+      - name: References (PyTorch, synthetic clip)
+        if: env.RUN_PARITY == 'true'
+        run: |
+          mkdir -p ref/ci
+          python .github/bench/synth.py ref/ci/synth.wav 12
+          for m in $MODELS; do
+            python tools/harness.py --wav ref/ci/synth.wav --model $m --chunk 1 --out ref/ci/seg-$m.safetensors
+            python tools/ref_separate.py --model $m --shifts 2 --seed 0 ref/ci/synth.wav ref/ci/synth.$m.s2.safetensors
+          done
+
+      - name: Parity
+        if: env.RUN_PARITY == 'true'
+        run: |
+          echo "### Parity (synthetic 12 s clip)" >> "$GITHUB_STEP_SUMMARY"
+          for m in $MODELS; do
+            ./target/release/parity weights ref/ci/seg-$m.safetensors | tee parity-$m.txt | grep -E '^## |final output|^\| (output|ispec|crosstransformer) '
+            echo "- segment $m: $(grep 'final output' parity-$m.txt)" >> "$GITHUB_STEP_SUMMARY"
+            rm ref/ci/seg-$m.safetensors
+            ./target/release/htdemucs-rs separate -n $m --shifts 2 --seed 0 --float32 --clip-mode none -o sep ref/ci/synth.wav 2>/dev/null
+            ./target/release/compare ref/ci/synth.$m.s2.safetensors sep/$m/synth | tee -a compare.txt
+            echo "- full path $m shifts 2: $(tail -1 compare.txt)" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Bench (Rust)
+        run: |
+          echo "### Rust, one segment" >> "$GITHUB_STEP_SUMMARY"
+          first=1
+          for m in $MODELS; do
+            for t in $THREADS; do
+              if [ $first = 1 ]; then check=1,2,4,8; first=0; else check=; fi
+              RAYON_NUM_THREADS=$t HTDEMUCS_CHECK_THREADS=$check HTDEMUCS_PROFILE=1 ./target/release/bench weights $m 3 | tee -a bench.txt
+            done
+          done
+          grep '^RESULT' bench.txt | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bench (PyTorch)
+        if: env.RUN_TORCH == 'true'
+        run: |
+          echo "### PyTorch, one segment" >> "$GITHUB_STEP_SUMMARY"
+          for m in $MODELS; do
+            for t in $THREADS; do
+              python .github/bench/torch_bench.py $m $t 2 | tee -a torch.txt
+            done
+          done
+          grep '^RESULT' torch.txt | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-logs
+          path: |
+            bench.txt
+            torch.txt
+            parity-*.txt
+            compare.txt
+          if-no-files-found: ignore

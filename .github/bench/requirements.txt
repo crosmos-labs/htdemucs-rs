@@ -1,0 +1,9 @@
+# PyTorch baseline and reference generation on the CI runner: Fretboard's pinned Demucs stack
+# (demucs 4.0.1, torch 2.2.2), CPU wheels.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+torch==2.2.2+cpu
+torchaudio==2.2.2+cpu
+demucs==4.0.1
+numpy<2
+soundfile

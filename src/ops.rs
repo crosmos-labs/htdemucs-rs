@@ -11,6 +11,84 @@ use rayon::prelude::*;
 
 use crate::tensor::Tensor;
 
+/// Op-class profiler (off unless `prof::enable(true)`): wall time per (branch, op class), summed
+/// over calls. Scopes are placed at leaf level (never nested), on the calling thread.
+pub mod prof {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::time::Instant;
+
+    pub const CLASSES: [&str; 15] = [
+        "conv gemm",
+        "conv im2col / tap shift-add",
+        "conv bias fill",
+        "conv_tr gemm",
+        "conv_tr col2im",
+        "linear gemm",
+        "attn QK^T gemm",
+        "attn softmax",
+        "attn AV gemm",
+        "groupnorm (+gelu / glu)",
+        "layernorm",
+        "gelu / glu",
+        "stft",
+        "istft",
+        "other (layout, copies, adds, standardise)",
+    ];
+    pub const CONV: usize = 0;
+    pub const IM2COL: usize = 1;
+    pub const BIAS: usize = 2;
+    pub const CONVTR: usize = 3;
+    pub const COL2IM: usize = 4;
+    pub const LINEAR: usize = 5;
+    pub const QK: usize = 6;
+    pub const SOFTMAX: usize = 7;
+    pub const AV: usize = 8;
+    pub const GROUPNORM: usize = 9;
+    pub const LAYERNORM: usize = 10;
+    pub const ACT: usize = 11;
+    pub const STFT: usize = 12;
+    pub const ISTFT: usize = 13;
+    pub const COPY: usize = 14;
+    pub const BRANCHES: [&str; 3] = ["freq", "time", "transformer"];
+    const N: usize = CLASSES.len() * BRANCHES.len();
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static BRANCH: AtomicUsize = AtomicUsize::new(0);
+    static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+    pub fn enable(on: bool) {
+        ON.store(on, Relaxed);
+    }
+
+    /// Which branch subsequent scopes are charged to (0 freq, 1 time, 2 transformer).
+    pub fn branch(b: usize) {
+        BRANCH.store(b, Relaxed);
+    }
+
+    pub struct Scope(usize, Option<Instant>);
+
+    #[inline]
+    pub fn scope(class: usize) -> Scope {
+        Scope(class, ON.load(Relaxed).then(Instant::now))
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            if let Some(t) = self.1 {
+                let i = BRANCH.load(Relaxed) * CLASSES.len() + self.0;
+                NS[i].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            }
+        }
+    }
+
+    /// Seconds per [branch][class] since the last call; resets.
+    pub fn take() -> Vec<Vec<f64>> {
+        (0..BRANCHES.len())
+            .map(|b| (0..CLASSES.len()).map(|c| NS[b * CLASSES.len() + c].swap(0, Relaxed) as f64 * 1e-9).collect())
+            .collect()
+    }
+}
+
 /// C (row-major m x n) = A (m x k) * B (k x n) [+ C if `accumulate`], where A and B are given as
 /// strided views: element (i, j) of A is a[i * a_rs + j * a_cs].
 #[allow(clippy::too_many_arguments)]
@@ -181,16 +259,21 @@ impl Conv {
         let (ho, wo) = self.out_size(h, w);
         let n = ho * wo;
         let kk = cin * self.k.0 * self.k.1;
+        let sc = prof::scope(prof::BIAS);
         let mut out = vec![0.0f32; self.cout * n];
         // Bias first, then accumulate the GEMM into it.
         out.par_chunks_mut(n).zip(self.b.par_iter()).for_each(|(row, &b)| row.fill(b));
+        drop(sc);
         let pointwise = self.k == (1, 1) && self.stride == (1, 1) && self.pad == (0, 0);
         if let Some(wt) = &self.w_taps {
             // y[kj] = W_kj x for all taps at once, then out[co, h, o] += y[kj, co, h, o + kj*d - p].
             let kw = self.k.1;
             let hw = h * w;
+            let sc = prof::scope(prof::CONV);
             let mut y = vec![0.0f32; kw * self.cout * hw];
             sgemm(kw * self.cout, hw, cin, wt, cin, 1, &x.data, hw, 1, &mut y, hw, false);
+            drop(sc);
+            let _sc = prof::scope(prof::IM2COL);
             let (d, p) = (self.dil.1 as isize, self.pad.1 as isize);
             let cout = self.cout;
             out.par_chunks_mut(n).enumerate().for_each(|(co, orow)| {
@@ -213,6 +296,7 @@ impl Conv {
                 }
             });
         } else if pointwise {
+            let _sc = prof::scope(prof::CONV);
             sgemm(self.cout, n, kk, &self.w, kk, 1, &x.data, n, 1, &mut out, n, true);
         } else {
             let block = (COL_BLOCK / kk).max(wo).min(n);
@@ -220,7 +304,10 @@ impl Conv {
             let mut j0 = 0;
             while j0 < n {
                 let nb = block.min(n - j0);
+                let sc = prof::scope(prof::IM2COL);
                 self.im2col(x, ho, wo, j0, nb, &mut col[..kk * nb]);
+                drop(sc);
+                let _sc = prof::scope(prof::CONV);
                 sgemm(self.cout, nb, kk, &self.w, kk, 1, &col, nb, 1, &mut out[j0..], n, true);
                 j0 += nb;
             }
@@ -294,8 +381,11 @@ impl ConvTr {
         let rows = self.cout * kh * kw;
         let n = h * w;
         // cols = W^T (rows x Cin) * x (Cin x n).
+        let sc = prof::scope(prof::CONVTR);
         let mut cols = vec![0.0f32; rows * n];
         sgemm(rows, n, cin, &self.w, 1, rows, &x.data, n, 1, &mut cols, n, false);
+        drop(sc);
+        let _sc = prof::scope(prof::COL2IM);
         // col2im: scatter-add each kernel tap, in tap order.
         let mut out = vec![0.0f32; self.cout * ho * wo];
         out.par_chunks_mut(ho * wo).enumerate().for_each(|(co, plane)| {
@@ -408,6 +498,7 @@ pub fn row_stats(x: &Tensor) -> Vec<(f32, f32)> {
 
 /// GroupNorm(1) per sample of a (C, S, T) tensor (see `row_stats`), then `f`, in place.
 pub fn group_norm1_then(x: &mut Tensor, gamma: &[f32], beta: &[f32], f: impl Fn(f32) -> f32 + Sync) {
+    let _sc = prof::scope(prof::GROUPNORM);
     let st = row_stats(x);
     let (s, t) = (x.shape[1], x.shape[2]);
     x.data.par_chunks_mut(s * t).enumerate().for_each(|(ci, plane)| {
@@ -425,6 +516,7 @@ pub fn group_norm1_then(x: &mut Tensor, gamma: &[f32], beta: &[f32], f: impl Fn(
 /// x += ls * (a * sigmoid(b)) with (a, b) the normalised halves of z - the tail of a DConv branch.
 /// If `delta` is given, the added values are also written there.
 pub fn group_norm1_glu_add(z: &Tensor, gamma: &[f32], beta: &[f32], ls: &[f32], x: &mut Tensor, mut delta: Option<&mut Tensor>) {
+    let _sc = prof::scope(prof::GROUPNORM);
     let st = row_stats(z);
     let (c, s, t) = (x.shape[0], x.shape[1], x.shape[2]);
     assert_eq!(z.shape, [2 * c, s, t]);
@@ -467,6 +559,7 @@ pub fn group_norm1_glu_add(z: &Tensor, gamma: &[f32], beta: &[f32], ls: &[f32], 
 
 /// LayerNorm over the last axis of (N, C). eps = 1e-5.
 pub fn layer_norm(x: &Tensor, gamma: &[f32], beta: &[f32]) -> Tensor {
+    let _sc = prof::scope(prof::LAYERNORM);
     let c = *x.shape.last().unwrap();
     let mut out = x.clone();
     out.data.par_chunks_mut(c).for_each(|row| {
@@ -482,6 +575,7 @@ pub fn layer_norm(x: &Tensor, gamma: &[f32], beta: &[f32]) -> Tensor {
 /// GroupNorm with one group over a whole (N, C) token sequence (Demucs' MyGroupNorm on (B, T, C)):
 /// one mean / variance for everything, then per-channel affine.
 pub fn group_norm_tokens(x: &mut Tensor, gamma: &[f32], beta: &[f32]) {
+    let _sc = prof::scope(prof::GROUPNORM);
     let c = *x.shape.last().unwrap();
     let (m, v) = big_stats(&x.data);
     let r = (1.0 / (v + 1e-5).sqrt()) as f32;
@@ -537,6 +631,7 @@ pub fn gelu1(x: f32) -> f32 {
 }
 
 pub fn gelu(x: &mut [f32]) {
+    let _sc = prof::scope(prof::ACT);
     x.par_chunks_mut(8192).for_each(|c| c.iter_mut().for_each(|v| *v = gelu1(*v)));
 }
 
@@ -547,6 +642,7 @@ pub fn sigmoid(x: f32) -> f32 {
 
 /// GLU over the first axis: (2C, ...) -> (C, ...), a * sigmoid(b).
 pub fn glu(x: &Tensor) -> Tensor {
+    let _sc = prof::scope(prof::ACT);
     let c2 = x.shape[0];
     let half = x.numel() / 2;
     let mut shape = x.shape.clone();
@@ -565,6 +661,7 @@ pub fn glu(x: &Tensor) -> Tensor {
 
 /// y = x W^T + b for x (N, Cin), W (Cout, Cin) (nn.Linear).
 pub fn linear(x: &Tensor, w: &[f32], b: &[f32]) -> Tensor {
+    let _sc = prof::scope(prof::LINEAR);
     let (n, cin) = (x.shape[0], x.shape[1]);
     let cout = b.len();
     let mut out = vec![0.0f32; n * cout];
@@ -585,7 +682,10 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> Tensor {
     let mut scores = vec![0.0f32; nq * nk];
     for h in 0..heads {
         // scores = q_h k_h^T
+        let sc = prof::scope(prof::QK);
         sgemm(nq, nk, d, &q.data[h * d..], c, 1, &k.data[h * d..], 1, c, &mut scores, nk, false);
+        drop(sc);
+        let sc = prof::scope(prof::SOFTMAX);
         scores.par_chunks_mut(nk).for_each(|row| {
             let mut mx = f32::NEG_INFINITY;
             for &s in row.iter() {
@@ -599,6 +699,8 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> Tensor {
                 *s *= inv;
             }
         });
+        drop(sc);
+        let _sc = prof::scope(prof::AV);
         sgemm(nq, d, nk, &scores, nk, 1, &v.data[h * d..], c, 1, &mut out[h * d..], c, false);
     }
     Tensor::new(&[nq, c], out)
