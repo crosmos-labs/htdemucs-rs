@@ -7,9 +7,11 @@ Uses the upstream inference code, github.com/KimberleyJensen/Mel-Band-Roformer-V
 (torch 2.2.2, rotary_embedding_torch 0.3.5, librosa 0.10.2):
 
     PY="uv run --quiet --python 3.11.17 --with-requirements research/round1/kim_env.txt python"
-    $PY tools/melroformer.py convert  <repo> <MelBandRoformer.ckpt> [--half]
-        -> weights/melroformer.safetensors (state_dict, PyTorch names, float32 - the checkpoint's
-           own precision; --half: float16, lossy, written as melroformer-f16.safetensors)
+    $PY tools/melroformer.py convert  <repo> <MelBandRoformer.ckpt> [--float32]
+        -> weights/melroformer.safetensors (state_dict, PyTorch names, float16: 457 MB, the
+           default since it measured within 0.0003 dB uSDR of float32 on every stem of four
+           MUSDB tracks, see README; --float32: the checkpoint's own precision, 913 MB, written as
+           melroformer-f32.safetensors - what the parity checks against PyTorch use)
            + weights/melroformer.json (constructor kwargs, inference settings, the mel bands)
     $PY tools/melroformer.py segment  <repo> <ckpt> <in.wav> <out.safetensors> [--chunk K]
         -> one chunk exactly as demix_track feeds it (input, STFT, band split, every transformer,
@@ -74,9 +76,9 @@ def convert(a):
         v = v.float().contiguous()
         h = v.half()
         exact += int(torch.equal(h.float(), v))
-        # --half: the weights in float16; the rotary frequencies stay float32 (they are constants,
-        # not learned, and rounding them would move every rotation angle).
-        state[k] = h if a.half and not k.endswith("rotary_embed.freqs") else v
+        # Float16 weights (unless --float32); the rotary frequencies stay float32 (they are
+        # constants, not learned, and rounding them would move every rotation angle).
+        state[k] = h if not a.float32 and not k.endswith("rotary_embed.freqs") else v
     m = cfg.model
     # The bands: freqs_per_band (60 x 1025, bool) from librosa's mel filter bank, with the
     # upstream fix-ups ([0][0] and [-1][-1] forced on). Band b's features are its frequencies in
@@ -100,7 +102,7 @@ def convert(a):
     assert torch.equal(rot, 1.0 / (10000 ** (torch.arange(0, m.dim_head, 2).float() / m.dim_head)))
     out = ROOT / "weights"
     out.mkdir(exist_ok=True)
-    name = "melroformer-f16" if a.half else "melroformer"
+    name = "melroformer-f32" if a.float32 else "melroformer"
     st.save(out / f"{name}.safetensors", state, metadata={"model": "melroformer", "checkpoint": config["checkpoint"]})
     (out / "melroformer.json").write_text(json.dumps(config) + "\n")
     n = sum(v.numel() for v in state.values())
@@ -232,7 +234,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("convert")
-    c.add_argument("repo"); c.add_argument("ckpt"); c.add_argument("--half", action="store_true")
+    c.add_argument("repo"); c.add_argument("ckpt"); c.add_argument("--float32", action="store_true")
     s = sub.add_parser("segment")
     s.add_argument("repo"); s.add_argument("ckpt"); s.add_argument("inp"); s.add_argument("out")
     s.add_argument("--chunk", type=int, default=0); s.add_argument("--threads", type=int, default=4)

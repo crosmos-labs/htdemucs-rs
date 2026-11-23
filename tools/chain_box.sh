@@ -30,7 +30,7 @@ parity)
     k=$(key "$tr"); d=$OUT/parity/$k; mkdir -p "$d"; [ -f "$d/result.txt" ] && continue
     ln -sf "$M/$tr/mixture.wav" "$d/$k.wav"
     [ -f "$d/ref.4.safetensors" ] || heavy "$PY" "$REPO/tools/chain_ref.py" "$KIM" "$CKPT" "$d/$k.wav" "$d/ref" --threads "$T" 2>/dev/null | tail -1 > "$d/torch.json"
-    r=$(rust chain "$T" "$d/$k.wav" "$d/sep")
+    r=$(rust chain "$T" "$d/$k.wav" "$d/sep" MELROFORMER_WEIGHTS=melroformer-f32)
     { echo "$tr | rust $r | torch $(cat "$d/torch.json")"
       "$REPO/target/release/compare" "$d/ref.4.safetensors" "$d/sep/htdemucs/$k"
       "$REPO/target/release/compare" "$d/ref.6.safetensors" "$d/sep/htdemucs_6s/$k"
@@ -39,7 +39,7 @@ parity)
   done ;;
 sdr)
   for v in f32 f16; do
-    wf=melroformer; [ $v = f16 ] && wf=melroformer-f16
+    wf=melroformer-f32; [ $v = f16 ] && wf=melroformer  # convert writes float16 by default
     for tr in "$P1" "$P2" "$P3" "$P4"; do
       k=$(key "$tr"); d=$OUT/sdr/$v; mkdir -p "$d/in" "$d/scores"; [ -f "$d/scores/$tr.json" ] && continue
       ln -sf "$M/$tr/mixture.wav" "$d/in/$tr.wav"

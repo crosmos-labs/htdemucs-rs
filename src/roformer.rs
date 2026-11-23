@@ -701,7 +701,7 @@ fn freq_group() -> usize {
 
 impl MelRoformer {
     /// Loads `<dir>/melroformer.json` and `<dir>/<name>.safetensors` (float32 or float16;
-    /// `$MELROFORMER_WEIGHTS` overrides the name, e.g. melroformer-f16 for measurements).
+    /// `$MELROFORMER_WEIGHTS` overrides the name, e.g. melroformer-f32 for parity checks).
     pub fn load(dir: impl AsRef<Path>, name: &str) -> Result<Self, String> {
         let dir = dir.as_ref();
         let name = std::env::var("MELROFORMER_WEIGHTS").unwrap_or_else(|_| name.to_string());
