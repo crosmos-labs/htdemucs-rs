@@ -374,9 +374,10 @@ container as soon as the result is fetched matters.
   ensemble at shifts 0, both at 2 threads on the EPYC 9V74 (Zen 4, AVX-512). The recipe figure
   scales the 240 s shifts-0 run by the measured 60 s shifts-2 / shifts-0 ratio of 1.955. Running
   the two models as separate processes costs the same CPU and less memory.
-- **Wall** = CPU / (vCPUs x 0.9) + 30 s. The 0.9 is an assumed parallel efficiency above one
-  vCPU; scaling beyond 2 threads is not measured on x86. The 30 s covers start, upload, result
-  download and stop.
+- **Wall** = CPU / (vCPUs x efficiency) + 30 s. Efficiency is 0.9 at 2 vCPUs (assumed) and 0.78
+  at 4, measured on Blacksmith's 8-vCPU AMD EPYC (Zen 5, AVX-512; bench run 45271063897):
+  htdemucs takes 0.646 s per 7.8 s segment at 4 threads against 2.014 s at 1 thread, a 3.1x
+  speed-up (8 threads: 0.537 s). The 30 s covers start, upload, result download and stop.
 - **Memory** = the instance's memory x wall. **Disk** = the instance's disk x wall (1–6% of the
   inclusion per song, never the binding limit).
 - **Songs inside the inclusion** = the smallest of 375 vCPU-min, 25 GiB-h and 200 GB-h, each
@@ -393,19 +394,19 @@ every type from `standard-1` up holds every song. (Before `a7c5ba8` they were 1.
 | Fretboard recipe: both models, shifts 2 | 4 min | standard-1 | yes | 21.7 vCPU-min | 43.9 min | 2.93 GiB-h | 8.5 (memory) | $0.054 |
 | Fretboard recipe: both models, shifts 2 | 4 min | standard-2 | yes | 21.7 vCPU-min | 22.2 min | 2.22 GiB-h | 11.3 (memory) | $0.047 |
 | Fretboard recipe: both models, shifts 2 | 4 min | standard-3 | yes | 21.7 vCPU-min | 12.6 min | 1.68 GiB-h | 14.9 (memory) | $0.042 |
-| Fretboard recipe: both models, shifts 2 | 4 min | standard-4 | yes | 21.7 vCPU-min | 6.5 min | 1.31 GiB-h | 17.3 (CPU) | $0.038 |
+| Fretboard recipe: both models, shifts 2 | 4 min | standard-4 | yes | 21.7 vCPU-min | 7.5 min | 1.49 GiB-h | 16.8 (memory) | $0.040 |
 | Fretboard recipe: both models, shifts 2 | 22 min | standard-1 | yes | 119.5 vCPU-min | 239.5 min | 15.97 GiB-h | 1.6 (memory) | $0.295 |
 | Fretboard recipe: both models, shifts 2 | 22 min | standard-2 | yes | 119.5 vCPU-min | 120.0 min | 12.00 GiB-h | 2.1 (memory) | $0.257 |
 | Fretboard recipe: both models, shifts 2 | 22 min | standard-3 | yes | 119.5 vCPU-min | 66.9 min | 8.92 GiB-h | 2.8 (memory) | $0.228 |
-| Fretboard recipe: both models, shifts 2 | 22 min | standard-4 | yes | 119.5 vCPU-min | 33.7 min | 6.74 GiB-h | 3.1 (CPU) | $0.207 |
+| Fretboard recipe: both models, shifts 2 | 22 min | standard-4 | yes | 119.5 vCPU-min | 38.8 min | 7.76 GiB-h | 3.1 (CPU) | $0.217 |
 | Ensemble, shifts 0 | 4 min | standard-1 | yes | 11.1 vCPU-min | 22.7 min | 1.52 GiB-h | 16.5 (memory) | $0.028 |
 | Ensemble, shifts 0 | 4 min | standard-2 | yes | 11.1 vCPU-min | 11.6 min | 1.16 GiB-h | 21.5 (memory) | $0.024 |
 | Ensemble, shifts 0 | 4 min | standard-3 | yes | 11.1 vCPU-min | 6.7 min | 0.89 GiB-h | 28.1 (memory) | $0.022 |
-| Ensemble, shifts 0 | 4 min | standard-4 | yes | 11.1 vCPU-min | 3.6 min | 0.72 GiB-h | 33.7 (CPU) | $0.020 |
+| Ensemble, shifts 0 | 4 min | standard-4 | yes | 11.1 vCPU-min | 4.1 min | 0.81 GiB-h | 30.8 (memory) | $0.021 |
 | Ensemble, shifts 0 | 22 min | standard-1 | yes | 61.2 vCPU-min | 122.9 min | 8.19 GiB-h | 3.1 (memory) | $0.151 |
 | Ensemble, shifts 0 | 22 min | standard-2 | yes | 61.2 vCPU-min | 61.7 min | 6.17 GiB-h | 4.1 (memory) | $0.132 |
 | Ensemble, shifts 0 | 22 min | standard-3 | yes | 61.2 vCPU-min | 34.5 min | 4.60 GiB-h | 5.4 (memory) | $0.117 |
-| Ensemble, shifts 0 | 22 min | standard-4 | yes | 61.2 vCPU-min | 17.5 min | 3.50 GiB-h | 6.1 (CPU) | $0.106 |
+| Ensemble, shifts 0 | 22 min | standard-4 | yes | 61.2 vCPU-min | 20.1 min | 4.02 GiB-h | 6.1 (CPU) | $0.111 |
 
 If a Cloudflare vCPU turns out to be a whole core (the `threads=1` rate), CPU per song drops by
 roughly 40%. A 4-minute recipe song would then take about 13 vCPU-minutes (about 28 songs a month
@@ -417,26 +418,29 @@ inside the inclusion), and a shifts-0 ensemble song about 7 vCPU-minutes (about 
   Durable Object names, and `max_instances: 2`.
   - Memory is billed on wall time, so the fastest instance is also the cheapest per song. Every
     type now holds a 22-minute song (about 1.6 GiB since the streamed output, against 7.0 GiB
-    before), so this is a cost choice, not a memory one.
-    Inside the inclusion, `standard-4` is the only type where CPU, not memory, runs out first.
+    before), so this is a cost choice, not a memory one. At the measured 0.78 efficiency it is
+    still the cheapest, by a smaller margin than the assumed 0.9 gave ($0.040 against $0.042 on
+    `standard-3` for a 4-minute recipe song). Inside the inclusion, memory and CPU run out at
+    about the same point on `standard-4`; on the smaller types memory runs out first.
   - One job per instance because the work is CPU-bound. Two jobs in one container would only
     share the 4 vCPUs and add their memory.
   - The DO should stop the container as soon as it has the result (`signal(15)`, or `destroy()`),
     not wait for an inactivity timeout: every idle minute bills 12 GiB.
 - **Fretboard's recipe** (htdemucs + htdemucs_6s at shifts 2), songs up to 22 minutes:
-  - about **17 four-minute songs a month** inside the $5 inclusion (CPU-bound: 21.7 vCPU-min
-    each);
-  - about **$0.038 per extra 4-minute song**, $0.21 per 22-minute one;
-  - about 6.5 minutes of wall time for 4 minutes of music, assuming 90% scaling to 4 vCPUs.
+  - about **17 four-minute songs a month** inside the $5 inclusion (memory and CPU about equal:
+    1.49 GiB-h and 21.7 vCPU-min each);
+  - about **$0.040 per extra 4-minute song**, $0.22 per 22-minute one;
+  - about 7.5 minutes of wall time for 4 minutes of music, at the measured 78% scaling to 4
+    vCPUs.
 - **Ensemble at shifts 0** (research round 2's "avg_s0": above htdemucs at shifts 2 on every
   MUSDB stem):
-  - about **34 four-minute songs a month** inside the inclusion;
-  - about **$0.020 per extra song** ($0.11 at 22 minutes);
-  - about 3.6 minutes of wall time.
+  - about **31 four-minute songs a month** inside the inclusion;
+  - about **$0.021 per extra song** ($0.11 at 22 minutes);
+  - about 4.1 minutes of wall time.
 - **Cheaper still, if needed:**
   - A custom type with 4 vCPUs and less memory: with the streamed output,
     `{vcpu: 4, memoryMib: 3072}` holds any song up to 22 minutes (1.6 GiB peak), and cuts the
-    memory part of a 4-minute recipe song from $0.012 to $0.003. CPU, the bigger part, stays.
+    memory part of a 4-minute recipe song from $0.013 to $0.003. CPU, the bigger part, stays.
     Confirm the peak in the container first (open question 4).
   - Measure `--threads` against Cloudflare's real vCPUs first (open question 1).
 
@@ -449,8 +453,10 @@ inside the inclusion), and a shifts-0 ensemble song about 7 vCPU-minutes (about 
    nothing about the CPU model or SMT. The status JSON reports `cpu_model` and `nproc`, so the
    first real job answers the model question. Run the same 60 s clip there before committing to
    a budget.
-2. **Multi-core scaling on x86** (4 vCPUs) is not measured. It sets wall time, and so memory
-   cost, not CPU cost.
+2. **Multi-core scaling on x86**, roughly answered: 3.1x at 4 threads (0.78 efficiency) and
+   3.75x at 8 on Blacksmith's 8-vCPU Zen 5 (bench run 45271063897, htdemucs per segment). Those
+   are 8 vCPUs used 4 at a time, not a 4-vCPU instance; Cloudflare's own scaling is still open
+   (with question 1). It sets wall time, and so memory cost, not CPU cost.
 3. **Large bodies through the Durable Object.** A 22-minute float32 WAV is 466 MB, and the stems
    tar can be over 1 GB in float32 or about 0.6–1.3 GB in FLAC. Workers' request-body limits apply to
    client requests; whether streaming R2 -> container -> R2 through `getTcpPort().fetch()` has
