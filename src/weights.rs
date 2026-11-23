@@ -45,38 +45,51 @@ impl SafeTensors {
         Self::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))
     }
 
+    /// Parses a safetensors file. Malformed input (truncated, bad header, offsets out of range,
+    /// shape / size mismatch) is an error, never a panic.
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-        let header: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(&bytes[8..8 + n]).map_err(|e| e.to_string())?;
-        let data = &bytes[8 + n..];
+        let n = bytes.get(..8).map(|h| u64::from_le_bytes(h.try_into().unwrap())).ok_or("truncated: no header length")?;
+        let end = usize::try_from(n).ok().and_then(|n| n.checked_add(8)).filter(|&e| e <= bytes.len()).ok_or("truncated: header runs past the end")?;
+        let header: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes[8..end]).map_err(|e| format!("bad header: {e}"))?;
+        let data = &bytes[end..];
         let mut tensors = HashMap::new();
         let mut metadata = HashMap::new();
         let mut entries = vec![];
         for (name, h) in header {
             if name == "__metadata__" {
-                for (k, v) in h.as_object().unwrap() {
+                for (k, v) in h.as_object().ok_or("bad __metadata__")? {
                     metadata.insert(k.clone(), v.as_str().unwrap_or_default().to_string());
                 }
                 continue;
             }
-            let dtype = h["dtype"].as_str().unwrap().to_string();
-            let shape: Vec<usize> =
-                h["shape"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
-            let off = h["data_offsets"].as_array().unwrap();
-            let (a, b) = (off[0].as_u64().unwrap() as usize, off[1].as_u64().unwrap() as usize);
-            let raw = &data[a..b];
-            let values: Vec<f32> = match dtype.as_str() {
-                "F32" => raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
-                "F16" => raw
-                    .chunks_exact(2)
-                    .map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
-                    .collect(),
-                "F64" => raw
-                    .chunks_exact(8)
-                    .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
-                    .collect(),
+            let bad = |what: &str| format!("{name}: bad {what}");
+            let dtype = h.get("dtype").and_then(|v| v.as_str()).ok_or_else(|| bad("dtype"))?.to_string();
+            let shape: Vec<usize> = h
+                .get("shape")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| bad("shape"))?
+                .iter()
+                .map(|v| v.as_u64().and_then(|x| usize::try_from(x).ok()))
+                .collect::<Option<_>>()
+                .ok_or_else(|| bad("shape"))?;
+            let off = h.get("data_offsets").and_then(|v| v.as_array()).filter(|o| o.len() == 2).ok_or_else(|| bad("data_offsets"))?;
+            let at = |i: usize| off[i].as_u64().and_then(|x| usize::try_from(x).ok()).ok_or_else(|| bad("data_offsets"));
+            let (a, b) = (at(0)?, at(1)?);
+            let raw = data.get(a..b).ok_or_else(|| format!("{name}: data {a}..{b} outside the file (truncated?)"))?;
+            let width = match dtype.as_str() {
+                "F32" => 4,
+                "F16" => 2,
+                "F64" => 8,
                 d => return Err(format!("{name}: unsupported dtype {d}")),
+            };
+            let count = shape.iter().try_fold(1usize, |p, &d| p.checked_mul(d)).ok_or_else(|| bad("shape"))?;
+            if raw.len() != count.checked_mul(width).ok_or_else(|| bad("shape"))? {
+                return Err(format!("{name}: {} bytes for shape {shape:?} {dtype}", raw.len()));
+            }
+            let values: Vec<f32> = match width {
+                4 => raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+                2 => raw.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap()))).collect(),
+                _ => raw.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32).collect(),
             };
             entries.push((a, name.clone()));
             tensors.insert(name, Tensor::new(&shape, values));
@@ -97,7 +110,39 @@ impl SafeTensors {
 
 #[cfg(test)]
 mod tests {
-    use super::f16_to_f32;
+    use super::{f16_to_f32, SafeTensors};
+
+    #[test]
+    fn malformed_files_are_errors() {
+        // A valid two-tensor file, then every truncation of it and a few corruptions.
+        let header = br#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"b":{"dtype":"F16","shape":[1,2],"data_offsets":[8,12]}}"#;
+        let mut f = (header.len() as u64).to_le_bytes().to_vec();
+        f.extend_from_slice(header);
+        f.extend_from_slice(&1.0f32.to_le_bytes());
+        f.extend_from_slice(&2.0f32.to_le_bytes());
+        f.extend_from_slice(&[0x00, 0x3c, 0x00, 0xc0]);
+        let ok = SafeTensors::parse(&f).unwrap();
+        assert_eq!(ok.get("a").unwrap().data, [1.0, 2.0]);
+        assert_eq!(ok.get("b").unwrap().data, [1.0, -2.0]);
+        for n in 0..f.len() {
+            assert!(SafeTensors::parse(&f[..n]).is_err(), "truncated to {n} bytes");
+        }
+        let mut huge = f.clone();
+        huge[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(SafeTensors::parse(&huge).is_err());
+        let bad = |from: &str, to: &str| {
+            let h = String::from_utf8(header.to_vec()).unwrap().replace(from, to);
+            let mut g = (h.len() as u64).to_le_bytes().to_vec();
+            g.extend_from_slice(h.as_bytes());
+            g.extend_from_slice(&f[8 + header.len()..]);
+            SafeTensors::parse(&g)
+        };
+        assert!(bad("[0,8]", "[0,80]").is_err());
+        assert!(bad("[0,8]", "[8,0]").is_err());
+        assert!(bad("\"shape\":[2]", "\"shape\":[3]").is_err());
+        assert!(bad("F16", "I8").is_err());
+        assert!(bad("\"shape\":[2]", "\"shape\":\"x\"").is_err());
+    }
     #[test]
     fn half() {
         assert_eq!(f16_to_f32(0x3c00), 1.0);
