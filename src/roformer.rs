@@ -495,8 +495,17 @@ fn grow(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
     &mut v[..n]
 }
 
-/// Query rows per attention tile (the score tile is rows x seq_len).
-const ATTN_ROWS: usize = 128;
+/// A tuning knob read once from the environment (benchmarks), else `default`. Shapes only: the
+/// result never depends on the thread count.
+fn knob(name: &str, cell: &'static std::sync::OnceLock<usize>, default: usize) -> usize {
+    *cell.get_or_init(|| std::env::var(name).ok().and_then(|v| v.parse().ok()).filter(|&v| v > 0).unwrap_or(default))
+}
+
+/// Query rows per attention tile (the score tile is rows x seq_len); MR_ATTN_ROWS overrides.
+fn attn_rows() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    knob("MR_ATTN_ROWS", &C, 128)
+}
 
 impl Block {
     fn load(st: &mut SafeTensors, p: &str, heads: usize) -> Self {
@@ -546,15 +555,16 @@ impl Block {
             }
         }
         let ao = grow(&mut sc.ao, n * inner);
-        let tile = grow(&mut sc.scores, ATTN_ROWS.min(len) * len);
+        let rows = attn_rows();
+        let tile = grow(&mut sc.scores, rows.min(len) * len);
         let sm = 1.0 / (dim_head as f32).sqrt();
         for s0 in (0..n).step_by(len) {
             for hd in 0..heads {
                 let q = &big[s0 * wq + hd * dim_head..];
                 let k = &big[s0 * wq + inner + hd * dim_head..];
                 let v = &big[s0 * wq + 2 * inner + hd * dim_head..];
-                for r0 in (0..len).step_by(ATTN_ROWS) {
-                    let m = ATTN_ROWS.min(len - r0);
+                for r0 in (0..len).step_by(rows) {
+                    let m = rows.min(len - r0);
                     let t = &mut tile[..m * len];
                     {
                         let _p = prof::gemm(prof::QK, m, len, dim_head);
@@ -660,8 +670,11 @@ pub struct MelRoformer {
 }
 
 /// Frames per frequency-transformer task (60 bands each): fixed, so results do not depend on
-/// the thread count.
-const FREQ_GROUP: usize = 8;
+/// the thread count; MR_FREQ_GROUP overrides.
+fn freq_group() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    knob("MR_FREQ_GROUP", &C, 8)
+}
 
 impl MelRoformer {
     /// Loads `<dir>/melroformer.json` and `<dir>/<name>.safetensors` (float32 or float16;
@@ -734,7 +747,7 @@ impl MelRoformer {
         x.par_chunks_mut(frames * dim).for_each_init(Scratch::default, |sc, xb| self.layers[i].0.forward(xb, frames, rope, heads, dh, sc));
     }
 
-    /// Layer i's frequency transformer on x (band, frame, dim): tasks of FREQ_GROUP frames, each
+    /// Layer i's frequency transformer on x (band, frame, dim): tasks of `freq_group()` frames, each
     /// gathering its (frame, band) tokens, transforming them and scattering them back.
     fn freq_layer(&self, i: usize, x: &mut [f32], frames: usize, rope: &Rope) {
         let (dim, heads, dh, nb) = (self.cfg.dim, self.cfg.heads, self.cfg.dim_head, self.cfg.num_bands);
@@ -742,9 +755,10 @@ impl MelRoformer {
         prof::part(2);
         let fb = &self.layers[i].1;
         let xp = SendPtr(x.as_mut_ptr());
-        (0..frames.div_ceil(FREQ_GROUP)).into_par_iter().for_each_init(Scratch::default, |sc, g| {
-            let t0 = g * FREQ_GROUP;
-            let gt = FREQ_GROUP.min(frames - t0);
+        let fg = freq_group();
+        (0..frames.div_ceil(fg)).into_par_iter().for_each_init(Scratch::default, |sc, g| {
+            let t0 = g * fg;
+            let gt = fg.min(frames - t0);
             let mut loc = std::mem::take(&mut sc.x);
             let l = grow(&mut loc, gt * nb * dim);
             // SAFETY: task g reads and writes only tokens (b, t) with t in [t0, t0 + gt).
