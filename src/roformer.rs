@@ -1046,6 +1046,18 @@ pub fn separate(model: &MelRoformer, wav: &[f32], ch: &Chunking, progress: &mut 
 /// `separate` with any chunk model (2 x chunk samples in, 2 x chunk out).
 pub fn separate_with(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec<f32>, progress: &mut dyn FnMut()) -> Vec<f32> {
     let len = wav.len() / 2;
+    let mut out = vec![0.0f32; 2 * len];
+    separate_stream(wav, ch, model, progress, &mut |t0, l, r| {
+        out[t0..t0 + l.len()].copy_from_slice(l);
+        out[len + t0..len + t0 + r.len()].copy_from_slice(r);
+    });
+    out
+}
+
+/// `separate_with`, handing the vocals out as they are finalised: `emit(t0, left, right)` gets
+/// track samples [t0, t0 + left.len()) of both channels, in order, covering the track once.
+pub fn separate_stream(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec<f32>, progress: &mut dyn FnMut(), emit: &mut dyn FnMut(usize, &[f32], &[f32])) {
+    let len = wav.len() / 2;
     let c = ch.chunk;
     let total = ch.total(len);
     let border = if ch.padded(len) { ch.border } else { 0 };
@@ -1061,27 +1073,29 @@ pub fn separate_with(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec<f
         wav[s * len + j as usize]
     };
     let base = ch.window();
-    let mut out = vec![0.0f32; 2 * len];
     // Window [wbase, wbase + c) of upstream's result (2 rows) and counter.
     let mut res = vec![0.0f32; 2 * c];
     let mut cnt = vec![0.0f32; c];
     let mut wbase = 0usize;
+    let mut fin = vec![0.0f32; 2 * c];
     let mut flush = |res: &mut Vec<f32>, cnt: &mut Vec<f32>, wbase: &mut usize, upto: usize| {
         let w = upto - *wbase;
         if w == 0 {
             return;
         }
         assert!(w <= c);
+        // The part of [wbase, upto) inside the track (padded positions border .. border + len).
+        let (k0, k1) = (border.saturating_sub(*wbase).min(w), (border + len).saturating_sub(*wbase).min(w));
         for s in 0..2 {
-            for k in 0..w {
-                let p = *wbase + k;
-                if p >= border && p < border + len {
-                    let v = res[s * c + k] / cnt[k];
-                    out[s * len + p - border] = if v.is_nan() { 0.0 } else { v.clamp(f32::MIN, f32::MAX) };
-                }
+            for k in k0..k1 {
+                let v = res[s * c + k] / cnt[k];
+                fin[s * c + k] = if v.is_nan() { 0.0 } else { v.clamp(f32::MIN, f32::MAX) };
             }
             res.copy_within(s * c + w..(s + 1) * c, s * c);
             res[(s + 1) * c - w..(s + 1) * c].fill(0.0);
+        }
+        if k0 < k1 {
+            emit(*wbase + k0 - border, &fin[k0..k1], &fin[c + k0..c + k1]);
         }
         cnt.copy_within(w.., 0);
         cnt[c - w..].fill(0.0);
@@ -1123,7 +1137,6 @@ pub fn separate_with(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec<f
         i += ch.step;
     }
     flush(&mut res, &mut cnt, &mut wbase, total);
-    out
 }
 
 /// (frame, band, dim) -> (band, frame, dim).

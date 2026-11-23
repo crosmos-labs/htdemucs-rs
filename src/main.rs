@@ -127,20 +127,6 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(a)
 }
 
-/// demucs.audio.prevent_clip, per stem (all channels): rescale divides by max(1.01 * peak, 1),
-/// clamp limits to +-0.99.
-fn prevent_clip(x: &mut [f32], mode: &str) {
-    match mode {
-        "rescale" => {
-            let peak = x.iter().fold(0f32, |m, v| m.max(v.abs()));
-            let d = (1.01f32 * peak).max(1.0);
-            x.iter_mut().for_each(|v| *v /= d);
-        }
-        "clamp" => x.iter_mut().for_each(|v| *v = v.clamp(-0.99, 0.99)),
-        _ => {}
-    }
-}
-
 fn mmss(s: f64) -> String {
     let s = s.max(0.0).round() as u64;
     format!("{:02}:{:02}", s / 60, s % 60)
@@ -329,7 +315,7 @@ fn run_melroformer(a: Args) -> Result<(), String> {
     for track in &a.tracks {
         let t1 = Instant::now();
         let input = audio::decode(track)?;
-        let mut input = audio::resample(audio::to_channels(input, 2)?, rate)?;
+        let input = audio::resample(audio::to_channels(input, 2)?, rate)?;
         let len = input.frames();
         if a.verbose {
             eprintln!("{}: {:.1} s of audio, decoded in {:.2}s", track.display(), len as f64 / rate as f64, t1.elapsed().as_secs_f64());
@@ -339,26 +325,51 @@ fn run_melroformer(a: Args) -> Result<(), String> {
         if show {
             tqdm_line(0, total, step_sec, 0.0);
         }
-        let mut vocals = roformer::separate(&model, &input.data, &ch, &mut || {
-            done += 1;
-            if show {
-                tqdm_line(done, total, step_sec, t2.elapsed().as_secs_f64());
-            }
-        });
+        // Both stems are written as the chunks finalise them (audio::StemWriter, as the Demucs
+        // path): vocals, and instrumental = mix - vocals (upstream inference.py).
+        let name = track.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+        let dir = a.out.join("melroformer").join(name);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let clip = audio::Clip::parse(&a.clip).ok_or(format!("clip mode {}", a.clip))?;
+        let mut writers = ["vocals", "instrumental"]
+            .iter()
+            .map(|src| audio::StemWriter::create(&dir.join(format!("{src}.{}", a.format.ext())), 2, len, rate, a.format, clip))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (mut err, mut inst) = (None, vec![]);
+        let mix = &input.data;
+        let model_fn = |part: &[f32]| model.forward(part, &mut htdemucs::Tracer::none());
+        roformer::separate_stream(
+            mix,
+            &ch,
+            &model_fn,
+            &mut || {
+                done += 1;
+                if show {
+                    tqdm_line(done, total, step_sec, t2.elapsed().as_secs_f64());
+                }
+            },
+            &mut |t0, l, r| {
+                if err.is_some() {
+                    return;
+                }
+                inst.clear();
+                inst.extend(l.iter().enumerate().map(|(i, v)| mix[t0 + i] - v));
+                inst.extend(r.iter().enumerate().map(|(i, v)| mix[len + t0 + i] - v));
+                let (il, ir) = inst.split_at(l.len());
+                err = writers[0].push(&[l, r]).and_then(|_| writers[1].push(&[il, ir])).err();
+            },
+        );
+        if let Some(e) = err {
+            return Err(e);
+        }
+        for w in writers {
+            w.finish()?;
+        }
         if show {
             eprintln!();
         }
         if a.verbose {
-            eprintln!("  separated in {:.1}s", t2.elapsed().as_secs_f64());
-        }
-        // The mix becomes the instrumental, in place.
-        input.data.iter_mut().zip(&vocals).for_each(|(m, v)| *m -= v);
-        let name = track.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
-        let dir = a.out.join("melroformer").join(name);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        for (src, x) in [("vocals", &mut vocals), ("instrumental", &mut input.data)] {
-            prevent_clip(x, &a.clip);
-            audio::write(&dir.join(format!("{src}.{}", a.format.ext())), x, 2, rate, a.format)?;
+            eprintln!("  separated and written in {:.1}s", t2.elapsed().as_secs_f64());
         }
         if a.verbose {
             eprintln!("  wrote {} in {:.1}s total", dir.display(), t1.elapsed().as_secs_f64());
