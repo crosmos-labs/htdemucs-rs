@@ -72,7 +72,9 @@ def convert(a):
         v = v.float().contiguous()
         h = v.half()
         exact += int(torch.equal(h.float(), v))
-        state[k] = h if a.half else v
+        # --half: the weights in float16; the rotary frequencies stay float32 (they are constants,
+        # not learned, and rounding them would move every rotation angle).
+        state[k] = h if a.half and not k.endswith("rotary_embed.freqs") else v
     m = cfg.model
     # The bands: freqs_per_band (60 x 1025, bool) from librosa's mel filter bank, with the
     # upstream fix-ups ([0][0] and [-1][-1] forced on). Band b's features are its frequencies in

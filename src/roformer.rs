@@ -607,9 +607,11 @@ pub struct MelRoformer {
 const FREQ_GROUP: usize = 8;
 
 impl MelRoformer {
-    /// Loads `<dir>/<name>.json` and `<dir>/<name>.safetensors` (float32 or float16).
+    /// Loads `<dir>/melroformer.json` and `<dir>/<name>.safetensors` (float32 or float16;
+    /// `$MELROFORMER_WEIGHTS` overrides the name, e.g. melroformer-f16 for measurements).
     pub fn load(dir: impl AsRef<Path>, name: &str) -> Result<Self, String> {
         let dir = dir.as_ref();
+        let name = std::env::var("MELROFORMER_WEIGHTS").unwrap_or_else(|_| name.to_string());
         let cfg = Config::load(dir.join("melroformer.json"))?;
         let mut st = SafeTensors::load(dir.join(format!("{name}.safetensors")))?;
         let m = Self::from_weights(cfg, &mut st)?;
