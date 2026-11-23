@@ -115,7 +115,7 @@ Checkpoints (from demucs' own `remote/*.yaml` + `files.txt`): `htdemucs` = `9557
 ships them in float16 and upcasts on load, so the converted safetensors are float16 too: 84.0 MB
 and 54.9 MB.
 
-## Parity (one segment, vs PyTorch CPU float32)
+## Parity, one segment (vs PyTorch CPU float32)
 
 | segment | htdemucs | htdemucs_6s |
 |---|---|---|
@@ -132,6 +132,45 @@ survive to the output.
 
 Speed, one segment on an M1 Pro (8 threads): PyTorch 2.2.2 CPU 3.4 s (htdemucs) / 3.0 s
 (htdemucs_6s); this crate 1.8 s / 1.7 s with the `gemm` crate, 1.3 s / 1.1 s with Accelerate.
+
+## Parity, full songs (vs PyTorch CPU float32, demucs' own code path)
+
+Fretboard's four test songs, decoded once by ffmpeg to float WAV (the same file feeds both),
+seed 0, SNR in dB per stem over the whole song (`tools/ref_songs.sh`, `tools/parity_songs.sh`,
+Accelerate build; the gemm build gives the same to within ~1 dB).
+
+| htdemucs | shifts | drums | bass | other | vocals |
+|---|---|---|---|---|---|
+| Aerials | 2 | 116.1 | 122.0 | 125.4 | 129.4 |
+| Aerials | 0 | 113.2 | 118.7 | 122.6 | 126.9 |
+| The Man Who Sold the World | 2 | 119.3 | 122.1 | 125.5 | 128.0 |
+| The Man Who Sold the World | 0 | 116.7 | 119.4 | 122.7 | 125.0 |
+| Never Too Late | 2 | 118.7 | 125.1 | 124.2 | 129.0 |
+| Never Too Late | 0 | 115.7 | 122.3 | 121.3 | 126.3 |
+| Iss Tarah | 2 | 118.4 | 124.6 | 123.8 | 128.0 |
+| Iss Tarah | 0 | 116.0 | 121.4 | 120.4 | 125.5 |
+
+| htdemucs_6s | shifts | drums | bass | other | vocals | guitar | piano |
+|---|---|---|---|---|---|---|---|
+| Aerials | 2 | 124.0 | 120.9 | 111.8 | 128.8 | 124.4 | 101.9 |
+| Aerials | 0 | 121.3 | 117.9 | 113.8 | 126.3 | 122.2 | 94.3 |
+| The Man Who Sold the World | 2 | 120.9 | 120.6 | 109.2 | 126.5 | 123.4 | 94.7 |
+| The Man Who Sold the World | 0 | 119.0 | 117.8 | 112.0 | 124.7 | 120.8 | 95.0 |
+| Never Too Late | 2 | 125.7 | 124.8 | 108.3 | 128.4 | 124.9 | 100.0 |
+| Never Too Late | 0 | 122.9 | 122.0 | 107.4 | 125.9 | 122.2 | 103.8 |
+| Iss Tarah | 2 | 122.7 | 125.4 | 121.0 | 126.5 | 120.4 | 118.3 |
+| Iss Tarah | 0 | 119.6 | 122.0 | 117.9 | 124.0 | 116.4 | 116.7 |
+
+The absolute error is the same everywhere, -134 to -160 dBFS RMS (max abs error 0.4-10 x 1e-6);
+SNR is relative to each stem's own level, so the lower figures are near-silent stems: the 6-stem
+"piano" on the three rock songs sits at -49 to -67 dBFS RMS (e.g. The Man Who Sold the World,
+shifts 2: piano at -67 dBFS, 94.7 dB SNR, error -162 dBFS, max abs 5.8e-7), and "other" at
+-34 to -42 dBFS there.
+
+Decoder: symphonia (+ edit lists) vs ffmpeg on the four m4a files: same length, aligned, 127-134
+dB SNR. Stems from the m4a decoded by us vs the PyTorch reference from ffmpeg's decode
+(htdemucs, shifts 2): 115.3-127.9 dB, within ~1-3 dB of the same-input figures - the decoder
+choice does not matter at this level.
 
 ## Demucs behaviour worth knowing
 
