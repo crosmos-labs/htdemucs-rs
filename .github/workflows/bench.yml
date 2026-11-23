@@ -131,7 +131,10 @@ jobs:
             ./target/release/parity weights ref/ci/seg-$m.safetensors | tee parity-$m.txt | grep -E '^## |final output|^\| (output|ispec|crosstransformer) '
             echo "- segment $m: $(grep 'final output' parity-$m.txt)" >> "$GITHUB_STEP_SUMMARY"
             rm ref/ci/seg-$m.safetensors
-            ./target/release/htdemucs-rs separate -n $m --shifts 2 --seed 0 --float32 --clip-mode none -o sep ref/ci/synth.wav 2>/dev/null
+            for tune in 0 1; do
+              HTDEMUCS_MALLOC_TUNE=$tune /usr/bin/time -f "separate $m (malloc tune $tune): %e s wall, %U+%S s CPU, peak RSS %M KB, %R minor faults" \
+                ./target/release/htdemucs-rs separate -q -n $m --shifts 2 --seed 0 --float32 --clip-mode none -o sep ref/ci/synth.wav
+            done
             ./target/release/compare ref/ci/synth.$m.s2.safetensors sep/$m/synth | tee -a compare.txt
             echo "- full path $m shifts 2: $(tail -1 compare.txt)" >> "$GITHUB_STEP_SUMMARY"
           done

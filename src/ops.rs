@@ -204,14 +204,42 @@ pub fn sgemm_par(
     if m == 0 || n == 0 {
         return;
     }
+    assert!((m - 1) * c_rs + n <= c.len());
+    // SAFETY: c covers the output, as asserted.
+    unsafe { sgemm_raw(m, n, k, a, a_rs, a_cs, b, b_rs, b_cs, c.as_mut_ptr(), c_rs, accumulate, parallel) }
+}
+
+/// `sgemm_par` writing through a raw pointer, for tasks that write disjoint tiles of one matrix.
+///
+/// # Safety
+/// c[i * c_rs + j] for i < m, j < n must be valid for writes (and reads if `accumulate`), and not
+/// accessed by anyone else during the call.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn sgemm_raw(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    a_rs: usize,
+    a_cs: usize,
+    b: &[f32],
+    b_rs: usize,
+    b_cs: usize,
+    c: *mut f32,
+    c_rs: usize,
+    accumulate: bool,
+    parallel: bool,
+) {
+    if m == 0 || n == 0 {
+        return;
+    }
     assert!(k == 0 || (m - 1) * a_rs + (k - 1) * a_cs < a.len());
     assert!(k == 0 || (k - 1) * b_rs + (n - 1) * b_cs < b.len());
-    assert!((m - 1) * c_rs + n <= c.len());
     prof::gemm_flops(m, n, k);
     #[cfg(any(all(feature = "accelerate", target_os = "macos"), feature = "openblas"))]
     {
         let _ = parallel; // the BLAS manages its own threads
-        cblas::sgemm(m, n, k, a, a_rs, a_cs, b, b_rs, b_cs, c, c_rs, accumulate);
+        unsafe { cblas::sgemm(m, n, k, a, a_rs, a_cs, b, b_rs, b_cs, c, c_rs, accumulate) };
     }
     // gemm computes dst = alpha * dst + beta * lhs * rhs. It never splits the k dimension across
     // threads, so results do not depend on the thread count.
@@ -221,7 +249,7 @@ pub fn sgemm_par(
             m,
             n,
             k,
-            c.as_mut_ptr(),
+            c,
             1,
             c_rs as isize,
             accumulate,
@@ -270,16 +298,16 @@ mod cblas {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn sgemm(
+    pub unsafe fn sgemm(
         m: usize, n: usize, k: usize, a: &[f32], a_rs: usize, a_cs: usize, b: &[f32], b_rs: usize,
-        b_cs: usize, c: &mut [f32], c_rs: usize, accumulate: bool,
+        b_cs: usize, c: *mut f32, c_rs: usize, accumulate: bool,
     ) {
         let (ta, lda) = layout(a_rs, a_cs, k);
         let (tb, ldb) = layout(b_rs, b_cs, n);
         unsafe {
             cblas_sgemm(
                 ROW_MAJOR, ta, tb, m as c_int, n as c_int, k as c_int, 1.0, a.as_ptr(), lda,
-                b.as_ptr(), ldb, if accumulate { 1.0 } else { 0.0 }, c.as_mut_ptr(), c_rs as c_int,
+                b.as_ptr(), ldb, if accumulate { 1.0 } else { 0.0 }, c, c_rs as c_int,
             );
         }
     }
@@ -438,6 +466,18 @@ fn glu_add_row(x: &mut [f32], d: Option<&mut [f32]>, za: &[f32], zb: &[f32], ci:
 /// Upper bound on the im2col buffer (floats); larger convolutions are done in column blocks.
 const COL_BLOCK: usize = 1 << 24;
 
+/// Output columns per task for the blocked im2col convolution (0: one multithreaded GEMM per
+/// 2^24-float im2col block instead). Depends on the shape only - never on the thread count.
+/// HTDEMUCS_CONV_BLOCK = target im2col floats per task (0 disables).
+fn conv_block_cols(kk: usize, n: usize) -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let target = *T.get_or_init(|| std::env::var("HTDEMUCS_CONV_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if target == 0 {
+        return 0;
+    }
+    (target / kk).max(512).min(n)
+}
+
 impl Conv {
     #[allow(clippy::too_many_arguments)]
     pub fn new(w: Vec<f32>, b: Vec<f32>, cin: usize, cout: usize, k: (usize, usize), stride: (usize, usize), pad: (usize, usize), dil: (usize, usize)) -> Self {
@@ -516,9 +556,30 @@ impl Conv {
                 let _sc = prof::scope(prof::BIAS);
                 out.par_chunks_mut(n).zip(self.b.par_iter()).for_each(|(row, &b)| row.fill(b));
             }
+            let nbc = conv_block_cols(kk, n);
             if pointwise {
                 let _sc = prof::scope(prof::CONV);
                 sgemm(self.cout, n, kk, &self.w, kk, 1, &x.data, n, 1, &mut out, n, bias);
+            } else if nbc > 0 {
+                // Column blocks as tasks: each im2cols its block into a buffer that stays in
+                // cache and multiplies it single-threaded. (k is never split, so per-element
+                // sums are the same as one big GEMM's.)
+                let _sc = prof::scope(prof::CONV);
+                let op = SendPtr(out.as_mut_ptr());
+                let cout = self.cout;
+                (0..n.div_ceil(nbc)).into_par_iter().for_each_init(
+                    || vec![0.0f32; kk * nbc],
+                    |col, blk| {
+                        let j0 = blk * nbc;
+                        let nb = nbc.min(n - j0);
+                        let col = &mut col[..kk * nb];
+                        for (r, row) in col.chunks_mut(nb).enumerate() {
+                            self.im2col_row(x, wo, j0, nb, r, row);
+                        }
+                        // SAFETY: columns [j0, j0 + nb) of every output row belong to this task.
+                        unsafe { sgemm_raw(cout, nb, kk, &self.w, kk, 1, col, nb, 1, op.get().add(j0), n, bias, false) };
+                    },
+                );
             } else {
                 let block = (COL_BLOCK / kk).max(wo).min(n);
                 let mut col = vec![0.0f32; kk * block];
@@ -540,12 +601,17 @@ impl Conv {
     /// col[(ci, ki, kj), j - j0] = x[ci, ho*sh + ki*dh - ph, wo*sw + kj*dw - pw] for output
     /// positions j = ho * Wo + wo in [j0, j0 + nb); zero outside the input.
     fn im2col(&self, x: &Tensor, _ho: usize, wo_n: usize, j0: usize, nb: usize, col: &mut [f32]) {
+        col.par_chunks_mut(nb).enumerate().for_each(|(r, row)| self.im2col_row(x, wo_n, j0, nb, r, row));
+    }
+
+    /// Row r = (ci, ki, kj) of the im2col matrix, output positions [j0, j0 + nb).
+    fn im2col_row(&self, x: &Tensor, wo_n: usize, j0: usize, nb: usize, r: usize, row: &mut [f32]) {
         let (h, w) = (x.shape[1] as isize, x.shape[2] as isize);
         let (kh, kw) = self.k;
         let (sh, sw) = (self.stride.0 as isize, self.stride.1 as isize);
         let (ph, pw) = (self.pad.0 as isize, self.pad.1 as isize);
         let (dh, dw) = (self.dil.0 as isize, self.dil.1 as isize);
-        col.par_chunks_mut(nb).enumerate().for_each(|(r, row)| {
+        {
             let ci = r / (kh * kw);
             let ki = ((r / kw) % kh) as isize;
             let kj = (r % kw) as isize;
@@ -583,7 +649,7 @@ impl Conv {
                 }
                 j += run;
             }
-        });
+        }
     }
 }
 
@@ -1136,9 +1202,10 @@ pub fn attention_into(q: &[f32], q_rs: usize, k: &[f32], k_rs: usize, v: &[f32],
             let s = &mut scores[..m * nk];
             sgemm_par(m, nk, d, &q[r0 * q_rs + h * d..], q_rs, 1, &k[h * d..], 1, k_rs, s, nk, false, false);
             s.chunks_mut(nk).for_each(softmax);
-            // SAFETY: tile (rows r0..r0+m, cols h*d..h*d+d) of out is written by this task only.
-            let o = unsafe { std::slice::from_raw_parts_mut(optr.get().add(r0 * c + h * d), olen - r0 * c - h * d) };
-            sgemm_par(m, d, nk, s, nk, 1, &v[h * d..], v_rs, 1, o, c, false, false);
+            // SAFETY: tile (rows r0..r0+m, cols h*d..h*d+d) of out is in bounds and written by
+            // this task only.
+            assert!((r0 + m - 1) * c + (h + 1) * d <= olen);
+            unsafe { sgemm_raw(m, d, nk, s, nk, 1, &v[h * d..], v_rs, 1, optr.get().add(r0 * c + h * d), c, false, false) };
         },
     );
 }

@@ -203,6 +203,26 @@ impl DecLayer {
     }
 }
 
+/// glibc serves every allocation above 32 MB (and, by its adaptive threshold, many smaller ones)
+/// with a fresh mmap, so each forward's multi-GB of short-lived activations came back as new
+/// zero-filled pages: ~200k page faults and ~6% of the CPU time per segment on x86 Linux. Keeping
+/// freed memory in the heap instead (no mmap, no trimming) makes the buffers reusable. Process-wide;
+/// HTDEMUCS_MALLOC_TUNE=0 leaves glibc's defaults. (No effect on other platforms / C libraries.)
+fn tune_malloc() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if std::env::var("HTDEMUCS_MALLOC_TUNE").as_deref() != Ok("0") {
+                unsafe {
+                    libc::mallopt(libc::M_MMAP_MAX, 0);
+                    libc::mallopt(libc::M_TRIM_THRESHOLD, i32::MAX);
+                }
+            }
+        });
+    }
+}
+
 pub struct HTDemucs {
     pub cfg: Config,
     stft: Stft,
@@ -220,6 +240,7 @@ pub struct HTDemucs {
 impl HTDemucs {
     /// Loads `<dir>/<name>.json` and `<dir>/<name>.safetensors` (from tools/convert.py).
     pub fn load(dir: impl AsRef<Path>, name: &str) -> Result<Self, String> {
+        tune_malloc();
         let dir = dir.as_ref();
         let cfg = Config::load(dir.join(format!("{name}.json")))?;
         let mut st = SafeTensors::load(dir.join(format!("{name}.safetensors")))?;
