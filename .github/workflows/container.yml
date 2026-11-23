@@ -1,0 +1,204 @@
+# The Cloudflare Containers image (Dockerfile, docs/container.md) on a linux/amd64 runner: builds
+# the distroless and debian-slim variants, reports their sizes, runs smoke separations through the
+# container's HTTP interface on a synthetic clip (no copyrighted audio) and checks them against
+# PyTorch references made on this runner (>= 90 dB per stem), then times longer clips for instance
+# sizing (CPU seconds per second of audio, peak memory inside the container). Nothing is pushed to
+# a registry and nothing is deployed.
+name: container
+
+on:
+  workflow_dispatch:
+    inputs:
+      sizing:
+        description: time 60 s / 240 s clips for instance sizing
+        type: boolean
+        default: true
+      long_minutes:
+        description: "also run -n ensemble --shifts 0 on a clip this long, for memory (0: skip; 22 = Fretboard's limit)"
+        default: "0"
+  push:
+    branches: [container]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - .github/workflows/container.yml
+      - .github/container/**
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SIZING: ${{ github.event_name == 'push' || inputs.sizing }}
+  LONG_MINUTES: ${{ inputs.long_minutes || '0' }}
+  MIN_DB: "90"
+
+jobs:
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CPU
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|L3'
+          free -m; uname -r; docker version --format 'docker {{.Server.Version}}'
+          {
+            echo "### Runner"
+            echo '```'
+            lscpu | grep -E 'Model name|^CPU\(s\)|Thread|L3'
+            echo "flags: $(grep -o -w -E 'avx2|fma|avx512f|avx512bw|avx512vl|amx_tile' /proc/cpuinfo | sort -u | tr '\n' ' ')"
+            echo "memory: $(free -m | awk '/Mem:/ {print $2}') MB"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/bench/requirements.txt
+
+      - name: Python deps (torch 2.2.2 CPU, demucs 4.0.1)
+        run: pip install -q -r .github/bench/requirements.txt
+
+      # Same key and paths as bench.yml, so the converted weights are shared.
+      - name: Weights cache
+        id: weights
+        uses: actions/cache@v4
+        with:
+          path: |
+            weights
+            ~/.cache/torch/hub/checkpoints
+          key: weights-${{ hashFiles('tools/convert.py', 'tools/st.py') }}-v1
+
+      - name: Convert weights (demucs' own checkpoint download)
+        if: steps.weights.outputs.cache-hit != 'true'
+        run: python tools/convert.py htdemucs htdemucs_6s
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (distroless)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-contexts: weights=weights
+          platforms: linux/amd64
+          target: distroless
+          tags: htdemucs-rs:distroless
+          load: true
+          push: false
+          cache-from: type=gha,scope=container
+          cache-to: type=gha,scope=container,mode=max
+
+      - name: Build (debian-slim)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-contexts: weights=weights
+          platforms: linux/amd64
+          target: debian
+          tags: htdemucs-rs:debian
+          load: true
+          push: false
+          cache-from: type=gha,scope=container
+
+      - name: Sizes
+        run: |
+          docker pull -q gcr.io/distroless/cc-debian13:nonroot > /dev/null
+          docker pull -q debian:trixie-slim > /dev/null
+          row() { # image -> uncompressed MB, gzip MB
+            u=$(docker image inspect -f '{{.Size}}' "$1"); c=$(docker save "$1" | gzip -6 | wc -c)
+            printf '| %s | %.1f | %.1f |\n' "$1" "$(echo "$u/1000000" | bc -l)" "$(echo "$c/1000000" | bc -l)"
+          }
+          {
+            echo "### Image sizes (MB = 10^6 bytes; compressed = docker save | gzip -6)"
+            echo "| image | uncompressed | compressed |"
+            echo "|---|---|---|"
+            for i in htdemucs-rs:distroless htdemucs-rs:debian gcr.io/distroless/cc-debian13:nonroot debian:trixie-slim; do row $i; done
+            echo
+            echo "Layers (htdemucs-rs:distroless):"
+            echo '```'
+            docker history --format '{{.Size}}\t{{.CreatedBy}}' htdemucs-rs:distroless | cut -c1-140
+            echo '```'
+            id=$(docker create htdemucs-rs:distroless)
+            docker cp "$id":/usr/local/bin/htdemucs-rs /tmp/htdemucs-rs; docker cp "$id":/usr/local/bin/htdemucs-serve /tmp/htdemucs-serve; docker rm "$id" > /dev/null
+            echo "Binaries: htdemucs-rs $(stat -c %s /tmp/htdemucs-rs) bytes, htdemucs-serve $(stat -c %s /tmp/htdemucs-serve) bytes"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Clips and PyTorch references
+        run: |
+          mkdir -p clips
+          python .github/bench/synth.py clips/synth.wav 12
+          python - << 'EOF'
+          import numpy as np, soundfile as sf
+          x, sr = sf.read("clips/synth.wav", dtype="float32")
+          for secs in (60, 240):
+              sf.write(f"clips/synth{secs}.wav", np.tile(x, (secs // 12, 1)), sr, subtype="FLOAT")
+          EOF
+          for m in htdemucs htdemucs_6s; do
+            python tools/ref_separate.py --model $m --shifts 2 --seed 0 clips/synth.wav clips/ref.$m.s2.safetensors
+          done
+
+      - name: Smoke separations and parity (HTTP, distroless)
+        run: |
+          q="shifts=2&seed=0&format=float32&clip-mode=none"
+          for m in htdemucs htdemucs_6s ensemble; do
+            .github/container/job.sh htdemucs-rs:distroless "smoke $m s2 12s" "name=$m&$q" clips/synth.wav out/$m 12
+          done
+          {
+            echo "### Parity vs PyTorch on this runner (12 s synthetic clip, shifts 2, seed 0; SNR dB per stem)"
+            echo '```'
+            python .github/container/check.py $MIN_DB out/htdemucs/htdemucs clips/ref.htdemucs.s2.safetensors
+            python .github/container/check.py $MIN_DB out/htdemucs_6s/htdemucs_6s clips/ref.htdemucs_6s.s2.safetensors
+            python .github/container/check.py $MIN_DB out/ensemble clips/ref.htdemucs.s2.safetensors clips/ref.htdemucs_6s.s2.safetensors
+            echo '```'
+          } > parity.md
+          cat parity.md; cat parity.md >> "$GITHUB_STEP_SUMMARY"
+          ! grep -q FAIL parity.md
+
+      - name: Smoke (debian-slim image, once mode, FLAC)
+        run: |
+          docker run -i --rm htdemucs-rs:debian once name=htdemucs < clips/synth.wav > once.tar
+          tar -tvf once.tar
+          test "$(tar -tf once.tar | wc -l)" = 4
+          .github/container/job.sh htdemucs-rs:debian "smoke debian htdemucs s0 12s" "name=htdemucs&format=float32&clip-mode=none" clips/synth.wav out/debian 12
+
+      - name: Sizing (distroless)
+        if: env.SIZING == 'true'
+        run: |
+          .github/container/job.sh htdemucs-rs:distroless "ensemble s2 60s" "name=ensemble&shifts=2&format=flac" clips/synth60.wav out/e2-60 60
+          .github/container/job.sh htdemucs-rs:distroless "ensemble s0 60s" "name=ensemble&shifts=0&format=flac" clips/synth60.wav out/e0-60 60
+          .github/container/job.sh htdemucs-rs:distroless "ensemble s0 240s" "name=ensemble&shifts=0&format=flac" clips/synth240.wav out/e0-240 240
+          .github/container/job.sh htdemucs-rs:distroless "htdemucs_6s s0 240s" "name=htdemucs_6s&shifts=0&format=flac" clips/synth240.wav out/s6-240 240
+
+      - name: Long clip (memory)
+        if: env.LONG_MINUTES != '0'
+        run: |
+          secs=$((LONG_MINUTES * 60))
+          python -c "import numpy as np, soundfile as sf; x, sr = sf.read('clips/synth.wav', dtype='float32'); sf.write('clips/long.wav', np.tile(x, ($secs // 12, 1)), sr, subtype='FLOAT')"
+          .github/container/job.sh htdemucs-rs:distroless "ensemble s0 ${LONG_MINUTES}min" "name=ensemble&shifts=0&format=flac" clips/long.wav out/long $secs
+
+      - name: Summary
+        if: always()
+        run: |
+          [ -f results.jsonl ] || exit 0
+          {
+            echo "### Jobs (in the container; peak RSS = the separator process, from wait4; cgroup peak = whole container incl. page cache)"
+            echo "| job | image | wall s | CPU s | CPU s / audio s | peak RSS MB | cgroup peak MB | ready s | result MB | host CPU |"
+            echo "|---|---|---|---|---|---|---|---|---|---|"
+            jq -r '"| \(.label) | \(.image | sub("htdemucs-rs:"; "")) | \(.wall_s) | \(.cpu_s) | \(.cpu_per_audio_s * 1000 | round / 1000) | \(.peak_rss_mb) | \(.cgroup_peak_mb) | \(.ready_s) | \(.tar_bytes / 1e5 | round / 10) | \(.cpu_model) (\(.nproc)) |"' results.jsonl
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-results
+          path: |
+            results.jsonl
+            parity.md
+            out/*.log
+          if-no-files-found: ignore
