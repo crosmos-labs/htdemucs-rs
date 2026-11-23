@@ -9,6 +9,7 @@ while kill -0 $pid 2>/dev/null; do r=$(awk '/VmHWM/{print $2}' /proc/$pid/status
 wait $pid; code=$?
 t1=$(date +%s.%N)
 sec() { echo "$1" | awk -F'[ms]' '{print $1 * 60 + $2}'; }
-read -r u s <<< "$(times | tail -1)"
+times > "$out.times"  # not in a pipe or $(...): a subshell would report its own (zero) child times
+read -r u s < <(tail -1 "$out.times"); rm -f "$out.times"
 awk -v u="$(sec "$u")" -v s="$(sec "$s")" -v p="$peak" -v a="$t0" -v b="$t1" 'BEGIN {printf "cpu_s=%.1f peak_rss_mb=%.0f wall_s=%.1f\n", u + s, p / 1024, b - a}' > "$out"
 exit $code
