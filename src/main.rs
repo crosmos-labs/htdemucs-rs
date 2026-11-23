@@ -11,17 +11,19 @@ use htdemucs::apply::{self, Options};
 use htdemucs::audio::{self, Format};
 use htdemucs::{HTDemucs, Tensor};
 
-const USAGE: &str = "usage: htdemucs-rs separate -n <htdemucs|htdemucs_6s> [options] <tracks>...
+const USAGE: &str = "usage: htdemucs-rs separate -n <htdemucs|htdemucs_6s|ensemble|melroformer> [options] <tracks>...
 
 options (demucs' names and defaults where they exist):
   -n, --name NAME        model (default htdemucs), or ensemble: htdemucs and htdemucs_6s on one
                          decode, averaged; writes DIR/htdemucs/<track>/ (4 stems) and
-                         DIR/htdemucs_6s/<track>/ (6 stems) - see src/ensemble.rs
+                         DIR/htdemucs_6s/<track>/ (6 stems) - see src/ensemble.rs;
+                         or melroformer: Kim's Mel-Band RoFormer, vocals + instrumental
   --weights DIR          converted weights (default $HTDEMUCS_WEIGHTS, else ./weights)
   -o, --out DIR          output root (default separated); files go to DIR/NAME/<track>/<stem>.<ext>
   --shifts N             random time shifts averaged (default 1)
   --seed S               seed of the shifts' random offsets, as random.seed(S) in Python (default 0)
   --overlap F            overlap between segments (default 0.25)
+  --num-overlap N        melroformer only: chunks overlapping each position (default 2, as upstream)
   --threads T            worker threads (default: all cores)
   --float32              write float32 WAV (default: 16-bit WAV)
   --flac                 write 16-bit FLAC
@@ -40,6 +42,7 @@ struct Args {
     format: Format,
     clip: String,
     clip4: Option<String>,
+    num_overlap: Option<usize>,
     verbose: bool,
     progress: bool,
     tracks: Vec<PathBuf>,
@@ -55,6 +58,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         format: Format::Wav16,
         clip: "rescale".into(),
         clip4: None,
+        num_overlap: None,
         verbose: false,
         progress: true,
         tracks: vec![],
@@ -69,6 +73,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--shifts" => a.opts.shifts = num(val(&mut it, &arg)?, &arg)? as usize,
             "--seed" => a.opts.seed = val(&mut it, &arg)?.parse().map_err(|_| "--seed: not an integer".to_string())?,
             "--overlap" => a.opts.overlap = num(val(&mut it, &arg)?, &arg)? as f32,
+            "--num-overlap" => a.num_overlap = Some(num(val(&mut it, &arg)?, &arg)? as usize),
             "--threads" | "-j" => a.threads = Some(num(val(&mut it, &arg)?, &arg)? as usize),
             "--float32" => a.format = Format::WavF32,
             "--flac" => a.format = Format::Flac16,
@@ -164,6 +169,9 @@ fn run(a: Args) -> Result<(), String> {
     if let Some(t) = a.threads {
         rayon::ThreadPoolBuilder::new().num_threads(t).build_global().map_err(|e| e.to_string())?;
     }
+    if a.name == "melroformer" {
+        return run_melroformer(a);
+    }
     let t0 = Instant::now();
     // `-n ensemble`: htdemucs_6s and htdemucs on one decode, averaged (src/ensemble.rs).
     let ensemble = a.name == "ensemble";
@@ -236,6 +244,61 @@ fn run(a: Args) -> Result<(), String> {
             if a.verbose {
                 eprintln!("  wrote {} in {:.1}s total", dir.display(), t1.elapsed().as_secs_f64());
             }
+        }
+    }
+    if a.verbose {
+        eprintln!("done in {:.1}s, peak RSS {:.0} MB", t0.elapsed().as_secs_f64(), peak_rss_mb());
+    }
+    Ok(())
+}
+
+/// `-n melroformer`: Kim's Mel-Band RoFormer (src/roformer.rs) with upstream's chunking; writes
+/// vocals and instrumental (mix - vocals, as upstream's inference.py) to DIR/melroformer/<track>/.
+fn run_melroformer(a: Args) -> Result<(), String> {
+    use htdemucs::roformer::{self, Chunking, MelRoformer};
+    if a.opts.shifts > 1 || a.opts.overlap != Options::default().overlap {
+        return Err("melroformer takes no --shifts / --overlap (it is deterministic; see --num-overlap)".into());
+    }
+    let t0 = Instant::now();
+    let model = MelRoformer::load(&a.weights, "melroformer")?;
+    let ch = Chunking::new(&model.cfg, a.num_overlap.unwrap_or(model.cfg.num_overlap)).map_err(|e| format!("--num-overlap: {e}"))?;
+    let rate = model.cfg.sample_rate as u32;
+    for track in &a.tracks {
+        let t1 = Instant::now();
+        let input = audio::decode(track)?;
+        let mut input = audio::resample(audio::to_channels(input, 2)?, rate)?;
+        let len = input.frames();
+        if a.verbose {
+            eprintln!("{}: {:.1} s of audio, decoded in {:.2}s", track.display(), len as f64 / rate as f64, t1.elapsed().as_secs_f64());
+        }
+        let (total, mut done) = (ch.chunks(len), 0);
+        let (t2, show, step_sec) = (Instant::now(), a.progress, ch.step as f64 / rate as f64);
+        if show {
+            tqdm_line(0, total, step_sec, 0.0);
+        }
+        let mut vocals = roformer::separate(&model, &input.data, &ch, &mut || {
+            done += 1;
+            if show {
+                tqdm_line(done, total, step_sec, t2.elapsed().as_secs_f64());
+            }
+        });
+        if show {
+            eprintln!();
+        }
+        if a.verbose {
+            eprintln!("  separated in {:.1}s", t2.elapsed().as_secs_f64());
+        }
+        // The mix becomes the instrumental, in place.
+        input.data.iter_mut().zip(&vocals).for_each(|(m, v)| *m -= v);
+        let name = track.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+        let dir = a.out.join("melroformer").join(name);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for (src, x) in [("vocals", &mut vocals), ("instrumental", &mut input.data)] {
+            prevent_clip(x, &a.clip);
+            audio::write(&dir.join(format!("{src}.{}", a.format.ext())), x, 2, rate, a.format)?;
+        }
+        if a.verbose {
+            eprintln!("  wrote {} in {:.1}s total", dir.display(), t1.elapsed().as_secs_f64());
         }
     }
     if a.verbose {

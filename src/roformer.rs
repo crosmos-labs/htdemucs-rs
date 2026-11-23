@@ -879,6 +879,152 @@ impl MelRoformer {
     }
 }
 
+/// Upstream `demix_track`'s chunking: chunk length C, step C / num_overlap, fades of C / 10 at
+/// both ends of each chunk's window (none at the track's two ends), outputs overlap-added and
+/// divided by the summed windows; the track is reflect-padded by C - step at both ends when it
+/// is longer than twice that.
+pub struct Chunking {
+    pub chunk: usize,
+    pub step: usize,
+    pub fade: usize,
+    pub border: usize,
+}
+
+impl Chunking {
+    pub fn new(cfg: &Config, num_overlap: usize) -> Result<Self, String> {
+        let c = cfg.chunk_size;
+        if num_overlap == 0 || num_overlap > c {
+            return Err(format!("num_overlap must be in 1..={c}"));
+        }
+        let step = c / num_overlap;
+        Ok(Chunking { chunk: c, step, fade: c / 10, border: c - step })
+    }
+
+    fn padded(&self, len: usize) -> bool {
+        self.border > 0 && len > 2 * self.border
+    }
+
+    /// Length of the (padded) track the chunks walk over.
+    pub fn total(&self, len: usize) -> usize {
+        if self.padded(len) { len + 2 * self.border } else { len }
+    }
+
+    /// Number of model forwards for a track of `len` samples.
+    pub fn chunks(&self, len: usize) -> usize {
+        self.total(len).div_ceil(self.step)
+    }
+
+    /// get_windowing_array: ones with linspace fades (torch.linspace's float32 arithmetic).
+    fn window(&self) -> Vec<f32> {
+        let (c, fade) = (self.chunk, self.fade);
+        let lin = |start: f32, end: f32| -> Vec<f32> {
+            if fade == 1 {
+                return vec![start];
+            }
+            let step = (end - start) / (fade - 1) as f32;
+            let half = fade / 2;
+            (0..fade).map(|i| if i < half { start + step * i as f32 } else { end - step * (fade - i - 1) as f32 }).collect()
+        };
+        let mut w = vec![1.0f32; c];
+        for (v, f) in w[c - fade..].iter_mut().zip(lin(1.0, 0.0)) {
+            *v *= f;
+        }
+        for (v, f) in w[..fade].iter_mut().zip(lin(0.0, 1.0)) {
+            *v *= f;
+        }
+        w
+    }
+}
+
+/// Separates a track (2 channels x len, 44.1 kHz) as upstream's demix_track; returns the
+/// vocals, 2 x len. `progress` is called after every chunk.
+///
+/// Streams: the padded track is read on demand (never copied), and each chunk's weighted output
+/// is added into a one-chunk window; positions no later chunk reaches are divided by their summed
+/// weights and written to the output as the walk goes (same operations, same order as upstream's
+/// whole-track `result` / `counter` buffers).
+pub fn separate(model: &MelRoformer, wav: &[f32], ch: &Chunking, progress: &mut dyn FnMut()) -> Vec<f32> {
+    let len = wav.len() / 2;
+    let c = ch.chunk;
+    let total = ch.total(len);
+    let border = if ch.padded(len) { ch.border } else { 0 };
+    // Sample p of the (padded) track, channel s: reflect padding without edge repetition.
+    let at = |s: usize, p: usize| -> f32 {
+        let mut j = p as isize - border as isize;
+        if j < 0 {
+            j = -j;
+        }
+        if j >= len as isize {
+            j = 2 * (len as isize - 1) - j;
+        }
+        wav[s * len + j as usize]
+    };
+    let base = ch.window();
+    let mut out = vec![0.0f32; 2 * len];
+    // Window [wbase, wbase + c) of upstream's result (2 rows) and counter.
+    let mut res = vec![0.0f32; 2 * c];
+    let mut cnt = vec![0.0f32; c];
+    let mut wbase = 0usize;
+    let mut flush = |res: &mut Vec<f32>, cnt: &mut Vec<f32>, wbase: &mut usize, upto: usize| {
+        let w = upto - *wbase;
+        if w == 0 {
+            return;
+        }
+        assert!(w <= c);
+        for s in 0..2 {
+            for k in 0..w {
+                let p = *wbase + k;
+                if p >= border && p < border + len {
+                    let v = res[s * c + k] / cnt[k];
+                    out[s * len + p - border] = if v.is_nan() { 0.0 } else { v.clamp(f32::MIN, f32::MAX) };
+                }
+            }
+            res.copy_within(s * c + w..(s + 1) * c, s * c);
+            res[(s + 1) * c - w..(s + 1) * c].fill(0.0);
+        }
+        cnt.copy_within(w.., 0);
+        cnt[c - w..].fill(0.0);
+        *wbase = upto;
+    };
+    let mut part = vec![0.0f32; 2 * c];
+    let mut i = 0;
+    while i < total {
+        flush(&mut res, &mut cnt, &mut wbase, i);
+        let length = c.min(total - i);
+        part.par_chunks_mut(c).enumerate().for_each(|(s, row)| {
+            for (q, v) in row.iter_mut().enumerate() {
+                *v = if q < length {
+                    at(s, i + q)
+                } else if length > c / 2 + 1 {
+                    at(s, i + 2 * (length - 1) - q) // reflect-pad the short last chunk
+                } else {
+                    0.0
+                };
+            }
+        });
+        let y = model.forward(&part, &mut Tracer::none());
+        progress();
+        let mut w = base.clone();
+        if i == 0 {
+            w[..ch.fade].fill(1.0);
+        } else if i + c >= total {
+            w[c - ch.fade..].fill(1.0);
+        }
+        let rel = i - wbase;
+        for s in 0..2 {
+            for q in 0..length {
+                res[s * c + rel + q] += y[s * c + q] * w[q];
+            }
+        }
+        for q in 0..length {
+            cnt[rel + q] += w[q];
+        }
+        i += ch.step;
+    }
+    flush(&mut res, &mut cnt, &mut wbase, total);
+    out
+}
+
 /// (frame, band, dim) -> (band, frame, dim).
 fn frame_to_band(x: &[f32], nb: usize, frames: usize, dim: usize) -> Vec<f32> {
     let mut o = vec![0.0f32; x.len()];
