@@ -8,7 +8,10 @@ Priorities, in order: quality (match PyTorch Demucs), speed, build size.
 
 **Status:** `htdemucs-rs separate` separates whole songs with `htdemucs` (4 stems) and
 `htdemucs_6s` (6 stems), reproducing `demucs.separate` - including its seeded random shifts - to
-well above 100 dB SNR per stem against PyTorch CPU float32 (see Parity).
+well above 100 dB SNR per stem against PyTorch CPU float32 (see Parity). `-n melroformer` runs
+Kim's Mel-Band RoFormer vocal model (vocals + instrumental; +3.7 dB vocal SDR over htdemucs on
+MUSDB18-HQ), matching its PyTorch inference to 101-135 dB per stem on six full tracks with 37-60%
+less CPU than PyTorch on x86 (see *Mel-Band RoFormer*).
 
 ## Usage
 
@@ -120,6 +123,11 @@ src/bin/decodecmp.rs our decode vs ffmpeg's
 tools/ref_separate.py, ref_songs.sh   full-song PyTorch references (demucs' own code path)
 tools/parity_songs.sh, decode_effect.sh, docker_x86.sh   full-song parity, decoder effect, x86 check
 src/bin/bench.rs     segment timing (+ HTDEMUCS_PROFILE=1 per-layer profile)
+src/roformer.rs      Mel-Band RoFormer: config, STFT / iSTFT, forward, upstream demix_track
+tools/melroformer.py its converter, PyTorch references (chunk dump, full song, float64), timing
+tools/mr_parity_songs.sh   its full-song parity + CPU time vs PyTorch
+src/bin/mr_parity.rs, mr_bench.rs   its chunk parity (+ each transformer alone) and chunk timing
+.github/workflows/bench-roformer.yml   its x86 parity / speed runs (settings: .github/bench/mr_run.env)
 ```
 
 ## Reproducing
@@ -241,6 +249,122 @@ shift - a second pass adds time, not memory):
 What remains is mostly the output itself (sources x 2 x length float32: 2.8 GB for 6 stems at
 22 min), the decoded input (0.47 GB) and the weights.
 
+## Mel-Band RoFormer (`-n melroformer`)
+
+Kim Jensen's Mel-Band RoFormer vocal model, the best vocal separator in the research round
+(MUSDB18-HQ, 12 test tracks, uSDR: vocals 13.73 dB vs 10.04 for htdemucs at 2 shifts;
+accompaniment 18.76 vs 15.08 - `research/round1/round1.md`, round 2).
+
+```sh
+PY="uv run --quiet --python 3.11.17 --with-requirements research/round1/kim_env.txt python"
+$PY tools/melroformer.py convert <Mel-Band-Roformer-Vocal-Model repo @25f44ff> MelBandRoformer.ckpt
+htdemucs-rs separate -n melroformer --flac --clip-mode clamp -o out song.m4a
+# -> out/melroformer/song/{vocals,instrumental}.flac
+```
+
+**What it computes** (upstream `inference.py` / `utils.demix_track`, CPU, float32): chunks of
+352800 samples (8 s) every 176400 (`num_overlap` 2; `--num-overlap N` as upstream), the track
+reflect-padded by 4 s at both ends, linear fades of 0.8 s at each chunk's ends (not at the track's
+ends), outputs overlap-added and divided by the summed windows. Per chunk: STFT (2048 / hop 441,
+centred) -> 60 overlapping mel bands of bins, each RMSNorm + Linear to 384 -> 6 x (time
+transformer over each band's 801 frames, frequency transformer over each frame's 60 bands;
+RoPE, gated attention, 8 x 64 heads, GELU MLP) -> per-band tanh MLP + GLU -> complex mask,
+averaged where bands overlap -> iSTFT. `instrumental` = mix - vocals, as upstream writes it.
+There are no shifts or seeds (`--shifts` / `--overlap` are refused).
+
+**How.** `src/roformer.rs` reuses the crate's GEMM (gemm crate, runtime AVX2 / AVX-512 dispatch)
+and its elementwise style. Each transformer runs as tasks of a fixed shape - one band (801 tokens)
+for the time transformer, 16 frames (960 tokens) for the frequency transformer, one band for the
+mask MLPs - with every GEMM, RMSNorm, rotary, attention tile (256 query rows) and GELU of the task
+done on one thread with its intermediates in cache; the frequency tasks gather their tokens and
+scatter them back, so the activations stay in one (band, frame, dim) buffer. Results therefore do
+not depend on the thread count (checked by `tests/roformer.rs` and `mr_bench` at 1/2/4 threads).
+The track streams as in the Demucs path: the padded mix is read on demand, and the overlap-add
+lives in a one-chunk window finalised as the chunks advance (`tests`: bit-identical to a literal
+whole-buffer `demix_track`).
+
+**Weights.** The checkpoint (huggingface.co/KimberleyJSN/melbandroformer, `MelBandRoformer.ckpt`,
+913 MB, sha256 `87201f4d…7559e`; MIT since 2026-04-22, see `research/round1/round1.md` for the
+licence history and the open training-data question) is float32 and **not** float16-exact (none
+of its 684 tensors). So `weights/melroformer.safetensors` stays float32 (913 MB; 228.2 M
+parameters, 88% of them in the 60 mask MLPs). Float16 weights (`convert --half`, 457 MB, loaded
+with `MELROFORMER_WEIGHTS=melroformer-f16`) cost parity: Aerials chunk 10 drops from 128 dB to
+72 dB against PyTorch - inaudible, but it is no longer the same model's output, so float32 is
+the default.
+
+### Parity (vs PyTorch 2.2.2 CPU float32, upstream code)
+
+One chunk (`mr_parity`, Aerials chunk 10): output 128.1 dB; every transformer run alone on
+PyTorch's own input 126-134 dB; the band split is the lowest intermediate (96.8 dB, see below).
+
+Full songs (`tools/mr_parity_songs.sh`, the same float WAV into both; SNR per stem over the whole
+song, then the reference stem's level and the error's level):
+
+| track | vocals | instrumental | levels (vocals / instrumental), error |
+|---|---|---|---|
+| System of a Down, Aerials (243.6 s) | 126.7 dB | 130.6 dB | -19 / -15 dBFS; error -145 dBFS, max 2.6e-6 |
+| Nirvana, The Man Who Sold the World (217.9 s) | 117.5 dB | 125.5 dB | -22 / -14 dBFS; error -140 dBFS, max 6.2e-6 |
+| Three Days Grace, Never Too Late (209.3 s) | 128.3 dB | 132.5 dB | -16 / -12 dBFS; error -145 dBFS, max 8.9e-6 |
+| Chaar Diwaari, Iss Tarah (323.5 s) | 100.9 dB | 103.6 dB | -14 / -11 dBFS; error -115 dBFS, max 1.9e-4 |
+| MUSDB18-HQ test: Signe Jakobsen, What Have You Done To Me (177.4 s) | 131.5 dB | 133.9 dB | -23 / -20 dBFS; error -154 dBFS, max 3.4e-7 |
+| MUSDB18-HQ test: Angels In Amplifiers, I'm Alright (179.6 s) | 131.4 dB | 134.5 dB | -23 / -20 dBFS; error -155 dBFS, max 3.4e-7 |
+
+Measured at `a385f13` (the tuned defaults since change only task shapes; chunk parity unchanged at 128.1 dB). The absolute error is -140 to -155 dBFS on five tracks, so the SNR follows each stem's own level; Iss Tarah is the outlier at -115 dBFS (see below).
+
+**Where float32 cannot agree.** Each band's features are L2-normalised (RMSNorm) before the band
+projection. A band holding nothing but FFT rounding noise (a synthetic mix with no energy above
+some frequency; digital near-silence) is normalised up to unit size, and the noise's direction
+is arbitrary - there PyTorch float32 is itself far from PyTorch float64: on the bare CI synthetic
+clip, band split 11.1 dB and output 22.8 dB (torch f32 vs f64), against 10.8 / 30.0 dB for this
+crate vs f64. Real recordings have a noise floor in every band and agree to 96+ dB at the band
+split; the CI clip gets a -60 dBFS noise floor, which brings it to 101.7 dB (band split) and
+95.6 dB (chunk output, vocals at -100 dBFS), full path vocals 105.1 dB / instrumental 175.3 dB
+(error -220 / -191 dBFS).
+
+The same mechanism, milder, is Iss Tarah's lower figure: its error is -139 dBFS in the median
+second but -95 dBFS around 3:56 (chunks 59-60). There (`mr_parity` on chunk 59) the STFT agrees
+to 136.5 dB and the band split drops to 75.9 dB (max abs error 0.016 on values up to 7.8) - a
+low-energy band's rounding noise scaled up by its normalisation - then propagates (69-81 dB
+through the transformers, 109.6 dB at the chunk output), while every transformer run alone on
+PyTorch's input stays at 126-134 dB. Nothing in the network itself diverges; the band split's
+input is where float32 rounding, ours or PyTorch's, decides.
+
+### Speed and memory
+
+CPU seconds per second of audio **of one chunk** forward, 1 thread (`mr_bench`, `melroformer.py
+bench`); a whole track costs about twice that per second of music (every sample is in two
+chunks) plus the 4 s of padding at each end.
+
+| CPU | htdemucs-rs | PyTorch 2.2.2 | |
+|---|---|---|---|
+| AMD EPYC 7763 (Zen 3, AVX2), GitHub runner, `687be4c` | 4.90 | 7.76 | **37% less CPU** |
+| AMD EPYC 9V45 (Zen 5, AVX-512), GitHub runner, `f90a933` (first version) | 2.44 | 6.06 | 60% less |
+| Intel Xeon Platinum 8573C (Emerald Rapids, AVX-512), GitHub runner, `2f8583f` | 2.80 | 5.30 | **47% less CPU** |
+| Apple M1 Pro, gemm crate (NEON) build, loaded machine | 5.9-6.1 | 3.2-3.4 | **1.8x more CPU**: PyTorch's GEMMs use Accelerate (AMX) |
+
+Whole songs on the M1 Pro (4 threads, machine shared with other jobs at load 15-20, so CPU time
+is the comparable number): Aerials (243.6 s) 3046-3130 CPU-s here vs 1836 for PyTorch (12.5-12.8 vs 7.5 CPU-s per second of music); over the six parity tracks 12.9-16.3 vs 7.0-7.5 (load varied run to run) - the
+`gemm`-crate NEON build reaches ~70 GFLOP/s per core where PyTorch's Accelerate GEMMs use the AMX
+units. On x86 the GEMMs run at 90-95% of peak (Zen 3 ~93 GFLOP/s, Zen 5 / Xeon 6975P ~210-230
+GFLOP/s per core); they are 80-85% of the time, attention softmax ~6%, GELU / tanh ~5%,
+RMSNorm 2%. Two threads on a runner's two vCPUs (one core, SMT) give ~1.06x the throughput (Zen 3), as for PyTorch (1.11x).
+
+Optimisations kept (each measured on the runners): fixed-shape single-threaded GEMM tasks; QKV
+and gate projections in one GEMM; exp's integer part read from the float bits (a saturating
+`as i32` left every exp in the crate scalar on x86-64 - this also speeds up the Demucs path,
+bit-identically); softmax as plain max / exp / sum loops with the exp input clamped at -40 (no
+subnormal lanes) and normalisation applied to the 64-wide output instead of the 801-wide weights;
+AVX-512 versions of the elementwise kernels; tile sizes from A/B runs. Tried and dropped: K^T
+copied per head for the QK^T GEMM (faster GEMM, paid back in copies), 64-row tiles, 8-frame
+frequency tasks (1-3% slower).
+
+Memory: weights 0.91 GB (float32) + input + vocals (2 x 4 bytes x samples each) + one chunk's
+activations (~0.15 GB plus ~10 MB per thread). The safetensors loader now reads tensor by
+tensor (it used to hold the whole file and the tensors at once, ~1.8 GB at load). Peak RSS:
+Aerials, M1 Pro, 4 threads, `2f8583f`: **1.35 GB peak memory footprint** (1.51 GB max RSS; 1.83 GB footprint before the streaming loader), Iss Tarah (5.4 min) 1.30 GB; on the CI clip (Linux) 1.09 GB max RSS. PyTorch: 2.4 GB on Aerials (4 threads), 2.35 GB on the 12 s CI clip vs 1.09 GB here.
+
+Binary: 2.5 MB (macOS) / 4.4 MB (Linux x86-64) with both models and the AVX-512 kernels.
+
 ## Demucs behaviour worth knowing
 
 - `separate.py` standardises the whole track first: `ref = wav.mean(0)`, `wav = (wav -
@@ -255,6 +379,14 @@ What remains is mostly the output itself (sources x 2 x length float32: 2.8 GB f
   row separately.
 
 ## Credits
+
+Mel-Band RoFormer: the architecture is by Ju-Chiang Wang, Wei-Tsung Lu and Minz Won (ByteDance,
+arXiv:2310.01809), the PyTorch implementation by Phil Wang (lucidrains/BS-RoFormer, MIT), the
+trained vocal model and its inference code by Kimberley Jensen
+([KimberleyJensen/Mel-Band-Roformer-Vocal-Model](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model);
+weights at huggingface.co/KimberleyJSN/melbandroformer, MIT since 2026-04-22, not in this
+repository). `src/roformer.rs` is an independent reimplementation of that inference path.
+
 
 HTDemucs is by Simon Rouard, Francisco Massa and Alexandre Défossez (Meta AI),
 [facebookresearch/demucs](https://github.com/facebookresearch/demucs), MIT licence; this is an
