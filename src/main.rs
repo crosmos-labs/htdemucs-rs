@@ -29,6 +29,7 @@ options (demucs' names and defaults where they exist):
   --seed S               seed of the shifts' random offsets, as random.seed(S) in Python (default 0)
   --overlap F            overlap between segments (default 0.25)
   --num-overlap N        melroformer / megaguitar: chunks overlapping each position (default 2, as upstream)
+  --chunk-size N         melroformer / megaguitar: samples per chunk (default the model's: 352800 / 882000)
   --threads T            worker threads (default: all cores)
   --float32              write float32 WAV (default: 16-bit WAV)
   --flac                 write 16-bit FLAC
@@ -54,6 +55,7 @@ struct Args {
     average_four: bool,
     own_6s: bool,
     num_overlap: Option<usize>,
+    chunk_size: Option<usize>,
     verbose: bool,
     progress: bool,
     tracks: Vec<PathBuf>,
@@ -72,6 +74,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         average_four: true,
         own_6s: false,
         num_overlap: None,
+        chunk_size: None,
         verbose: false,
         progress: true,
         tracks: vec![],
@@ -87,6 +90,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--seed" => a.opts.seed = val(&mut it, &arg)?.parse().map_err(|_| "--seed: not an integer".to_string())?,
             "--overlap" => a.opts.overlap = num(val(&mut it, &arg)?, &arg)? as f32,
             "--num-overlap" => a.num_overlap = Some(num(val(&mut it, &arg)?, &arg)? as usize),
+            "--chunk-size" => a.chunk_size = Some(num(val(&mut it, &arg)?, &arg)? as usize),
             "--threads" | "-j" => a.threads = Some(num(val(&mut it, &arg)?, &arg)? as usize),
             "--float32" => a.format = Format::WavF32,
             "--flac" => a.format = Format::Flac16,
@@ -318,7 +322,8 @@ fn run_roformer(a: Args) -> Result<(), String> {
     }
     let t0 = Instant::now();
     let model = Roformer::load(&a.weights, &a.name)?;
-    let ch = Chunking::new(&model.cfg, a.num_overlap.unwrap_or(model.cfg.num_overlap)).map_err(|e| format!("--num-overlap: {e}"))?;
+    let ch = Chunking::with_chunk(&model.cfg, a.chunk_size.unwrap_or(model.cfg.chunk_size), a.num_overlap.unwrap_or(model.cfg.num_overlap))
+        .map_err(|e| format!("--num-overlap / --chunk-size: {e}"))?;
     let rate = model.cfg.sample_rate as u32;
     for track in &a.tracks {
         let t1 = Instant::now();

@@ -1074,7 +1074,14 @@ pub struct Chunking {
 
 impl Chunking {
     pub fn new(cfg: &Config, num_overlap: usize) -> Result<Self, String> {
-        let c = cfg.chunk_size;
+        Self::with_chunk(cfg, cfg.chunk_size, num_overlap)
+    }
+
+    /// `new` with another chunk length (samples; the model takes any length above n_fft / 2).
+    pub fn with_chunk(cfg: &Config, c: usize, num_overlap: usize) -> Result<Self, String> {
+        if c <= cfg.stft_n_fft / 2 || c < 10 {
+            return Err(format!("chunk size must be above {} samples", (cfg.stft_n_fft / 2).max(9)));
+        }
         if num_overlap == 0 || num_overlap > c {
             return Err(format!("num_overlap must be in 1..={c}"));
         }
