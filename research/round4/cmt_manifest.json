@@ -10,11 +10,11 @@
    "zip": "ButterflyEffect_PreachRightHere.zip",
    "seconds": 20.35,
    "group_gain": {
-    "drums": 0.6431399667987302,
-    "bass": 0.2557616408850185,
-    "guitar": 0.2771641220993252,
-    "other": 0.3847976079123698,
-    "vocals": 0.6723727964150155
+    "drums": 0.6431399816659319,
+    "bass": 0.2557616642485561,
+    "guitar": 0.277164124013409,
+    "other": 0.38479761607058566,
+    "vocals": 0.6723728422454514
    },
    "tracks": {
     "01_Kick.wav": [
@@ -103,11 +103,11 @@
    "zip": "Avalon_AllIKnow.zip",
    "seconds": 28.67,
    "group_gain": {
-    "drums": 0.4110745462101985,
-    "bass": 0.2556824191550535,
-    "guitar": 0.38050324087564213,
-    "keys": 0.18337237382058158,
-    "vocals": 0.5353479215937558
+    "drums": 0.4110745780981317,
+    "bass": 0.2556824570872291,
+    "guitar": 0.3805032886109692,
+    "keys": 0.18337238791207408,
+    "vocals": 0.5353480300624648
    },
    "tracks": {
     "01_Kick.wav": [
@@ -186,10 +186,10 @@
    "zip": "Diesel13_Roar.zip",
    "seconds": 31.49,
    "group_gain": {
-    "drums": 0.7149927414734566,
-    "bass": 0.5374507025134573,
-    "guitar": 0.5166320408125914,
-    "vocals": 0.3556734743056026
+    "drums": 0.7149927807633467,
+    "bass": 0.5374507680372339,
+    "guitar": 0.5166320949882909,
+    "vocals": 0.3556735122526797
    },
    "tracks": {
     "01_Kick.wav": [
@@ -269,47 +269,47 @@
     ],
     "16_LeadVox.wav": [
      "vocals",
-     0.355673,
+     0.355674,
      0.0
     ],
     "17_BackingVox1.wav": [
      "vocals",
-     0.355673,
+     0.355674,
      0.0
     ],
     "18_BackingVox1DT.wav": [
      "vocals",
-     0.355673,
+     0.355674,
      0.0
     ],
     "19_BackingVox2.wav": [
      "vocals",
-     0.355673,
+     0.355674,
      0.0
     ],
     "20_BackingVox2DT.wav": [
      "vocals",
-     0.355673,
+     0.355674,
      0.0
     ],
     "21_BackingVox3.wav": [
      "vocals",
-     0.355673,
+     0.355674,
      0.0
     ],
     "22_BackingVox3DT.wav": [
      "vocals",
-     0.355673,
+     0.355674,
      0.0
     ],
     "23_BackingVox4.wav": [
      "vocals",
-     0.355673,
+     0.355674,
      0.0
     ],
     "24_BackingVox4DT.wav": [
      "vocals",
-     0.355673,
+     0.355674,
      0.0
     ]
    }
@@ -318,10 +318,10 @@
    "zip": "DunningKruger_JapanSong.zip",
    "seconds": 19.22,
    "group_gain": {
-    "drums": 0.931497299785134,
-    "bass": 0.35584139583046437,
-    "guitar": 0.2846253408148667,
-    "vocals": 0.6307204059623399
+    "drums": 0.9314972500571127,
+    "bass": 0.3558413684873571,
+    "guitar": 0.2846252961894298,
+    "vocals": 0.6307203510364503
    },
    "tracks": {
     "01_Kick render 001.wav": [
@@ -392,10 +392,10 @@
    "zip": "HeadwoundHarry_XXXV.zip",
    "seconds": 20.47,
    "group_gain": {
-    "drums": 0.7335066154393798,
-    "bass": 0.4668010520413736,
-    "guitar": 0.6571933847712893,
-    "vocals": 7.002101754908055
+    "drums": 0.7335066856505579,
+    "bass": 0.46680106646171987,
+    "guitar": 0.6571933891584142,
+    "vocals": 7.0021022777071105
    },
    "tracks": {
     "01_Kick.wav": [
@@ -479,10 +479,10 @@
    "zip": "HowToKillAConversation_Mute.zip",
    "seconds": 29.05,
    "group_gain": {
-    "drums": 2.216346239154875,
-    "bass": 0.37107294318037953,
-    "guitar": 0.37943082797276956,
-    "vocals": 3.6628531537525686
+    "drums": 2.2163461898209453,
+    "bass": 0.37107295906979626,
+    "guitar": 0.3794308073363269,
+    "vocals": 3.6628532459636767
    },
    "tracks": {
     "01_Kick.wav": [
@@ -551,11 +551,11 @@
    "zip": "ImpossibleColours_TheTruth.zip",
    "seconds": 36.07,
    "group_gain": {
-    "drums": 1.5794949780555632,
-    "bass": 0.47058556063385554,
-    "guitar": 2.515764052653102,
-    "keys": 0.519472932430682,
-    "vocals": 0.6601409233874144
+    "drums": 1.5794952478074193,
+    "bass": 0.4705856089239559,
+    "guitar": 2.5157644047854912,
+    "keys": 0.5194730425669393,
+    "vocals": 0.6601410370786968
    },
    "tracks": {
     "01_Kick.wav": [
@@ -669,12 +669,12 @@
    "zip": "JetB_ToTheWolves.zip",
    "seconds": 26.36,
    "group_gain": {
-    "drums": 0.6280161105727542,
-    "bass": 0.18098641494791246,
-    "keys": 0.7173951434802575,
-    "guitar": 0.3116529501523191,
-    "vocals": 0.4920282090597093,
-    "other": 0.10355591814735512
+    "drums": 0.6280161185515858,
+    "bass": 0.18098642702037598,
+    "keys": 0.717395204038693,
+    "guitar": 0.3116529589593176,
+    "vocals": 0.4920282369796823,
+    "other": 0.1035559259344591
    },
    "tracks": {
     "01_KickIn.wav": [
@@ -778,10 +778,10 @@
    "zip": "JuanitaDientesVerdes_PlacidoDomingo.zip",
    "seconds": 22.06,
    "group_gain": {
-    "drums": 1.4792109572674321,
-    "bass": 0.572863185232606,
-    "guitar": 0.9047961670808226,
-    "vocals": 1.55448962953223
+    "drums": 1.4792108753449411,
+    "bass": 0.5728631390542348,
+    "guitar": 0.9047960535354741,
+    "vocals": 1.5544896089699731
    },
    "tracks": {
     "01_Kick.wav": [
@@ -845,11 +845,11 @@
    "zip": "ManAboutADog_MaggieMay.zip",
    "seconds": 28.54,
    "group_gain": {
-    "drums": 0.9517690404266355,
-    "bass": 0.7340078954464448,
-    "guitar": 0.37725917172645557,
-    "keys": 1.2338148062830991,
-    "vocals": 1.895413010870576
+    "drums": 0.9517691775977876,
+    "bass": 0.7340080227303415,
+    "guitar": 0.3772592254650808,
+    "keys": 1.233814961334121,
+    "vocals": 1.895413291447063
    },
    "tracks": {
     "01_Kick.wav": [
@@ -919,11 +919,11 @@
    "zip": "Mistrusted_Polemic.zip",
    "seconds": 28.24,
    "group_gain": {
-    "drums": 0.636701741796404,
-    "bass": 0.7215258308684838,
-    "guitar": 0.3030179370156794,
-    "other": 1.0839068295598986,
-    "vocals": 0.6417718067698621
+    "drums": 0.6367017780978502,
+    "bass": 0.7215259142257616,
+    "guitar": 0.3030179323280202,
+    "other": 1.083906870358577,
+    "vocals": 0.6417718733166207
    },
    "tracks": {
     "01_Kick.wav": [
@@ -1027,10 +1027,10 @@
    "zip": "NeonHornet_TakeItOff.zip",
    "seconds": 28.83,
    "group_gain": {
-    "drums": 0.6212678753627617,
-    "bass": 0.8926999770153873,
-    "guitar": 0.5774756664622451,
-    "vocals": 0.8217972896381464
+    "drums": 0.6212678898069371,
+    "bass": 0.8927000103006597,
+    "guitar": 0.5774756303526319,
+    "vocals": 0.8217972753079312
    },
    "tracks": {
     "01_Kick.wav": [
@@ -1094,11 +1094,11 @@
    "zip": "PeterWhite_TheBluesIsALady.zip",
    "seconds": 34.19,
    "group_gain": {
-    "drums": 1.2212798437081869,
-    "bass": 0.6396262937110542,
-    "guitar": 0.14856809566109394,
-    "keys": 0.44280625709658317,
-    "vocals": 0.42189072980129416
+    "drums": 1.221279926990071,
+    "bass": 0.6396263262609193,
+    "guitar": 0.14856809280501726,
+    "keys": 0.44280628205572775,
+    "vocals": 0.42189077323600727
    },
    "tracks": {
     "01_Kick.wav": [
@@ -1212,11 +1212,11 @@
    "zip": "PurpleHatMob_AccessDenied.zip",
    "seconds": 21.85,
    "group_gain": {
-    "drums": 0.5336315244113579,
-    "bass": 0.4525942663756004,
-    "guitar": 0.29290467799531167,
-    "other": 0.4558138308965926,
-    "vocals": 0.6689561807278886
+    "drums": 0.5336315494051074,
+    "bass": 0.4525942897326074,
+    "guitar": 0.29290467487835353,
+    "other": 0.45581386310840855,
+    "vocals": 0.6689562453409624
    },
    "tracks": {
     "01_Kick.wav": [
@@ -1300,11 +1300,11 @@
    "zip": "StreetNoise_YouAreTheOne.zip",
    "seconds": 18.0,
    "group_gain": {
-    "drums": 1.5930761314090685,
-    "bass": 1.9748177713521613,
-    "guitar": 2.113603210414581,
-    "vocals": 1.9029755789839549,
-    "keys": 2.016624437489388
+    "drums": 1.5930760757449354,
+    "bass": 1.974817661132185,
+    "guitar": 2.1136031437429907,
+    "vocals": 1.902975546827621,
+    "keys": 2.016624481373903
    },
    "tracks": {
     "01_Kick.wav": [
@@ -1383,10 +1383,10 @@
    "zip": "TheBlackCrown_Cage.zip",
    "seconds": 36.22,
    "group_gain": {
-    "drums": 1.0111892468159933,
-    "bass": 0.15361309006398846,
-    "guitar": 0.36795698595421383,
-    "vocals": 0.7616160497218961
+    "drums": 1.0111891482667654,
+    "bass": 0.15361307340051195,
+    "guitar": 0.3679569366016822,
+    "vocals": 0.7616160116213381
    },
    "tracks": {
     "01_Kick.wav": [
@@ -1485,10 +1485,10 @@
    "zip": "Wires_RedOnYou.zip",
    "seconds": 25.13,
    "group_gain": {
-    "drums": 1.2512208166413208,
-    "bass": 0.6455132654131204,
-    "guitar": 0.7587916440852664,
-    "vocals": 1.1505556841909923
+    "drums": 1.2512207880755903,
+    "bass": 0.6455132568671891,
+    "guitar": 0.7587915952261792,
+    "vocals": 1.1505556607938612
    },
    "tracks": {
     "01_Kick.wav": [
@@ -1572,10 +1572,10 @@
    "zip": "Woodfire_GetFooled.zip",
    "seconds": 39.09,
    "group_gain": {
-    "drums": 0.740469942441523,
-    "bass": 0.40474687047519153,
-    "guitar": 0.5821835562218405,
-    "vocals": 1.0315884550296588
+    "drums": 0.7404699670338736,
+    "bass": 0.4047468994184033,
+    "guitar": 0.5821835903726612,
+    "vocals": 1.0315884603060845
    },
    "tracks": {
     "01_Kick.wav": [
@@ -1646,6 +1646,1507 @@
     "14_BackingVox.wav": [
      "vocals",
      1.031588,
+     0.0
+    ]
+   }
+  },
+  "EndaReilly_CurAnLongAgSeol": {
+   "zip": "EndaReilly_CurAnLongAgSeol_Full.zip",
+   "seconds": 186.99,
+   "group_gain": {
+    "drums": 0.736633237836416,
+    "bass": 0.2628791306906635,
+    "guitar": 0.8463283872591584,
+    "other": 0.1942778679886016,
+    "vocals": 0.6679819598132136
+   },
+   "tracks": {
+    "01_DrumMic1.wav": [
+     "drums",
+     0.736633,
+     0.0
+    ],
+    "02_DrumMic2.wav": [
+     "drums",
+     0.736633,
+     0.0
+    ],
+    "03_Brushes.wav": [
+     "drums",
+     0.736633,
+     null
+    ],
+    "04_BassMic1.wav": [
+     "bass",
+     0.262879,
+     0.0
+    ],
+    "05_BassMic2.wav": [
+     "bass",
+     0.262879,
+     0.0
+    ],
+    "06_AcousticGtr.wav": [
+     "guitar",
+     0.846328,
+     0.0
+    ],
+    "07_MandolinMic1.wav": [
+     "other",
+     0.194278,
+     0.0
+    ],
+    "08_MandolinMic2.wav": [
+     "other",
+     0.194278,
+     0.0
+    ],
+    "09_Fiddle1.wav": [
+     "other",
+     0.194278,
+     0.0
+    ],
+    "10_Fiddle2.wav": [
+     "other",
+     0.194278,
+     0.0
+    ],
+    "11_Accordion.wav": [
+     "other",
+     0.194278,
+     0.0
+    ],
+    "12_LeadVox.wav": [
+     "vocals",
+     0.667982,
+     0.0
+    ]
+   }
+  },
+  "TheLongWait_DarkHorses": {
+   "zip": "TheLongWait_DarkHorses_Full.zip",
+   "seconds": 293.72,
+   "group_gain": {
+    "drums": 1.1404401472134333,
+    "bass": 0.7506781524072154,
+    "guitar": 0.20247452983839623,
+    "vocals": 0.4874453881473588
+   },
+   "tracks": {
+    "01_Kick.wav": [
+     "drums",
+     1.14044,
+     0.0
+    ],
+    "02_Snare.wav": [
+     "drums",
+     1.14044,
+     0.0
+    ],
+    "03_Overheads.wav": [
+     "drums",
+     1.14044,
+     null
+    ],
+    "04_DrumsRoom.wav": [
+     "drums",
+     1.14044,
+     0.0
+    ],
+    "05_Bass.wav": [
+     "bass",
+     0.750678,
+     0.0
+    ],
+    "06_AcGtr.wav": [
+     "guitar",
+     0.202475,
+     null
+    ],
+    "07_ElecGtr1Mic1.wav": [
+     "guitar",
+     0.202475,
+     -0.6
+    ],
+    "08_ElecGtr1Mic2.wav": [
+     "guitar",
+     0.202475,
+     -0.6
+    ],
+    "09_ElecGtr2Mic1.wav": [
+     "guitar",
+     0.202475,
+     0.6
+    ],
+    "10_ElecGtr2Mic2.wav": [
+     "guitar",
+     0.202475,
+     0.6
+    ],
+    "11_ElecGtr3Mic1.wav": [
+     "guitar",
+     0.202475,
+     -0.6
+    ],
+    "12_ElecGtr3Mic2.wav": [
+     "guitar",
+     0.202475,
+     -0.6
+    ],
+    "13_ElecGtr4Mic1.wav": [
+     "guitar",
+     0.202475,
+     0.6
+    ],
+    "14_ElecGtr4Mic2.wav": [
+     "guitar",
+     0.202475,
+     0.6
+    ],
+    "15_LeadVox.wav": [
+     "vocals",
+     0.487445,
+     0.0
+    ],
+    "16_LeadVoxDT.wav": [
+     "vocals",
+     0.487445,
+     0.0
+    ],
+    "17_BackingVox01.wav": [
+     "vocals",
+     0.487445,
+     0.0
+    ],
+    "18_BackingVox02.wav": [
+     "vocals",
+     0.487445,
+     0.0
+    ]
+   }
+  },
+  "JulietsRescue_Heartbeats": {
+   "zip": "JulietsRescue_Heartbeats_Full.zip",
+   "seconds": 267.65,
+   "group_gain": {
+    "drums": 0.416010867542013,
+    "bass": 0.5138851843463264,
+    "guitar": 0.31108261034525403,
+    "other": 0.26458842026879803,
+    "vocals": 0.8703906028792333
+   },
+   "tracks": {
+    "01_Kick1.wav": [
+     "drums",
+     0.416011,
+     null
+    ],
+    "02_Kick2In.wav": [
+     "drums",
+     0.416011,
+     0.0
+    ],
+    "03_Kick2Out.wav": [
+     "drums",
+     0.416011,
+     0.0
+    ],
+    "04_Kick2Sub.wav": [
+     "drums",
+     0.416011,
+     0.0
+    ],
+    "05_Snare1.wav": [
+     "drums",
+     0.416011,
+     null
+    ],
+    "06_Snare2Over.wav": [
+     "drums",
+     0.416011,
+     0.0
+    ],
+    "07_Snare2Under.wav": [
+     "drums",
+     0.416011,
+     0.0
+    ],
+    "08_Snare2Squash.wav": [
+     "drums",
+     0.416011,
+     0.0
+    ],
+    "09_Hat1.wav": [
+     "drums",
+     0.416011,
+     null
+    ],
+    "10_Hat2.wav": [
+     "drums",
+     0.416011,
+     null
+    ],
+    "11_Hat3.wav": [
+     "drums",
+     0.416011,
+     null
+    ],
+    "12_Tom1.wav": [
+     "drums",
+     0.416011,
+     null
+    ],
+    "13_Tom2.wav": [
+     "drums",
+     0.416011,
+     null
+    ],
+    "14_Cymbals.wav": [
+     "drums",
+     0.416011,
+     null
+    ],
+    "15_Overheads.wav": [
+     "drums",
+     0.416011,
+     null
+    ],
+    "16_DrumsRoom.wav": [
+     "drums",
+     0.416011,
+     null
+    ],
+    "17_BassDI.wav": [
+     "bass",
+     0.513885,
+     0.0
+    ],
+    "18_BassAmp.wav": [
+     "bass",
+     0.513885,
+     null
+    ],
+    "19_BassSlideDI.wav": [
+     "bass",
+     0.513885,
+     0.0
+    ],
+    "20_BassSlideAmp.wav": [
+     "bass",
+     0.513885,
+     0.0
+    ],
+    "21_ElecGtr01.wav": [
+     "guitar",
+     0.311083,
+     -0.6
+    ],
+    "22_ElecGtr02.wav": [
+     "guitar",
+     0.311083,
+     0.6
+    ],
+    "23_ElecGtr03.wav": [
+     "guitar",
+     0.311083,
+     -0.6
+    ],
+    "24_ElecGtr04.wav": [
+     "guitar",
+     0.311083,
+     0.6
+    ],
+    "25_ElecGtr05.wav": [
+     "guitar",
+     0.311083,
+     -0.6
+    ],
+    "26_ElecGtr06.wav": [
+     "guitar",
+     0.311083,
+     0.6
+    ],
+    "27_ElecGtr07.wav": [
+     "guitar",
+     0.311083,
+     -0.6
+    ],
+    "28_ElecGtr08.wav": [
+     "guitar",
+     0.311083,
+     0.6
+    ],
+    "29_ElecGtr09.wav": [
+     "guitar",
+     0.311083,
+     -0.6
+    ],
+    "30_ElecGtr10.wav": [
+     "guitar",
+     0.311083,
+     0.6
+    ],
+    "31_ElecGtr11.wav": [
+     "guitar",
+     0.311083,
+     -0.6
+    ],
+    "32_ElecGtr12.wav": [
+     "guitar",
+     0.311083,
+     0.6
+    ],
+    "33_Synth01.wav": [
+     "other",
+     0.264588,
+     null
+    ],
+    "34_Synth02.wav": [
+     "other",
+     0.264588,
+     null
+    ],
+    "35_Synth03.wav": [
+     "other",
+     0.264588,
+     null
+    ],
+    "36_Synth04.wav": [
+     "other",
+     0.264588,
+     null
+    ],
+    "37_Synth05.wav": [
+     "other",
+     0.264588,
+     null
+    ],
+    "38_Synth06.wav": [
+     "other",
+     0.264588,
+     null
+    ],
+    "39_Synth07.wav": [
+     "other",
+     0.264588,
+     null
+    ],
+    "40_Synth08.wav": [
+     "other",
+     0.264588,
+     null
+    ],
+    "41_Synth09.wav": [
+     "other",
+     0.264588,
+     null
+    ],
+    "42_LeadVox1.wav": [
+     "vocals",
+     0.870391,
+     0.0
+    ],
+    "43_LeadVox2.wav": [
+     "vocals",
+     0.870391,
+     0.0
+    ],
+    "44_BackingVox1.wav": [
+     "vocals",
+     0.870391,
+     0.0
+    ],
+    "45_BackingVox2.wav": [
+     "vocals",
+     0.870391,
+     0.0
+    ]
+   }
+  },
+  "MR0908_AlJames": {
+   "zip": "MR0908_AlJames_Full.zip",
+   "seconds": 200.53,
+   "group_gain": {
+    "drums": 0.3700982899402037,
+    "other": 0.1958211130554842,
+    "bass": 0.42378693662257866,
+    "keys": 0.24768763617088443,
+    "guitar": 0.17352472090157245,
+    "vocals": 0.3250057276105958
+   },
+   "tracks": {
+    "01_Kick.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "02_Snare1.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "03_Snare2.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "04_Snare3.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "05_Sidestick.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "06_Claps.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "07_HiHat1.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "08_HiHat2.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "09_HiHat3.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "10_Ride1.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "11_Ride2.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "12_Tom1.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "13_Tom2.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "14_Tom3.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "15_Tom4.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "16_Tom5.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "17_Cymbal1Reverse.wav": [
+     "drums",
+     0.370098,
+     null
+    ],
+    "18_Cymbal2.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "19_Cymbal3.wav": [
+     "drums",
+     0.370098,
+     0.0
+    ],
+    "20_Loop.wav": [
+     "other",
+     0.195821,
+     null
+    ],
+    "21_Tambourine.wav": [
+     "drums",
+     0.370098,
+     null
+    ],
+    "22_Bass.wav": [
+     "bass",
+     0.423787,
+     0.0
+    ],
+    "23_Piano1Reverse.wav": [
+     "keys",
+     0.247688,
+     null
+    ],
+    "24_Piano2.wav": [
+     "keys",
+     0.247688,
+     null
+    ],
+    "25_SchoolBell.wav": [
+     "other",
+     0.195821,
+     null
+    ],
+    "26_ElecGtr1.wav": [
+     "guitar",
+     0.173525,
+     null
+    ],
+    "27_ElecGtr2MIDI.wav": "skip",
+    "28_ElecGtr3MIDI.wav": "skip",
+    "29_ElecGtr4.wav": [
+     "guitar",
+     0.173525,
+     null
+    ],
+    "30_ElecGtr5.wav": [
+     "guitar",
+     0.173525,
+     null
+    ],
+    "31_AcGtr1.wav": [
+     "guitar",
+     0.173525,
+     null
+    ],
+    "32_AcGtr2.wav": [
+     "guitar",
+     0.173525,
+     null
+    ],
+    "33_Strings.wav": [
+     "other",
+     0.195821,
+     null
+    ],
+    "34_StringsPizz.wav": [
+     "other",
+     0.195821,
+     null
+    ],
+    "35_Synth1.wav": [
+     "other",
+     0.195821,
+     null
+    ],
+    "36_Synth2.wav": [
+     "other",
+     0.195821,
+     null
+    ],
+    "37_Synth3.wav": [
+     "other",
+     0.195821,
+     null
+    ],
+    "38_Synth4.wav": [
+     "other",
+     0.195821,
+     null
+    ],
+    "39_LeadVox1.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "40_LeadVox2.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "41_LeadVoxDT.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "42_BackingVox01.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "43_BackingVox02.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "44_BackingVox03.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "45_BackingVox04.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "46_BackingVox05.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "47_BackingVox06.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "48_BackingVox07.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "49_BackingVox08.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "50_BackingVox09.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "51_BackingVox10.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "52_BackingVox11.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "53_BackingVox12.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "54_BackingVox13.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "55_BackingVox14.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "56_BackingVox15.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "57_BackingVox16.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "58_BackingVox17.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "59_BackingVox18.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "60_BackingVox19.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "61_BackingVox20.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ],
+    "62_BackingVox21.wav": [
+     "vocals",
+     0.325006,
+     0.0
+    ]
+   }
+  },
+  "BenCarrigan_WellTalkAboutItAllTonight": {
+   "zip": "BenCarrigan_WellTalkAboutItAllTonight_Full.zip",
+   "seconds": 254.91,
+   "group_gain": {
+    "drums": 0.45482123784704714,
+    "bass": 0.4264446038698276,
+    "guitar": 0.3937637493299142,
+    "keys": 0.17779614105415856,
+    "other": 0.10749332567774332,
+    "vocals": 0.40994117282938386
+   },
+   "tracks": {
+    "01_DrumMachine.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "02_Kick.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "03_KickSample.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "04_Snare.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "05_SnareSample1.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "06_SnareSample2.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "07_HiHat.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "08_Tom1.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "09_Tom2.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "10_Cymbal.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "11_CymbalSample1.wav": [
+     "drums",
+     0.454821,
+     null
+    ],
+    "12_CymbalSample2.wav": [
+     "drums",
+     0.454821,
+     null
+    ],
+    "13_DrumsRoom.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "14_Shaker.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "15_SleighBells.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "16_Tambourine.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "17_Hand Claps.wav": [
+     "drums",
+     0.454821,
+     0.0
+    ],
+    "18_Bass.wav": [
+     "bass",
+     0.426445,
+     0.0
+    ],
+    "19_AcousticGtr1.wav": [
+     "guitar",
+     0.393764,
+     null
+    ],
+    "20_AcousticGtr2.wav": [
+     "guitar",
+     0.393764,
+     -0.6
+    ],
+    "21_Rhythm Gtr.wav": [
+     "guitar",
+     0.393764,
+     null
+    ],
+    "22_Piano.wav": [
+     "keys",
+     0.177796,
+     null
+    ],
+    "23_Organ.wav": [
+     "keys",
+     0.177796,
+     0.0
+    ],
+    "24_Keyboard.wav": [
+     "keys",
+     0.177796,
+     0.0
+    ],
+    "25_PianoSFX.wav": [
+     "keys",
+     0.177796,
+     null
+    ],
+    "26_Glockenspiel.wav": [
+     "other",
+     0.107493,
+     null
+    ],
+    "27_Violin1.wav": [
+     "other",
+     0.107493,
+     0.0
+    ],
+    "28_Violin2.wav": [
+     "other",
+     0.107493,
+     0.0
+    ],
+    "29_Viola.wav": [
+     "other",
+     0.107493,
+     0.0
+    ],
+    "30_Cello.wav": [
+     "other",
+     0.107493,
+     0.0
+    ],
+    "31_StringsMix.wav": [
+     "other",
+     0.107493,
+     null
+    ],
+    "32_StringsTunedMix.wav": [
+     "other",
+     0.107493,
+     null
+    ],
+    "33_ViolinSamples.wav": [
+     "other",
+     0.107493,
+     null
+    ],
+    "34_ViolaSamples.wav": [
+     "other",
+     0.107493,
+     null
+    ],
+    "35_CelloSamples1.wav": [
+     "other",
+     0.107493,
+     null
+    ],
+    "36_CelloSamples2.wav": [
+     "other",
+     0.107493,
+     null
+    ],
+    "37_TrumpetSamples.wav": [
+     "other",
+     0.107493,
+     null
+    ],
+    "38_FrenchHornSamples.wav": [
+     "other",
+     0.107493,
+     null
+    ],
+    "39_Harmonica.wav": [
+     "other",
+     0.107493,
+     0.0
+    ],
+    "40_Lead Vox.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ],
+    "41_BackingVox1.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ],
+    "42_BackingVox2.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ],
+    "43_BackingVox3.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ],
+    "44_BackingVox4.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ],
+    "45_BackingVox5.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ],
+    "46_BackingVox6.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ],
+    "47_BackingVox4.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ],
+    "48_BackingVox7.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ],
+    "49_BackingVox8.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ],
+    "50_BackingVox7.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ],
+    "51_BackingVox8.wav": [
+     "vocals",
+     0.409941,
+     0.0
+    ]
+   }
+  },
+  "AngelsInAmplifiers_ImAlright": {
+   "zip": "AngelsInAmplifiers_ImAlright_Full.zip",
+   "seconds": 179.58,
+   "group_gain": {
+    "drums": 1.1002121884010294,
+    "bass": 0.6642258854341093,
+    "keys": 0.8532711829923542,
+    "guitar": 1.2799143315169548,
+    "vocals": 0.8679736987115275
+   },
+   "tracks": {
+    "01_Kick.wav": [
+     "drums",
+     1.100212,
+     0.0
+    ],
+    "02_Snare.wav": [
+     "drums",
+     1.100212,
+     0.0
+    ],
+    "03_Overheads.wav": [
+     "drums",
+     1.100212,
+     null
+    ],
+    "04_Toms.wav": [
+     "drums",
+     1.100212,
+     null
+    ],
+    "05_Percussion.wav": [
+     "drums",
+     1.100212,
+     null
+    ],
+    "06_Bass.wav": [
+     "bass",
+     0.664226,
+     0.0
+    ],
+    "07_Piano.wav": [
+     "keys",
+     0.853271,
+     0.0
+    ],
+    "08_ElecGtr.wav": [
+     "guitar",
+     1.279914,
+     -0.6
+    ],
+    "09_AcGtr1.wav": [
+     "guitar",
+     1.279914,
+     0.6
+    ],
+    "10_AcGtr2.wav": [
+     "guitar",
+     1.279914,
+     -0.6
+    ],
+    "11_LeadVox.wav": [
+     "vocals",
+     0.867974,
+     0.0
+    ],
+    "12_BackingVox1.wav": [
+     "vocals",
+     0.867974,
+     0.0
+    ],
+    "13_BackingVox2.wav": [
+     "vocals",
+     0.867974,
+     0.0
+    ]
+   }
+  },
+  "Forkupines_Semantics": {
+   "zip": "Forkupines_Semantics_Full.zip",
+   "seconds": 273.59,
+   "group_gain": {
+    "drums": 0.32004704814217955,
+    "bass": 0.21951231700613885,
+    "guitar": 0.14826199560500977,
+    "vocals": 0.7674700534339691
+   },
+   "tracks": {
+    "01_KickTrigger1.wav": [
+     "drums",
+     0.320047,
+     0.0
+    ],
+    "02_KickTrigger2.wav": [
+     "drums",
+     0.320047,
+     0.0
+    ],
+    "03_SnareUp.wav": [
+     "drums",
+     0.320047,
+     0.0
+    ],
+    "04_SnareDown.wav": [
+     "drums",
+     0.320047,
+     0.0
+    ],
+    "05_HiHat.wav": [
+     "drums",
+     0.320047,
+     0.0
+    ],
+    "06_Overheads.wav": [
+     "drums",
+     0.320047,
+     null
+    ],
+    "07_OverheadsTriggers.wav": [
+     "drums",
+     0.320047,
+     null
+    ],
+    "08_DrumsRoom.wav": [
+     "drums",
+     0.320047,
+     0.0
+    ],
+    "09_DrumsRoomTriggers.wav": [
+     "drums",
+     0.320047,
+     0.0
+    ],
+    "10_Tom1Trigger.wav": [
+     "drums",
+     0.320047,
+     0.0
+    ],
+    "11_Tom2Trigger.wav": [
+     "drums",
+     0.320047,
+     0.0
+    ],
+    "12_Tom3Trigger.wav": [
+     "drums",
+     0.320047,
+     0.0
+    ],
+    "13_Bass1DI.wav": [
+     "bass",
+     0.219512,
+     0.0
+    ],
+    "14_Bass1Amp.wav": [
+     "bass",
+     0.219512,
+     0.0
+    ],
+    "15_Bass2DI.wav": [
+     "bass",
+     0.219512,
+     0.0
+    ],
+    "16_Bass2Amp.wav": [
+     "bass",
+     0.219512,
+     0.0
+    ],
+    "17_Bass3DI.wav": [
+     "bass",
+     0.219512,
+     0.0
+    ],
+    "18_Bass3Amp.wav": [
+     "bass",
+     0.219512,
+     0.0
+    ],
+    "19_ElecGtr01.wav": [
+     "guitar",
+     0.148262,
+     -0.6
+    ],
+    "20_ElecGtr01DT.wav": [
+     "guitar",
+     0.148262,
+     0.6
+    ],
+    "21_ElecGtr02.wav": [
+     "guitar",
+     0.148262,
+     -0.6
+    ],
+    "22_ElecGtr02DT.wav": [
+     "guitar",
+     0.148262,
+     0.6
+    ],
+    "23_ElecGtr03DI.wav": "skip",
+    "24_ElecGtr03Amp.wav": [
+     "guitar",
+     0.148262,
+     -0.6
+    ],
+    "25_ElecGtr04.wav": [
+     "guitar",
+     0.148262,
+     0.6
+    ],
+    "26_ElecGtr04DT.wav": [
+     "guitar",
+     0.148262,
+     -0.6
+    ],
+    "27_ElecGtr05DI.wav": "skip",
+    "28_ElecGtr05Amp.wav": [
+     "guitar",
+     0.148262,
+     0.6
+    ],
+    "29_ElecGtr06.wav": [
+     "guitar",
+     0.148262,
+     -0.6
+    ],
+    "30_ElecGtr07.wav": [
+     "guitar",
+     0.148262,
+     0.6
+    ],
+    "31_ElecGtr08DI.wav": "skip",
+    "32_ElecGtr08Amp.wav": [
+     "guitar",
+     0.148262,
+     null
+    ],
+    "33_ElecGtr09DI.wav": "skip",
+    "34_ElecGtr09Amp.wav": [
+     "guitar",
+     0.148262,
+     null
+    ],
+    "35_ElecGtr10.wav": [
+     "guitar",
+     0.148262,
+     null
+    ],
+    "36_ElecGtr11.wav": [
+     "guitar",
+     0.148262,
+     -0.6
+    ],
+    "37_ElecGtr11DT.wav": [
+     "guitar",
+     0.148262,
+     0.6
+    ],
+    "38_ElecGtr12.wav": [
+     "guitar",
+     0.148262,
+     null
+    ],
+    "39_AcousticGtrMic1.wav": [
+     "guitar",
+     0.148262,
+     -0.6
+    ],
+    "40_AcousticGtrMic2.wav": [
+     "guitar",
+     0.148262,
+     -0.6
+    ],
+    "41_LeadVox1.wav": [
+     "vocals",
+     0.76747,
+     0.0
+    ],
+    "42_LeadVox2.wav": [
+     "vocals",
+     0.76747,
+     0.0
+    ],
+    "43_BackingVox1.wav": [
+     "vocals",
+     0.76747,
+     0.0
+    ],
+    "44_BackingVox1DT.wav": [
+     "vocals",
+     0.76747,
+     0.0
+    ],
+    "45_BackingVox2.wav": [
+     "vocals",
+     0.76747,
+     0.0
+    ],
+    "46_BackingVox2DT.wav": [
+     "vocals",
+     0.76747,
+     0.0
+    ],
+    "47_BackingVox3.wav": [
+     "vocals",
+     0.76747,
+     0.0
+    ],
+    "48_BackingVox3DT.wav": [
+     "vocals",
+     0.76747,
+     0.0
+    ]
+   }
+  },
+  "MR1107_SigneJakobsen": {
+   "zip": "MR1107_SigneJakobsen_Full.zip",
+   "seconds": 177.4,
+   "group_gain": {
+    "drums": 0.7508347408765303,
+    "bass": 0.6466338661095122,
+    "guitar": 0.14902706400775115,
+    "keys": 0.1686141747472352,
+    "other": 1.3454826166861724,
+    "vocals": 0.5536105193920493
+   },
+   "tracks": {
+    "01_Kick.wav": [
+     "drums",
+     0.750835,
+     0.0
+    ],
+    "02_SnareUp.wav": [
+     "drums",
+     0.750835,
+     0.0
+    ],
+    "03_SnareDown.wav": [
+     "drums",
+     0.750835,
+     0.0
+    ],
+    "04_Hihat.wav": [
+     "drums",
+     0.750835,
+     0.0
+    ],
+    "05_Overheads.wav": [
+     "drums",
+     0.750835,
+     null
+    ],
+    "06_Tom1.wav": [
+     "drums",
+     0.750835,
+     0.0
+    ],
+    "07_Tom2.wav": [
+     "drums",
+     0.750835,
+     0.0
+    ],
+    "08_Shaker1.wav": [
+     "drums",
+     0.750835,
+     0.0
+    ],
+    "09_Shaker2.wav": [
+     "drums",
+     0.750835,
+     0.0
+    ],
+    "10_Bass.wav": [
+     "bass",
+     0.646634,
+     0.0
+    ],
+    "11_ElecGtr01.wav": [
+     "guitar",
+     0.149027,
+     -0.6
+    ],
+    "12_ElecGtr02.wav": [
+     "guitar",
+     0.149027,
+     0.6
+    ],
+    "13_ElecGtr03.wav": [
+     "guitar",
+     0.149027,
+     -0.6
+    ],
+    "14_ElecGtr04.wav": [
+     "guitar",
+     0.149027,
+     0.6
+    ],
+    "15_ElecGtr05.wav": [
+     "guitar",
+     0.149027,
+     -0.6
+    ],
+    "16_ElecGtr06.wav": [
+     "guitar",
+     0.149027,
+     0.6
+    ],
+    "17_ElecGtr07.wav": [
+     "guitar",
+     0.149027,
+     -0.6
+    ],
+    "18_ElecGtr08.wav": [
+     "guitar",
+     0.149027,
+     0.6
+    ],
+    "19_ElecGtr09.wav": [
+     "guitar",
+     0.149027,
+     -0.6
+    ],
+    "20_ElecGtr10.wav": [
+     "guitar",
+     0.149027,
+     0.6
+    ],
+    "21_MIDIElecGtr1.wav": [
+     "guitar",
+     0.149027,
+     -0.6
+    ],
+    "22_MIDIElecGtr2.wav": [
+     "guitar",
+     0.149027,
+     0.6
+    ],
+    "23_Piano1.wav": [
+     "keys",
+     0.168614,
+     null
+    ],
+    "24_Piano2.wav": [
+     "keys",
+     0.168614,
+     null
+    ],
+    "25_StringPad.wav": [
+     "other",
+     1.345483,
+     null
+    ],
+    "26_Organ.wav": [
+     "keys",
+     0.168614,
+     null
+    ],
+    "27_LeadVox1.wav": [
+     "vocals",
+     0.553611,
+     0.0
+    ],
+    "28_LeadVox2.wav": [
+     "vocals",
+     0.553611,
+     0.0
+    ],
+    "29_LeadVox2DT.wav": [
+     "vocals",
+     0.553611,
+     0.0
+    ],
+    "30_BackingVox1.wav": [
+     "vocals",
+     0.553611,
+     0.0
+    ],
+    "31_BackingVox2.wav": [
+     "vocals",
+     0.553611,
+     0.0
+    ],
+    "32_BackingVox3.wav": [
+     "vocals",
+     0.553611,
+     0.0
+    ],
+    "33_BackingVox4.wav": [
+     "vocals",
+     0.553611,
+     0.0
+    ],
+    "34_BackingVox5.wav": [
+     "vocals",
+     0.553611,
+     0.0
+    ],
+    "35_BackingVox6.wav": [
+     "vocals",
+     0.553611,
      0.0
     ]
    }

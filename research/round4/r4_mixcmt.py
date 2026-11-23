@@ -59,23 +59,26 @@ for f in files:
     b = os.path.basename(f); g = ov.get(b, classify(b))
     tracks.append({'file': b, 'group': g, 'path': f})
 gtr = [t for t in tracks if t['group'] == 'guitar']
-if any(not re.search(r'\bdi\b|di$|di\d|_di', os.path.splitext(t['file'])[0].lower()) for t in gtr):
+if any(not re.search(r'(?<!MI)DI(?![a-z])', os.path.splitext(t['file'])[0]) for t in gtr):
     for t in gtr:
-        if t['file'] not in ov and re.search(r'(?<![a-z])di(?![a-z])|di$', re.sub(r'^\d+_', '', os.path.splitext(t['file'])[0]).lower()):
+        if t['file'] not in ov and re.search(r'(?<!MI)(?<![A-Za-z]i)DI(?![a-z])|(?<![A-Za-z])di(?![a-z])', os.path.splitext(t['file'])[0]):
             t['group'] = 'skip'; t['why'] = 'guitar DI with a non-DI guitar present'
-audio = {}
-for t in tracks:
+def load(t):
+    x, sr = sf.read(io.BytesIO(z.read(t['path'])), dtype='float32', always_2d=True); x = x.T
+    if sr != SR: g_ = gcd(SR, sr); x = resample_poly(x, SR // g_, sr // g_, axis=1).astype(np.float32)
+    t['sr'] = sr; t['channels'] = x.shape[0]; return x
+lens = {}
+for t in tracks:      # lengths first (header only), so tracks are read one at a time below
     if t['group'] == 'skip': continue
-    x, sr = sf.read(io.BytesIO(z.read(t['path'])), dtype='float64', always_2d=True); x = x.T
-    if sr != SR: g_ = gcd(SR, sr); x = resample_poly(x, SR // g_, sr // g_, axis=1)
-    t['sr'] = sr; t['channels'] = x.shape[0]; audio[t['file']] = x
-n = max(x.shape[1] for x in audio.values())
+    with z.open(t['path']) as fh: info = sf.info(fh)
+    lens[t['file']] = int(round(info.frames * SR / info.samplerate))
+n = max(lens.values())
 if a.max_s: n = min(n, int(a.max_s * SR))
 gi = 0; parts = {}; pans = {}
 part_key = lambda f: re.sub(r'mic ?\d+|\.\w+$|^\d+_', '', f.lower())   # two mics of one guitar part share a pan
 for t in tracks:
     if t['group'] == 'skip': continue
-    x = audio.pop(t['file'])[:, :n]; x = np.pad(x, ((0, 0), (0, n - x.shape[1])))
+    x = load(t)[:, :n]; x = np.pad(x, ((0, 0), (0, n - x.shape[1])))
     if x.shape[0] == 1:
         p = 0.0
         if t['group'] == 'guitar' and len([u for u in tracks if u['group'] == 'guitar']) >= 2:

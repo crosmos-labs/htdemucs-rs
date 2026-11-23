@@ -4,8 +4,10 @@
 Inference as MSST's utils.model_utils.demix in 'generic' mode: chunk_size = inference.chunk_size (20 s), step = chunk/overlap,
 linear fades of chunk/10, reflect padding of `border` at both ends, overlap-add divided by the summed window, fp32 (use_amp only
 affects CUDA). Only the mask heads for --stems are kept (the backbone is shared, so the other heads don't change these outputs).
-Attention runs in slices of 2 along the batch (bands) axis to bound memory; this is the same arithmetic.
---minus subtracts a vocals file from the input first (Kim's instrumental). Writes float32 (n_stems, 2, n) and prints a JSON line.
+On MPS, attention runs in slices of 2 along the batch (bands) axis to bound memory (MPS has no memory-efficient SDPA);
+same arithmetic. On the CPU, PyTorch's flash SDPA kernel needs no slicing. Per-chunk CPU seconds are reported so the
+rate can be quoted without the edge padding a short excerpt adds (rate = CPU per chunk × overlap / chunk seconds).
+--minus subtracts a vocals file from the input first (Kim's instrumental); --start / --dur (s) crop the input after that. Writes float32 (n_stems, 2, n) and prints a JSON line.
 """
 import argparse, json, sys, time, types
 import numpy as np, soundfile as sf, torch, yaml
@@ -16,6 +18,8 @@ for k in ('repo', 'ckpt', 'cfg', 'inp', 'out'): ap.add_argument(k)
 ap.add_argument('--stems', default='guitar,electric-guitar,acoustic-guitar'); ap.add_argument('--device', default='mps')
 ap.add_argument('--threads', type=int, default=1); ap.add_argument('--overlap', type=int, default=2)
 ap.add_argument('--chunk', type=int, default=0); ap.add_argument('--minus', default=None)
+ap.add_argument('--start', type=float, default=0); ap.add_argument('--dur', type=float, default=0)
+ap.add_argument('--attn-slice', type=int, default=-1, help='batch slice for attention; -1: 2 on MPS, none on CPU')
 a = ap.parse_args()
 torch.set_num_threads(a.threads)
 # import models.bs_roformer.bs_roformer without the package __init__ (which pulls in the conformer variants)
@@ -26,8 +30,9 @@ from models.bs_roformer.bs_roformer import BSRoformer
 from models.bs_roformer import attend as att
 
 _fwd = att.Attend.forward
-def sliced(self, q, k, v, S=2):
-    if q.shape[0] <= S: return _fwd(self, q, k, v)
+S = a.attn_slice if a.attn_slice >= 0 else (2 if a.device == 'mps' else 0)
+def sliced(self, q, k, v):
+    if not S or q.shape[0] <= S: return _fwd(self, q, k, v)
     return torch.cat([_fwd(self, q[i:i + S], k[i:i + S], v[i:i + S]) for i in range(0, q.shape[0], S)])
 att.Attend.forward = sliced
 
@@ -48,18 +53,19 @@ mix, sr = sf.read(a.inp, dtype='float32', always_2d=True); assert sr == 44100
 mix = mix.T.copy()
 if a.minus:
     v = sf.read(a.minus, dtype='float32', always_2d=True)[0].T; assert v.shape == mix.shape; mix = mix - v
+s0 = int(a.start * sr); mix = np.ascontiguousarray(mix[:, s0:s0 + int(a.dur * sr)] if a.dur else mix[:, s0:])
 chunk = a.chunk or cfg['inference']['chunk_size']; step = chunk // a.overlap; border = chunk - step; fade = chunk // 10
 win = torch.ones(chunk); win[:fade] = torch.linspace(0, 1, fade); win[-fade:] = torch.linspace(1, 0, fade)
 x = torch.from_numpy(mix); n0 = x.shape[-1]
 if n0 > 2 * border and border > 0: x = F.pad(x[None], (border, border), mode='reflect')[0]
 N = x.shape[-1]; res = torch.zeros(len(ids), 2, N); cnt = torch.zeros(N)
-c0, w0 = time.process_time(), time.time()
+c0, w0 = time.process_time(), time.time(); per = []
 with torch.no_grad():
     i = 0
     while i < N:
         part = x[:, i:i + chunk]; L_ = part.shape[-1]
         part = F.pad(part[None], (0, chunk - L_), mode='reflect' if L_ > chunk // 2 else 'constant')[0]
-        y = model(part[None].to(dev))[0].float().cpu()
+        t0 = time.process_time(); y = model(part[None].to(dev))[0].float().cpu(); per.append(time.process_time() - t0)
         w = win.clone()
         if i == 0: w[:fade] = 1
         if i + step >= N: w[-fade:] = 1
@@ -71,4 +77,5 @@ out = torch.nan_to_num(out).numpy().astype(np.float32)
 cpu, wall = time.process_time() - c0, time.time() - w0
 np.save(a.out, out)
 print(json.dumps({'stems': want, 'audio_s': round(n0 / sr, 2), 'device': a.device, 'threads': a.threads, 'overlap': a.overlap,
-                  'cpu_s': round(cpu, 2), 'wall_s': round(wall, 2), 'minus': bool(a.minus)}))
+                  'cpu_s': round(cpu, 2), 'wall_s': round(wall, 2), 'minus': bool(a.minus), 'chunks': len(per),
+                  'cpu_per_chunk': round(float(np.median(per)), 2), 'rate_long': round(float(np.median(per)) * a.overlap / (chunk / sr), 3)}))

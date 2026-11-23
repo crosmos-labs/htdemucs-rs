@@ -9,6 +9,7 @@ Per item (a dir with mixture.wav, guitar.wav and the other true parts, which sum
             bleed_vdbk = vocals + drums + bass + keys; resid = what no part explains (artefacts).
   csdr      (--csdr) museval BSSEval v4 median over 1 s windows, two sources: guitar vs the rest (mix − g), with estimates
             ĝ and mix − ĝ; csdr_nog is the second source's. Two sources keep museval affordable.
+An optional <pass dir>/window.json {"start_s", "dur_s"} restricts scoring to that window (Mega runs only on it).
 Variants come from the pass files: 6s_s0, 6s_s2, 6s_inst (round 4 r4_sep.py) and mega_mix / mega_inst (r4_mega.py:
 stems guitar, electric-guitar, acoustic-guitar), plus averages of pairs.
 """
@@ -31,9 +32,11 @@ def variants(pd):
         f = f'{pd}/mega_{p}.npy'
         if os.path.exists(f):
             m = np.load(f); v[f'mega_{p}'] = m[0]; v[f'megaEA_{p}'] = m[1] + m[2]
+    return v
+
+def averages(v):
     for x, y in (('6s_inst', 'mega_inst'), ('6s_s0', 'mega_mix'), ('6s_inst', 'mega_mix')):
         if x in v and y in v: v[f'avg({x},{y})'] = 0.5 * (v[x] + v[y])
-    return v
 
 def db(n, d): return float(10 * np.log10((n + 1e-12) / (d + 1e-12)))
 
@@ -58,11 +61,17 @@ for it in sorted(os.listdir(a.items)):
     old = json.load(open(dst)) if os.path.exists(dst) else {}
     todo = [k for k in v if k not in old or (a.csdr and 'csdr' not in old[k])]
     if not todo: continue
-    rd = lambda n: sf.read(f'{a.items}/{it}/{n}.wav', dtype='float32', always_2d=True)[0].T
+    w = json.load(open(f'{pd}/window.json')) if os.path.exists(f'{pd}/window.json') else {'start_s': 0, 'dur_s': 0}
+    s0 = int(w['start_s'] * 44100); s1 = s0 + int(w['dur_s'] * 44100) if w['dur_s'] else None
+    rd = lambda n: sf.read(f'{a.items}/{it}/{n}.wav', dtype='float32', always_2d=True)[0].T[:, s0:s1]
     mix = rd('mixture'); parts = {p: rd(p) for p in PARTS if os.path.exists(f'{a.items}/{it}/{p}.wav')}
     g = parts['guitar']; nog = mix - g
+    for k in list(v):   # 6s passes cover the whole item; Mega passes only the window
+        if not k.startswith('mega'): v[k] = v[k][:, s0:s0 + g.shape[1]]
+    averages(v); todo = [k for k in v if k not in old or (a.csdr and 'csdr' not in old[k])]
     for k in todo:
-        e = v[k][:, :g.shape[1]]; err = ((g - e) ** 2).sum()
+        e = v[k]
+        e = e[:, :g.shape[1]]; assert e.shape == g.shape, (k, e.shape, g.shape); err = ((g - e) ** 2).sum()
         r = old.get(k, {}); r.update({'usdr': db((g ** 2).sum(), err), 'nog_usdr': db((nog ** 2).sum(), err)})
         if 'bleed_resid' not in r: r.update(bleed(e, parts))
         if a.csdr and 'csdr' not in r:
