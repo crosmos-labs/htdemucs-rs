@@ -36,9 +36,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SIZING: ${{ github.event_name == 'push' || inputs.sizing }}
-  THREADS_1: ${{ inputs.threads_1 || false }}
-  LONG_MINUTES: ${{ inputs.long_minutes || '0' }}
+  # A push runs the measurements configured here (this one: one-thread timing and a 22-minute
+  # clip; the 60 / 240 s sizing jobs ran on 3d7f61b); workflow_dispatch takes them as inputs.
+  SIZING: ${{ github.event_name == 'push' && 'false' || inputs.sizing }}
+  THREADS_1: ${{ github.event_name == 'push' && 'true' || inputs.threads_1 }}
+  LONG_MINUTES: ${{ github.event_name == 'push' && '22' || inputs.long_minutes }}
   MIN_DB: "90"
 
 jobs:
@@ -151,9 +153,10 @@ jobs:
       - name: Smoke separations and parity (HTTP, distroless)
         run: |
           q="shifts=2&seed=0&format=float32&clip-mode=none"
-          for m in htdemucs htdemucs_6s ensemble; do
+          for m in htdemucs htdemucs_6s; do
             .github/container/job.sh htdemucs-rs:distroless "smoke $m s2 12s" "name=$m&$q" clips/synth.wav out/$m 12
           done
+          .github/container/job.sh htdemucs-rs:distroless "smoke ensemble s2 12s" "name=ensemble&ensemble-own-6s=1&$q" clips/synth.wav out/ensemble 12
           fail=0
           {
             echo "### Parity vs PyTorch on this runner (12 s synthetic clip, shifts 2, seed 0; SNR dB per stem)"
@@ -161,6 +164,7 @@ jobs:
             python .github/container/check.py $MIN_DB out/htdemucs/htdemucs clips/ref.htdemucs.s2.safetensors || fail=1
             python .github/container/check.py $MIN_DB out/htdemucs_6s/htdemucs_6s clips/ref.htdemucs_6s.s2.safetensors || fail=1
             python .github/container/check.py $MIN_DB out/ensemble clips/ref.htdemucs.s2.safetensors clips/ref.htdemucs_6s.s2.safetensors || fail=1
+            python .github/container/check.py $MIN_DB out/ensemble/htdemucs_6s.own clips/ref.htdemucs_6s.s2.safetensors || fail=1
             echo '```'
           } > parity.md
           cat parity.md; cat parity.md >> "$GITHUB_STEP_SUMMARY"
