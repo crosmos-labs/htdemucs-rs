@@ -14,6 +14,8 @@ Uses the upstream inference code, github.com/KimberleyJensen/Mel-Band-Roformer-V
     $PY tools/melroformer.py segment  <repo> <ckpt> <in.wav> <out.safetensors> [--chunk K]
         -> one chunk exactly as demix_track feeds it (input, STFT, band split, every transformer,
            masks, output)
+    $PY tools/melroformer.py segment ... --double   (float64 model: the reference for both float32s)
+    $PY tools/melroformer.py compare-dumps <a.safetensors> <b.safetensors>   (SNR of a vs b per tensor)
     $PY tools/melroformer.py bench    <repo> <ckpt> [--threads N] [--runs R]
         -> CPU and wall time of one chunk forward (PyTorch's baseline), RESULT line
     $PY tools/melroformer.py separate <repo> <ckpt> <in.wav> <out.safetensors> [--threads N]
@@ -131,6 +133,11 @@ def segment(a):
     cfg, model = load(a.repo, a.ckpt)
     x = chunk_input(cfg, read_wav(a.inp), a.chunk)
     dump = {"input": x.clone()}
+    if a.double:  # float64 everywhere (weights, input, STFT): the reference for both float32s
+        model = model.double()
+        x = x.double()
+        w = torch.hann_window(cfg.model.stft_win_length).double()  # float32 Hann values, as float64
+        model.stft_window_fn = lambda device=None, dtype=None: w
     hooks = []
 
     def keep(name):
@@ -155,6 +162,8 @@ def segment(a):
     dump["output"] = y
     # Batch dimension dropped; transformer outputs are (sequences, length, dim).
     out = {k: (v[0] if k in ("band_split", "mask") else v).float().contiguous() for k, v in dump.items()}
+    if a.double:
+        out["input"] = dump["input"].float()
     st.save(a.out, out, metadata={"chunk": a.chunk, "input": a.inp, "cpu_s": cpu, "threads": torch.get_num_threads()})
     print(f"chunk {a.chunk}: forward {cpu:.1f} CPU s on {torch.get_num_threads()} threads; "
           f"{len(out)} tensors -> {a.out}")
@@ -187,6 +196,18 @@ def separate(a):
                       "cpu_per_audio_s": round(cpu / audio, 3), "threads": torch.get_num_threads(), "peak_rss_mb": round(rss)}))
 
 
+def compare_dumps(a):
+    """SNR (dB) and max abs error of dump a against dump b, per shared tensor."""
+    x, _ = st.load(a.a)
+    y, _ = st.load(a.b)
+    for k in x:
+        if k in y and k != "input":
+            u, v = x[k].astype(np.float64), y[k].astype(np.float64)
+            err = ((u - v) ** 2).sum()
+            snr = 10 * np.log10((v ** 2).sum() / err) if err > 0 else float("inf")
+            print(f"| {k} | {snr:.1f} | {np.abs(u - v).max():.2e} |")
+
+
 def bench(a):
     torch.set_num_threads(a.threads)
     cfg, model = load(a.repo, a.ckpt)
@@ -215,11 +236,14 @@ if __name__ == "__main__":
     s = sub.add_parser("segment")
     s.add_argument("repo"); s.add_argument("ckpt"); s.add_argument("inp"); s.add_argument("out")
     s.add_argument("--chunk", type=int, default=0); s.add_argument("--threads", type=int, default=4)
+    s.add_argument("--double", action="store_true")
     f = sub.add_parser("separate")
     f.add_argument("repo"); f.add_argument("ckpt"); f.add_argument("inp"); f.add_argument("out")
     f.add_argument("--threads", type=int, default=4)
     b = sub.add_parser("bench")
     b.add_argument("repo"); b.add_argument("ckpt")
     b.add_argument("--threads", type=int, default=1); b.add_argument("--runs", type=int, default=2)
+    d = sub.add_parser("compare-dumps")
+    d.add_argument("a"); d.add_argument("b")
     a = p.parse_args()
-    {"convert": convert, "segment": segment, "separate": separate, "bench": bench}[a.cmd](a)
+    {"compare-dumps": compare_dumps, "convert": convert, "segment": segment, "separate": separate, "bench": bench}[a.cmd](a)

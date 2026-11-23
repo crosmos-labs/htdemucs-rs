@@ -369,6 +369,8 @@ simd_fn! {
 /// 1 / their sum: the caller scales the attention output row instead of the weights (one pass
 /// fewer; PyTorch's CPU flash attention also normalises at the end).
 fn softmax_unnorm(row: &mut [f32], scale: f32) -> f32 {
+    // Three simple passes (max, exp, sum): plain loops that the loop vectoriser handles fully;
+    // fusing exp and the f64 sum into one 8-lane loop left the exp scalar on x86-64.
     let mut m8 = [f32::NEG_INFINITY; 8];
     let chunks = row.chunks_exact(8);
     for &s in chunks.remainder() {
@@ -380,25 +382,23 @@ fn softmax_unnorm(row: &mut [f32], scale: f32) -> f32 {
         }
     }
     let mx = m8.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) * scale;
-    let mut acc = [0f64; 8];
-    let mut chunks = row.chunks_exact_mut(8);
-    for c in &mut chunks {
-        for i in 0..8 {
-            let x = c[i] * scale - mx;
-            // exp of the clamped value: vectorised, every lane is computed, and exp below
-            // about -87 would give subnormals (microcode assists on x86).
-            let e = if x < -40.0 { 0.0 } else { exp_g::<F>(x.max(-40.0)) };
-            c[i] = e;
-            acc[i] += e as f64;
-        }
+    for v in row.iter_mut() {
+        let x = *v * scale - mx;
+        // exp of the clamped value: every lane computes exp, and far below -40 it would give
+        // subnormals (microcode assists); those lanes are 0 anyway.
+        *v = if x < -40.0 { 0.0 } else { exp_g::<F>(x.max(-40.0)) };
     }
-    let mut tail = 0f64;
-    for v in chunks.into_remainder() {
+    (1.0 / crate::ops::sum64(row)) as f32
+}
+}
+
+simd_fn! {
+/// The exp pass of `softmax_unnorm` alone (micro-benchmarks).
+fn exp_pass_row(row: &mut [f32], scale: f32, mx: f32) {
+    for v in row.iter_mut() {
         let x = *v * scale - mx;
         *v = if x < -40.0 { 0.0 } else { exp_g::<F>(x.max(-40.0)) };
-        tail += *v as f64;
     }
-    (1.0 / (acc.iter().sum::<f64>() + tail)) as f32
 }
 }
 
@@ -1253,6 +1253,12 @@ pub mod micro {
         rows.chunks_exact_mut(n).for_each(|r| {
             super::softmax_unnorm(r, 0.125);
         });
+    }
+    pub fn exp_pass(rows: &mut [f32], n: usize) {
+        rows.chunks_exact_mut(n).for_each(|r| super::exp_pass_row(r, 0.125, 3.0));
+    }
+    pub fn sum_pass(rows: &[f32], n: usize) -> f64 {
+        rows.chunks_exact(n).map(crate::ops::sum64).sum()
     }
     pub fn bias_gelu(x: &mut [f32], b: &[f32]) {
         x.chunks_exact_mut(b.len()).for_each(|r| super::bias_gelu_row(r, b));

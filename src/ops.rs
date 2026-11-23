@@ -764,7 +764,7 @@ impl ConvTr {
 
 simd_fn! {
 /// Sum in f64 with 8 independent accumulators (vectorises).
-fn sum64(x: &[f32]) -> f64 {
+pub fn sum64(x: &[f32]) -> f64 {
     let mut acc = [0f64; 8];
     let chunks = x.chunks_exact(8);
     let rest = chunks.remainder();
