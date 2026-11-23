@@ -12,13 +12,13 @@
 //!                             409 while a job is running, 400 on a bad option
 //!     GET    /job             status JSON: state idle | receiving | running | done | failed,
 //!                             progress, CPU seconds, peak RSS, the host's CPU model
-//!     GET    /job/result      the stems as an uncompressed tar (<model folder>/<stem>.<ext>),
+//!     GET    /job/result      the stems as an uncompressed tar (<output folder>/<stem>.<ext>),
 //!                             with Content-Length; 409 unless the job is done
 //!     DELETE /job             kills a running job, or deletes a finished job's files
 //!
 //! Options (query string or `once` arguments) map one-to-one onto the CLI's flags: name (or n),
-//! shifts, seed, overlap, num-overlap, clip-mode, clip-mode-4, ensemble-4, threads; plus
-//! format = flac (default) | wav (16-bit) | float32.
+//! shifts, seed, overlap, num-overlap, clip-mode, clip-mode-4, ensemble-4, threads,
+//! ensemble-own-6s (=1); plus format = flac (default) | wav (16-bit) | float32.
 //!
 //! Each job is its own process, so its memory goes back to the system when it ends (the CLI tunes
 //! glibc malloc to keep freed memory in the heap), and a failed job cannot take the server down.
@@ -51,6 +51,9 @@ const OPTIONS: &[(&str, &str)] = &[
     ("threads", "--threads"),
 ];
 
+/// On / off switches (`key=1` or `key=true` adds the flag, `0` / `false` leaves it out).
+const SWITCHES: &[(&str, &str)] = &[("ensemble-own-6s", "--ensemble-own-6s")];
+
 /// Request options -> CLI arguments. Values are plain tokens (no leading '-'), so a request can set
 /// only the listed flags; the CLI validates the values themselves.
 fn cli_args(pairs: &[(String, String)]) -> Result<Vec<String>, String> {
@@ -69,9 +72,17 @@ fn cli_args(pairs: &[(String, String)]) -> Result<Vec<String>, String> {
             };
             continue;
         }
+        if let Some((_, flag)) = SWITCHES.iter().find(|(n, _)| n == k) {
+            match v.as_str() {
+                "1" | "true" => args.push(flag.to_string()),
+                "0" | "false" => {}
+                _ => return Err(format!("{k}: {v} (1 / true or 0 / false)")),
+            }
+            continue;
+        }
         let flag = OPTIONS.iter().find(|(n, _)| n == k).map(|(_, f)| *f);
         let Some(flag) = flag else {
-            let names: Vec<&str> = OPTIONS.iter().map(|(n, _)| *n).chain(["format"]).collect();
+            let names: Vec<&str> = OPTIONS.iter().chain(SWITCHES).map(|(n, _)| *n).chain(["format"]).collect();
             return Err(format!("unknown option {k} (allowed: {})", names.join(", ")));
         };
         args.extend([flag.to_string(), v.clone()]);
