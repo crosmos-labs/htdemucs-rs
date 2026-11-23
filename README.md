@@ -130,7 +130,7 @@ amplifies the 1e-6-level difference already in its input. Run alone on PyTorch's
 PyTorch's own float32 vs float64 difference for that layer, 116 dB - and the error does not
 survive to the output.
 
-Speed, one segment on an M1 Pro (8 threads): PyTorch 2.2.2 CPU 3.4 s (htdemucs) / 3.0 s
+Speed, one segment on an M1 Pro (8 threads, quiet machine): PyTorch 2.2.2 CPU 3.4 s (htdemucs) / 3.0 s
 (htdemucs_6s); this crate 1.8 s / 1.7 s with the `gemm` crate, 1.3 s / 1.1 s with Accelerate.
 
 ## Parity, full songs (vs PyTorch CPU float32, demucs' own code path)
@@ -171,6 +171,24 @@ Decoder: symphonia (+ edit lists) vs ffmpeg on the four m4a files: same length, 
 dB SNR. Stems from the m4a decoded by us vs the PyTorch reference from ffmpeg's decode
 (htdemucs, shifts 2): 115.3-127.9 dB, within ~1-3 dB of the same-input figures - the decoder
 choice does not matter at this level.
+
+## Speed and memory, full song (indicative)
+
+Aerials (243.6 s), htdemucs, shifts 2, M1 Pro, whole process (`tools/speed.sh`). The machine was
+shared with other heavy jobs; the 1-minute load average (8 cores) is given for each run, and
+CPU time is the less load-sensitive number. A clean benchmark is still to do.
+
+| | threads | wall | CPU time | peak RSS | load |
+|---|---|---|---|---|---|
+| Rust, Accelerate | 8 | 168 s | 347 s | 1.5 GB | 12-14 |
+| Rust, Accelerate | 4 | 196 s | 314 s | 1.4 GB | 12-17 |
+| Rust, gemm crate | 8 | 252 s | 742 s | 1.2 GB | 12-15 |
+| Rust, gemm crate | 4 | 285 s | 639 s | 1.7 GB | 10-12 |
+| PyTorch 2.2.2 CPU | 8 | 400 s | 1402 s | 2.2 GB | 15-17 |
+| PyTorch 2.2.2 CPU | 4 | 350 s | 1077 s | 1.8 GB | 10-11 |
+
+Release binary (`htdemucs-rs`, LTO, stripped, with decoders, resampler and FLAC encoder): 2.2 MB
+on macOS. Weights: 84 MB / 55 MB.
 
 ## Demucs behaviour worth knowing
 
