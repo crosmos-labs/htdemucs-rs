@@ -109,17 +109,20 @@ fn main() {
         let (b1, a1, (_, f1)) = (ALLOC_BYTES.load(Relaxed), ALLOC_CALLS.load(Relaxed), usage());
         prof::enable(false);
         let tab = prof::take();
-        let tracked: f64 = tab.iter().flatten().sum();
-        println!("\nop class profile (wall time of one forward, {threads} threads, total {total:.3}s):");
-        println!("| op class | {} | all | share |\n|---|---|---|---|---|---|", prof::BRANCHES.join(" | "));
-        let mut rows: Vec<(usize, f64)> = (0..prof::CLASSES.len()).map(|c| (c, tab.iter().map(|b| b[c]).sum())).collect();
+        let tracked: f64 = tab.iter().flatten().map(|v| v.0).sum();
+        let gflop: f64 = tab.iter().flatten().map(|v| v.1).sum::<f64>() * 1e-9;
+        println!("\nop class profile (wall time of one forward, {threads} threads, total {total:.3}s, {gflop:.1} GFLOP in GEMMs):");
+        println!("| op class | {} | all | share | GFLOP | GFLOP/s |\n|---|---|---|---|---|---|---|---|", prof::BRANCHES.join(" | "));
+        let mut rows: Vec<(usize, f64, f64)> =
+            (0..prof::CLASSES.len()).map(|c| (c, tab.iter().map(|b| b[c].0).sum(), tab.iter().map(|b| b[c].1).sum())).collect();
         rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        for (c, all) in rows {
-            let per: Vec<String> = tab.iter().map(|b| format!("{:.0} ms", b[c] * 1e3)).collect();
-            println!("| {} | {} | {:.0} ms | {:.1}% |", prof::CLASSES[c], per.join(" | "), all * 1e3, 100.0 * all / total);
+        for (c, all, fl) in rows {
+            let per: Vec<String> = tab.iter().map(|b| format!("{:.0} ms", b[c].0 * 1e3)).collect();
+            let rate = if fl > 0.0 { format!("{:.1} | {:.0}", fl * 1e-9, fl * 1e-9 / all) } else { " | ".into() };
+            println!("| {} | {} | {:.0} ms | {:.1}% | {rate} |", prof::CLASSES[c], per.join(" | "), all * 1e3, 100.0 * all / total);
         }
         let rest = total - tracked;
-        println!("| untracked (copies, layout, adds) | | | | {:.0} ms | {:.1}% |", rest * 1e3, 100.0 * rest / total);
+        println!("| untracked (copies, layout, adds) | | | | {:.0} ms | {:.1}% | | |", rest * 1e3, 100.0 * rest / total);
         println!(
             "allocations per forward: {:.2} GB in {} calls; minor page faults {} ({:.2} GB at 4 KiB, {:.2} GB at 16 KiB)",
             (b1 - b0) as f64 / 1e9,

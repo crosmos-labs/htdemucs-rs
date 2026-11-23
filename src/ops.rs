@@ -55,6 +55,8 @@ pub mod prof {
     static ON: AtomicBool = AtomicBool::new(false);
     static BRANCH: AtomicUsize = AtomicUsize::new(0);
     static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static FLOPS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static CLASS: AtomicUsize = AtomicUsize::new(0);
 
     pub fn enable(on: bool) {
         ON.store(on, Relaxed);
@@ -69,7 +71,20 @@ pub mod prof {
 
     #[inline]
     pub fn scope(class: usize) -> Scope {
-        Scope(class, ON.load(Relaxed).then(Instant::now))
+        let on = ON.load(Relaxed);
+        if on {
+            CLASS.store(class, Relaxed);
+        }
+        Scope(class, on.then(Instant::now))
+    }
+
+    /// Counts a GEMM's floating-point operations against the current scope's class.
+    #[inline]
+    pub fn gemm_flops(m: usize, n: usize, k: usize) {
+        if ON.load(Relaxed) {
+            let i = BRANCH.load(Relaxed) * CLASSES.len() + CLASS.load(Relaxed);
+            FLOPS[i].fetch_add((2 * m * n * k) as u64, Relaxed);
+        }
     }
 
     impl Drop for Scope {
@@ -81,13 +96,69 @@ pub mod prof {
         }
     }
 
-    /// Seconds per [branch][class] since the last call; resets.
-    pub fn take() -> Vec<Vec<f64>> {
+    /// (seconds, GEMM flops) per [branch][class] since the last call; resets.
+    pub fn take() -> Vec<Vec<(f64, f64)>> {
         (0..BRANCHES.len())
-            .map(|b| (0..CLASSES.len()).map(|c| NS[b * CLASSES.len() + c].swap(0, Relaxed) as f64 * 1e-9).collect())
+            .map(|b| {
+                (0..CLASSES.len())
+                    .map(|c| {
+                        let i = b * CLASSES.len() + c;
+                        (NS[i].swap(0, Relaxed) as f64 * 1e-9, FLOPS[i].swap(0, Relaxed) as f64)
+                    })
+                    .collect()
+            })
             .collect()
     }
 }
+
+/// True if the CPU has AVX2 and FMA (x86-64): elementwise kernels then run in versions compiled
+/// for them. (Without target-cpu flags, x86-64 code is SSE2-only; the GEMMs dispatch on their own.)
+/// Rust never contracts a * b + c into an FMA, so both versions compute the same bits.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn avx2_fma() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    static S: AtomicU8 = AtomicU8::new(0);
+    match S.load(Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("HTDEMUCS_NO_AVX2").is_none()
+                && std::is_x86_feature_detected!("avx2")
+                && std::is_x86_feature_detected!("fma");
+            S.store(if on { 1 } else { 2 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// Defines a function whose body is compiled twice on x86-64 - for the baseline and for
+/// AVX2 + FMA - and picks one at run time (see `avx2_fma`). Elsewhere, just the function.
+macro_rules! simd_fn {
+    ($(#[$m:meta])* $vis:vis fn $name:ident($($a:ident : $t:ty),* $(,)?) $(-> $r:ty)? $body:block) => {
+        $(#[$m])*
+        #[allow(clippy::too_many_arguments)]
+        $vis fn $name($($a: $t),*) $(-> $r)? {
+            #[inline(always)]
+            #[allow(clippy::too_many_arguments)]
+            fn imp($($a: $t),*) $(-> $r)? $body
+            #[cfg(target_arch = "x86_64")]
+            {
+                #[target_feature(enable = "avx2,fma")]
+                #[allow(clippy::too_many_arguments)]
+                unsafe fn v3($($a: $t),*) $(-> $r)? {
+                    imp($($a),*)
+                }
+                if crate::ops::avx2_fma() {
+                    return unsafe { v3($($a),*) };
+                }
+            }
+            imp($($a),*)
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use simd_fn;
 
 /// C (row-major m x n) = A (m x k) * B (k x n) [+ C if `accumulate`], where A and B are given as
 /// strided views: element (i, j) of A is a[i * a_rs + j * a_cs].
@@ -132,6 +203,7 @@ pub fn sgemm_par(
     assert!(k == 0 || (m - 1) * a_rs + (k - 1) * a_cs < a.len());
     assert!(k == 0 || (k - 1) * b_rs + (n - 1) * b_cs < b.len());
     assert!((m - 1) * c_rs + n <= c.len());
+    prof::gemm_flops(m, n, k);
     #[cfg(all(feature = "accelerate", target_os = "macos"))]
     {
         let _ = parallel; // Accelerate manages its own threads
@@ -413,23 +485,7 @@ impl ConvTr {
     }
 }
 
-/// Mean and (biased) variance of a slice, f64 two-pass (for short rows).
-fn stats(xs: impl Iterator<Item = f32> + Clone) -> (f64, f64) {
-    let mut n = 0usize;
-    let mut s = 0f64;
-    for x in xs.clone() {
-        s += x as f64;
-        n += 1;
-    }
-    let mean = s / n as f64;
-    let mut v = 0f64;
-    for x in xs {
-        let d = x as f64 - mean;
-        v += d * d;
-    }
-    (mean, v / n as f64)
-}
-
+simd_fn! {
 /// Sum in f64 with 8 independent accumulators (vectorises).
 fn sum64(x: &[f32]) -> f64 {
     let mut acc = [0f64; 8];
@@ -442,7 +498,9 @@ fn sum64(x: &[f32]) -> f64 {
     }
     acc.iter().sum::<f64>() + rest.iter().map(|&v| v as f64).sum::<f64>()
 }
+}
 
+simd_fn! {
 /// Sum of squared deviations from `m`, in f64 (vectorises).
 fn sqdev64(x: &[f32], m: f64) -> f64 {
     let mut acc = [0f64; 8];
@@ -455,6 +513,7 @@ fn sqdev64(x: &[f32], m: f64) -> f64 {
         }
     }
     acc.iter().sum::<f64>() + rest.iter().map(|&v| (v as f64 - m) * (v as f64 - m)).sum::<f64>()
+}
 }
 
 /// Mean and biased variance of a large slice, f64 two-pass, in parallel. Partial sums are
@@ -501,15 +560,19 @@ pub fn group_norm1_then(x: &mut Tensor, gamma: &[f32], beta: &[f32], f: impl Fn(
     let _sc = prof::scope(prof::GROUPNORM);
     let st = row_stats(x);
     let (s, t) = (x.shape[1], x.shape[2]);
-    x.data.par_chunks_mut(s * t).enumerate().for_each(|(ci, plane)| {
-        for (row, &(m, r)) in plane.chunks_mut(t).zip(&st) {
-            let scale = r * gamma[ci];
-            let shift = beta[ci] - m * scale;
-            for v in row {
-                *v = f(*v * scale + shift);
-            }
+    x.data.par_chunks_mut(s * t).enumerate().for_each(|(ci, plane)| gn_plane(plane, t, &st, gamma[ci], beta[ci], &f));
+}
+
+simd_fn! {
+fn gn_plane(plane: &mut [f32], t: usize, st: &[(f32, f32)], g: f32, b: f32, f: &(impl Fn(f32) -> f32 + Sync)) {
+    for (row, &(m, r)) in plane.chunks_mut(t).zip(st) {
+        let scale = r * g;
+        let shift = b - m * scale;
+        for v in row {
+            *v = f(*v * scale + shift);
         }
-    });
+    }
+}
 }
 
 /// GroupNorm(1) per sample of z (2C, S, T), GLU over channels, LayerScale, residual add:
@@ -521,55 +584,67 @@ pub fn group_norm1_glu_add(z: &Tensor, gamma: &[f32], beta: &[f32], ls: &[f32], 
     let (c, s, t) = (x.shape[0], x.shape[1], x.shape[2]);
     assert_eq!(z.shape, [2 * c, s, t]);
     let plane = s * t;
-    let one = |ci: usize, xp: &mut [f32], mut dp: Option<&mut [f32]>| {
-        let za = &z.data[ci * plane..(ci + 1) * plane];
-        let zb = &z.data[(c + ci) * plane..(c + ci + 1) * plane];
-        for (si, &(m, r)) in st.iter().enumerate() {
-            let (sa, sb) = (r * gamma[ci], r * gamma[c + ci]);
-            let (ha, hb) = (beta[ci] - m * sa, beta[c + ci] - m * sb);
-            let rg = si * t..(si + 1) * t;
-            let (xa, ya, yb) = (&mut xp[rg.clone()], &za[rg.clone()], &zb[rg.clone()]);
-            match dp.as_deref_mut() {
-                None => {
-                    for i in 0..t {
-                        let d = ls[ci] * ((ya[i] * sa + ha) * sigmoid(yb[i] * sb + hb));
-                        xa[i] += d;
-                    }
-                }
-                Some(dp) => {
-                    for i in 0..t {
-                        let d = ls[ci] * ((ya[i] * sa + ha) * sigmoid(yb[i] * sb + hb));
-                        dp[si * t + i] = d;
-                        xa[i] += d;
-                    }
-                }
-            }
-        }
-    };
     match delta.as_deref_mut() {
-        None => x.data.par_chunks_mut(plane).enumerate().for_each(|(ci, xp)| one(ci, xp, None)),
+        None => x.data.par_chunks_mut(plane).enumerate().for_each(|(ci, xp)| glu_add_plane(ci, c, t, xp, None, &z.data, &st, gamma, beta, ls)),
         Some(d) => x
             .data
             .par_chunks_mut(plane)
             .zip(d.data.par_chunks_mut(plane))
             .enumerate()
-            .for_each(|(ci, (xp, dp))| one(ci, xp, Some(dp))),
+            .for_each(|(ci, (xp, dp))| glu_add_plane(ci, c, t, xp, Some(dp), &z.data, &st, gamma, beta, ls)),
     }
+}
+
+simd_fn! {
+fn glu_add_plane(ci: usize, c: usize, t: usize, xp: &mut [f32], dp: Option<&mut [f32]>, z: &[f32], st: &[(f32, f32)], gamma: &[f32], beta: &[f32], ls: &[f32]) {
+    let mut dp = dp;
+    let plane = xp.len();
+    let za = &z[ci * plane..(ci + 1) * plane];
+    let zb = &z[(c + ci) * plane..(c + ci + 1) * plane];
+    for (si, &(m, r)) in st.iter().enumerate() {
+        let (sa, sb) = (r * gamma[ci], r * gamma[c + ci]);
+        let (ha, hb) = (beta[ci] - m * sa, beta[c + ci] - m * sb);
+        let rg = si * t..(si + 1) * t;
+        let (xa, ya, yb) = (&mut xp[rg.clone()], &za[rg.clone()], &zb[rg.clone()]);
+        match dp.as_deref_mut() {
+            None => {
+                for i in 0..t {
+                    let d = ls[ci] * ((ya[i] * sa + ha) * sigmoid(yb[i] * sb + hb));
+                    xa[i] += d;
+                }
+            }
+            Some(dp) => {
+                for i in 0..t {
+                    let d = ls[ci] * ((ya[i] * sa + ha) * sigmoid(yb[i] * sb + hb));
+                    dp[si * t + i] = d;
+                    xa[i] += d;
+                }
+            }
+        }
+    }
+}
 }
 
 /// LayerNorm over the last axis of (N, C). eps = 1e-5.
 pub fn layer_norm(x: &Tensor, gamma: &[f32], beta: &[f32]) -> Tensor {
     let _sc = prof::scope(prof::LAYERNORM);
     let c = *x.shape.last().unwrap();
-    let mut out = x.clone();
-    out.data.par_chunks_mut(c).for_each(|row| {
-        let (m, v) = stats(row.iter().copied());
-        let r = 1.0 / (v + 1e-5).sqrt();
-        for (i, val) in row.iter_mut().enumerate() {
-            *val = (((*val as f64 - m) * r) as f32) * gamma[i] + beta[i];
-        }
-    });
-    out
+    let mut out = vec![0.0f32; x.numel()];
+    out.par_chunks_mut(c).zip(x.data.par_chunks(c)).for_each(|(o, row)| layer_norm_row(row, o, gamma, beta));
+    Tensor::new(&x.shape, out)
+}
+
+simd_fn! {
+/// LayerNorm of one row into `o`.
+pub fn layer_norm_row(row: &[f32], o: &mut [f32], gamma: &[f32], beta: &[f32]) {
+    let n = row.len() as f64;
+    let m = sum64(row) / n;
+    let v = sqdev64(row, m) / n;
+    let r = 1.0 / (v + 1e-5).sqrt();
+    for i in 0..row.len() {
+        o[i] = (((row[i] as f64 - m) * r) as f32) * gamma[i] + beta[i];
+    }
+}
 }
 
 /// GroupNorm with one group over a whole (N, C) token sequence (Demucs' MyGroupNorm on (B, T, C)):
@@ -580,12 +655,16 @@ pub fn group_norm_tokens(x: &mut Tensor, gamma: &[f32], beta: &[f32]) {
     let (m, v) = big_stats(&x.data);
     let r = (1.0 / (v + 1e-5).sqrt()) as f32;
     let m = m as f32;
-    x.data.par_chunks_mut(c).for_each(|row| {
-        for (i, val) in row.iter_mut().enumerate() {
-            let scale = r * gamma[i];
-            *val = *val * scale + (beta[i] - m * scale);
-        }
-    });
+    x.data.par_chunks_mut(c).for_each(|row| affine_row(row, r, m, gamma, beta));
+}
+
+simd_fn! {
+fn affine_row(row: &mut [f32], r: f32, m: f32, gamma: &[f32], beta: &[f32]) {
+    for (i, val) in row.iter_mut().enumerate() {
+        let scale = r * gamma[i];
+        *val = *val * scale + (beta[i] - m * scale);
+    }
+}
 }
 
 /// exp(x) in f32, ~1 ulp (Cephes expf: Cody-Waite reduction + degree-6 polynomial), written
@@ -632,7 +711,15 @@ pub fn gelu1(x: f32) -> f32 {
 
 pub fn gelu(x: &mut [f32]) {
     let _sc = prof::scope(prof::ACT);
-    x.par_chunks_mut(8192).for_each(|c| c.iter_mut().for_each(|v| *v = gelu1(*v)));
+    x.par_chunks_mut(8192).for_each(gelu_slice);
+}
+
+simd_fn! {
+pub fn gelu_slice(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = gelu1(*v);
+    }
+}
 }
 
 #[inline(always)]
@@ -651,12 +738,16 @@ pub fn glu(x: &Tensor) -> Tensor {
     let mut out = vec![0.0f32; half];
     out.par_chunks_mut(8192)
         .zip(a.par_chunks(8192).zip(b.par_chunks(8192)))
-        .for_each(|(o, (a, b))| {
-            for i in 0..o.len() {
-                o[i] = a[i] * sigmoid(b[i]);
-            }
-        });
+        .for_each(|(o, (a, b))| glu_slice(o, a, b));
     Tensor::new(&shape, out)
+}
+
+simd_fn! {
+fn glu_slice(o: &mut [f32], a: &[f32], b: &[f32]) {
+    for i in 0..o.len() {
+        o[i] = a[i] * sigmoid(b[i]);
+    }
+}
 }
 
 /// y = x W^T + b for x (N, Cin), W (Cout, Cin) (nn.Linear).
@@ -671,39 +762,103 @@ pub fn linear(x: &Tensor, w: &[f32], b: &[f32]) -> Tensor {
 }
 
 /// Multi-head scaled dot-product attention. q (Nq, C), k and v (Nk, C), heads split C.
-/// (Head by head with full-width multithreaded GEMMs: measured faster, with both the gemm crate
-/// and Accelerate, than many small single-threaded GEMMs over (head, query block) tasks.)
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> Tensor {
     let (nq, c) = (q.shape[0], q.shape[1]);
     let nk = k.shape[0];
+    let mut out = vec![0.0f32; nq * c];
+    attention_into(&q.data, c, &k.data, c, &v.data, c, nq, nk, c, heads, &mut out);
+    Tensor::new(&[nq, c], out)
+}
+
+simd_fn! {
+/// softmax(scale * row), in place. (The max is over eight lanes: max is exact, so any order gives
+/// the same result.)
+fn softmax_row(row: &mut [f32], scale: f32) {
+    let mut m8 = [f32::NEG_INFINITY; 8];
+    let chunks = row.chunks_exact(8);
+    for &s in chunks.remainder() {
+        m8[0] = m8[0].max(s * scale);
+    }
+    for c in chunks {
+        for i in 0..8 {
+            m8[i] = m8[i].max(c[i] * scale);
+        }
+    }
+    let mx = m8.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    for s in row.iter_mut() {
+        *s = exp(*s * scale - mx);
+    }
+    let inv = (1.0 / sum64(row)) as f32;
+    for s in row.iter_mut() {
+        *s *= inv;
+    }
+}
+}
+
+/// Query rows per attention task (see `attention_into`); HTDEMUCS_ATTN_BLOCK overrides (0: the
+/// old head-by-head full-width path).
+fn attn_block() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var("HTDEMUCS_ATTN_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(128))
+}
+
+/// A raw pointer that may cross threads: tasks write disjoint (row block, head) tiles of one
+/// output matrix, which cannot be expressed as disjoint slices.
+#[derive(Clone, Copy)]
+struct SendPtr(*mut f32);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+impl SendPtr {
+    fn get(self) -> *mut f32 {
+        self.0
+    }
+}
+
+/// Attention on strided views: row i of q / k / v starts at q[i * q_rs] (etc.), each row holds C =
+/// heads * d values; writes out (Nq, C) with row stride C.
+///
+/// Blocked: one task per (query block, head), each a single-threaded QK^T GEMM, softmax and AV
+/// GEMM on a (block x Nk) score tile that stays in cache - instead of materialising every head's
+/// full (Nq x Nk) scores. Every value is computed the same way whatever the thread count.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_into(q: &[f32], q_rs: usize, k: &[f32], k_rs: usize, v: &[f32], v_rs: usize, nq: usize, nk: usize, c: usize, heads: usize, out: &mut [f32]) {
     let d = c / heads;
     let scale = 1.0 / (d as f32).sqrt();
-    let mut out = vec![0.0f32; nq * c];
-    let mut scores = vec![0.0f32; nq * nk];
-    for h in 0..heads {
-        // scores = q_h k_h^T
-        let sc = prof::scope(prof::QK);
-        sgemm(nq, nk, d, &q.data[h * d..], c, 1, &k.data[h * d..], 1, c, &mut scores, nk, false);
-        drop(sc);
-        let sc = prof::scope(prof::SOFTMAX);
-        scores.par_chunks_mut(nk).for_each(|row| {
-            let mut mx = f32::NEG_INFINITY;
-            for &s in row.iter() {
-                mx = mx.max(s * scale);
-            }
-            for s in row.iter_mut() {
-                *s = exp(*s * scale - mx);
-            }
-            let inv = (1.0 / sum64(row)) as f32;
-            for s in row.iter_mut() {
-                *s *= inv;
-            }
-        });
-        drop(sc);
-        let _sc = prof::scope(prof::AV);
-        sgemm(nq, d, nk, &scores, nk, 1, &v.data[h * d..], c, 1, &mut out[h * d..], c, false);
+    assert!(out.len() >= nq * c);
+    let softmax = |row: &mut [f32]| softmax_row(row, scale);
+    let bq = attn_block();
+    if bq == 0 {
+        let mut scores = vec![0.0f32; nq * nk];
+        for h in 0..heads {
+            let sc = prof::scope(prof::QK);
+            sgemm(nq, nk, d, &q[h * d..], q_rs, 1, &k[h * d..], 1, k_rs, &mut scores, nk, false);
+            drop(sc);
+            let sc = prof::scope(prof::SOFTMAX);
+            scores.par_chunks_mut(nk).for_each(softmax);
+            drop(sc);
+            let _sc = prof::scope(prof::AV);
+            sgemm(nq, d, nk, &scores, nk, 1, &v[h * d..], v_rs, 1, &mut out[h * d..], c, false);
+        }
+        return;
     }
-    Tensor::new(&[nq, c], out)
+    let _sc = prof::scope(prof::QK);
+    let nb = nq.div_ceil(bq);
+    let optr = SendPtr(out.as_mut_ptr());
+    let olen = out.len();
+    (0..nb * heads).into_par_iter().for_each_init(
+        || vec![0.0f32; bq * nk],
+        |scores, task| {
+            let (b, h) = (task / heads, task % heads);
+            let r0 = b * bq;
+            let m = bq.min(nq - r0);
+            let s = &mut scores[..m * nk];
+            sgemm_par(m, nk, d, &q[r0 * q_rs + h * d..], q_rs, 1, &k[h * d..], 1, k_rs, s, nk, false, false);
+            s.chunks_mut(nk).for_each(softmax);
+            // SAFETY: tile (rows r0..r0+m, cols h*d..h*d+d) of out is written by this task only.
+            let o = unsafe { std::slice::from_raw_parts_mut(optr.get().add(r0 * c + h * d), olen - r0 * c - h * d) };
+            sgemm_par(m, d, nk, s, nk, 1, &v[h * d..], v_rs, 1, o, c, false, false);
+        },
+    );
 }
 
 #[cfg(test)]
