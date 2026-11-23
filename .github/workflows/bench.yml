@@ -34,7 +34,7 @@ on:
         description: "commits to time with .github/bench/cputime.rs on this runner (same machine, comparable)"
         default: ""
       features_b:
-        description: "features for a second bench build (variants with BIN=b use it)"
+        description: "features for a second bench build (variants with BIN=b use it; none = --no-default-features)"
         default: ""
   push:
     branches: [main]
@@ -44,7 +44,8 @@ on:
       - src/bin/bench.rs
 
 concurrency:
-  group: bench-${{ github.ref }}
+  # pushes cancel each other; manual runs each get their own group
+  group: ${{ github.event_name == 'push' && format('bench-push-{0}', github.ref) || format('bench-{0}', github.run_id) }}
   cancel-in-progress: true
 
 env:
@@ -120,7 +121,8 @@ jobs:
           cargo build --release --bins ${FEATURES:+--features $FEATURES}
           ls -l target/release/htdemucs-rs target/release/bench
           if [ -n "$FEATURES_B" ]; then
-            cargo build --release --bin bench --features "$FEATURES_B" --target-dir target-b
+            if [ "$FEATURES_B" = none ]; then fb=--no-default-features; else fb="--features $FEATURES_B"; fi
+            cargo build --release --bin bench $fb --target-dir target-b
             ls -l target-b/release/bench
           fi
 

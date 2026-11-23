@@ -499,7 +499,7 @@ const COL_BLOCK: usize = 1 << 24;
 /// HTDEMUCS_CONV_BLOCK = target im2col floats per task (0 disables).
 fn conv_block_cols(kk: usize, n: usize) -> usize {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let target = *T.get_or_init(|| std::env::var("HTDEMUCS_CONV_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    let target = *T.get_or_init(|| std::env::var("HTDEMUCS_CONV_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 20));
     if target == 0 {
         return 0;
     }
@@ -1202,8 +1202,12 @@ fn softmax_row(row: &mut [f32], scale: f32) {
         }
     }
     let mx = m8.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    // Weights below e^-40 (4e-18 of the largest) are set to 0: they cannot change a float32 sum,
+    // and left in they become subnormal after normalisation and in the AV products, which costs
+    // Intel CPUs a microcode assist per operation (attention ran ~6x slower on a Xeon).
     for s in row.iter_mut() {
-        *s = exp_g::<F>(*s * scale - mx);
+        let x = *s * scale - mx;
+        *s = if x < -40.0 { 0.0 } else { exp_g::<F>(x) };
     }
     let inv = (1.0 / sum64(row)) as f32;
     for s in row.iter_mut() {
@@ -1216,146 +1220,13 @@ fn softmax_row(row: &mut [f32], scale: f32) {
 /// old head-by-head full-width path).
 fn attn_block() -> usize {
     static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var("HTDEMUCS_ATTN_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(128))
+    *B.get_or_init(|| std::env::var("HTDEMUCS_ATTN_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(512))
 }
 
-/// HTDEMUCS_ATTN_KERNEL=1: the hand-written attention kernel (`attn_kernel_task`) instead of the
-/// gemm crate for the blocked QK^T / AV products.
-fn attn_kernel() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var("HTDEMUCS_ATTN_KERNEL").as_deref() == Ok("1"))
-}
-
-/// Keys / values per chunk in `attn_kernel_task`: K^T and V chunks of d x 256 floats stay in L1/L2.
-const ATTN_JC: usize = 256;
-
-/// acc[r][c] (+)= sum_kk a[r * a_rs + kk] * b[kk * b_rs + c], a 4 x 16 register tile.
-#[inline(always)]
-fn tile4x16<F: MulAdd>(a: &[f32], a_rs: usize, b: &[f32], b_rs: usize, k: usize, acc: &mut [[f32; 16]; 4]) {
-    assert!(a.len() >= 3 * a_rs + k && (k == 0 || b.len() >= (k - 1) * b_rs + 16));
-    for kk in 0..k {
-        // SAFETY: bounds asserted above.
-        let bv: [f32; 16] = unsafe { *(b.as_ptr().add(kk * b_rs) as *const [f32; 16]) };
-        for r in 0..4 {
-            let av = unsafe { *a.get_unchecked(r * a_rs + kk) };
-            for c in 0..16 {
-                acc[r][c] = F::fma(av, bv[c], acc[r][c]);
-            }
-        }
-    }
-}
-
-/// acc[c] (+)= sum_kk a[kk] * b[kk * b_rs + c], one row (the remainder rows of a block).
-#[inline(always)]
-fn tile1x16<F: MulAdd>(a: &[f32], b: &[f32], b_rs: usize, k: usize, acc: &mut [f32; 16]) {
-    assert!(a.len() >= k && (k == 0 || b.len() >= (k - 1) * b_rs + 16));
-    for kk in 0..k {
-        let bv: [f32; 16] = unsafe { *(b.as_ptr().add(kk * b_rs) as *const [f32; 16]) };
-        let av = unsafe { *a.get_unchecked(kk) };
-        for c in 0..16 {
-            acc[c] = F::fma(av, bv[c], acc[c]);
-        }
-    }
-}
-
-/// C (m x n, row stride c_rs) (+)= A (m x k, row stride a_rs) * B (k x n, row stride b_rs), n a
-/// multiple of 16, k split into chunks of `kc` (C is re-read between chunks: the sums run
-/// strictly in k order, so the chunking does not change the result). C is a raw pointer: the
-/// caller's tile may sit between other tasks' tiles.
-///
-/// # Safety
-/// c[i * c_rs + j], i < m, j < n, valid and not accessed by others during the call.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn small_gemm<F: MulAdd>(m: usize, n: usize, k: usize, kc: usize, a: &[f32], a_rs: usize, b: &[f32], b_rs: usize, c: *mut f32, c_rs: usize, accumulate: bool) {
-    assert!(n % 16 == 0);
-    let row = |i: usize, j: usize| unsafe { std::slice::from_raw_parts_mut(c.add(i * c_rs + j), 16) };
-    let mut k0 = 0;
-    while k0 < k {
-        let kn = kc.min(k - k0);
-        let first = k0 == 0 && !accumulate;
-        let mut r = 0;
-        while r < m {
-            let rows = (m - r).min(4);
-            for c0 in (0..n).step_by(16) {
-                if rows == 4 {
-                    let mut acc = [[0f32; 16]; 4];
-                    if !first {
-                        for rr in 0..4 {
-                            acc[rr].copy_from_slice(row(r + rr, c0));
-                        }
-                    }
-                    tile4x16::<F>(&a[r * a_rs + k0..], a_rs, &b[k0 * b_rs + c0..], b_rs, kn, &mut acc);
-                    for rr in 0..4 {
-                        row(r + rr, c0).copy_from_slice(&acc[rr]);
-                    }
-                } else {
-                    for rr in 0..rows {
-                        let mut acc = [0f32; 16];
-                        if !first {
-                            acc.copy_from_slice(row(r + rr, c0));
-                        }
-                        tile1x16::<F>(&a[(r + rr) * a_rs + k0..], &b[k0 * b_rs + c0..], b_rs, kn, &mut acc);
-                        row(r + rr, c0).copy_from_slice(&acc);
-                    }
-                }
-            }
-            r += rows;
-        }
-        k0 += kn;
-    }
-}
-
-/// One (query block, head) of attention with the hand-written kernel: s = q kt (m x nk) in key
-/// chunks, softmax rows, o = s v (m x d) in key chunks. kt is this head's K^T (d x nk); o has
-/// row stride c. Requires nk and d multiples of 16.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn attn_task<F: MulAdd>(m: usize, nk: usize, d: usize, scale: f32, q: &[f32], q_rs: usize, kt: &[f32], v: &[f32], v_rs: usize, s: &mut [f32], o: *mut f32, c: usize) {
-    assert!(s.len() >= m * nk);
-    // Scores, chunk by chunk of keys (that chunk of K^T stays in cache for all rows).
-    for j0 in (0..nk).step_by(ATTN_JC) {
-        let jn = ATTN_JC.min(nk - j0);
-        unsafe { small_gemm::<F>(m, jn, d, d, q, q_rs, &kt[j0..], nk, s.as_mut_ptr().add(j0), nk, false) };
-    }
-    for row in s[..m * nk].chunks_mut(nk) {
-        softmax_row(row, scale);
-    }
-    unsafe { small_gemm::<F>(m, d, nk, ATTN_JC, s, nk, v, v_rs, o, c, false) };
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn attn_task_v3(m: usize, nk: usize, d: usize, scale: f32, q: &[f32], q_rs: usize, kt: &[f32], v: &[f32], v_rs: usize, s: &mut [f32], o: *mut f32, c: usize) {
-    unsafe { attn_task::<Fused>(m, nk, d, scale, q, q_rs, kt, v, v_rs, s, o, c) }
-}
-
-/// # Safety
-/// As `attn_task`: the (m x d, row stride c) tile at o is this task's alone.
-#[allow(clippy::too_many_arguments)]
-unsafe fn attn_task_dispatch(m: usize, nk: usize, d: usize, scale: f32, q: &[f32], q_rs: usize, kt: &[f32], v: &[f32], v_rs: usize, s: &mut [f32], o: *mut f32, c: usize) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if avx2_fma() {
-            return attn_task_v3(m, nk, d, scale, q, q_rs, kt, v, v_rs, s, o, c);
-        }
-        attn_task::<Unfused>(m, nk, d, scale, q, q_rs, kt, v, v_rs, s, o, c)
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        attn_task::<Fused>(m, nk, d, scale, q, q_rs, kt, v, v_rs, s, o, c)
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    unsafe {
-        attn_task::<Unfused>(m, nk, d, scale, q, q_rs, kt, v, v_rs, s, o, c)
-    }
-}
-
-/// HTDEMUCS_ATTN_KT=1: transpose K per head before the blocked QK^T GEMMs.
+/// K transposed per head before the blocked QK^T GEMMs (default; HTDEMUCS_ATTN_KT=0 disables).
 fn attn_kt() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var("HTDEMUCS_ATTN_KT").as_deref() == Ok("1"))
+    *B.get_or_init(|| std::env::var("HTDEMUCS_ATTN_KT").as_deref() != Ok("0"))
 }
 
 /// A raw pointer that may cross threads: tasks write disjoint (row block, head) tiles of one
@@ -1403,8 +1274,7 @@ pub fn attention_into(q: &[f32], q_rs: usize, k: &[f32], k_rs: usize, v: &[f32],
     let olen = out.len();
     // K transposed per head, (heads, d, Nk), so the QK^T GEMMs read it in place instead of
     // packing a strided K for every task.
-    let kernel = attn_kernel() && nk % 16 == 0 && d % 16 == 0;
-    let kt: Option<Vec<f32>> = (attn_kt() || kernel).then(|| {
+    let kt: Option<Vec<f32>> = attn_kt().then(|| {
         let mut kt = vec![0.0f32; heads * d * nk];
         kt.par_chunks_mut(nk).enumerate().for_each(|(hd, row)| {
             for (j, v) in row.iter_mut().enumerate() {
@@ -1420,16 +1290,6 @@ pub fn attention_into(q: &[f32], q_rs: usize, k: &[f32], k_rs: usize, v: &[f32],
             let r0 = b * bq;
             let m = bq.min(nq - r0);
             let s = &mut scores[..m * nk];
-            if kernel {
-                // Output tile: rows r0..r0+m, cols h*d..h*d+d; o spans it with row stride c.
-                assert!((r0 + m - 1) * c + (h + 1) * d <= olen);
-                let kt = kt.as_ref().unwrap();
-                // SAFETY: that tile is this task's alone.
-                unsafe {
-                    attn_task_dispatch(m, nk, d, scale, &q[r0 * q_rs + h * d..], q_rs, &kt[h * d * nk..(h + 1) * d * nk], &v[h * d..], v_rs, s, optr.get().add(r0 * c + h * d), c)
-                };
-                return;
-            }
             match &kt {
                 Some(kt) => sgemm_par(m, nk, d, &q[r0 * q_rs + h * d..], q_rs, 1, &kt[h * d * nk..], nk, 1, s, nk, false, false),
                 None => sgemm_par(m, nk, d, &q[r0 * q_rs + h * d..], q_rs, 1, &k[h * d..], 1, k_rs, s, nk, false, false),
