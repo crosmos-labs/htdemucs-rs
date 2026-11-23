@@ -944,6 +944,11 @@ impl Chunking {
 /// weights and written to the output as the walk goes (same operations, same order as upstream's
 /// whole-track `result` / `counter` buffers).
 pub fn separate(model: &MelRoformer, wav: &[f32], ch: &Chunking, progress: &mut dyn FnMut()) -> Vec<f32> {
+    separate_with(wav, ch, &|part: &[f32]| model.forward(part, &mut Tracer::none()), progress)
+}
+
+/// `separate` with any chunk model (2 x chunk samples in, 2 x chunk out).
+pub fn separate_with(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec<f32>, progress: &mut dyn FnMut()) -> Vec<f32> {
     let len = wav.len() / 2;
     let c = ch.chunk;
     let total = ch.total(len);
@@ -1002,7 +1007,7 @@ pub fn separate(model: &MelRoformer, wav: &[f32], ch: &Chunking, progress: &mut 
                 };
             }
         });
-        let y = model.forward(&part, &mut Tracer::none());
+        let y = model(&part);
         progress();
         let mut w = base.clone();
         if i == 0 {
@@ -1071,6 +1076,89 @@ mod tests {
         assert_eq!(tanh_g::<Unfused>(0.0), 0.0);
         assert_eq!(tanh_g::<Unfused>(100.0), 1.0);
         assert_eq!(tanh_g::<Unfused>(-100.0), -1.0);
+    }
+
+    /// Upstream demix_track with whole-track buffers, literally (padded copy, result, counter).
+    fn demix_reference(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec<f32>) -> Vec<f32> {
+        let len = wav.len() / 2;
+        let c = ch.chunk;
+        let pad = ch.padded(len);
+        let b = if pad { ch.border } else { 0 };
+        let total = len + 2 * b;
+        let refl = |j: isize, n: usize| -> usize {
+            let j = if j < 0 { -j } else { j };
+            (if j >= n as isize { 2 * (n as isize - 1) - j } else { j }) as usize
+        };
+        let mix: Vec<f32> = (0..2).flat_map(|s| (0..total).map(move |p| (s, p))).map(|(s, p)| wav[s * len + refl(p as isize - b as isize, len)]).collect();
+        let w0 = ch.window();
+        let mut result = vec![0.0f32; 2 * total];
+        let mut counter = vec![0.0f32; total];
+        let mut i = 0;
+        while i < total {
+            let length = c.min(total - i);
+            let mut part = vec![0.0f32; 2 * c];
+            for s in 0..2 {
+                for q in 0..c {
+                    part[s * c + q] = if q < length {
+                        mix[s * total + i + q]
+                    } else if length > c / 2 + 1 {
+                        mix[s * total + i + refl(q as isize, length)]
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            let y = model(&part);
+            let mut w = w0.clone();
+            if i == 0 {
+                w[..ch.fade].fill(1.0);
+            } else if i + c >= total {
+                w[c - ch.fade..].fill(1.0);
+            }
+            for s in 0..2 {
+                for q in 0..length {
+                    result[s * total + i + q] += y[s * c + q] * w[q];
+                }
+            }
+            for q in 0..length {
+                counter[i + q] += w[q];
+            }
+            i += ch.step;
+        }
+        (0..2).flat_map(|s| (b..b + len).map(move |p| (s, p))).map(|(s, p)| {
+            let v = result[s * total + p] / counter[p];
+            if v.is_nan() { 0.0 } else { v }
+        }).collect()
+    }
+
+    #[test]
+    fn streamed_demix_matches_whole_track() {
+        // A toy chunk "model" that depends on the position in the chunk, so misplaced chunks or
+        // windows show; small chunks so every branch (padding, short last chunk reflect / zero
+        // padded, one-chunk tracks) is reached.
+        let model = |x: &[f32]| -> Vec<f32> { x.iter().enumerate().map(|(i, v)| v * 0.5 + (i % 7) as f32 * 1e-3).collect() };
+        for (chunk, n) in [(100usize, 2usize), (100, 4), (100, 1), (120, 3)] {
+            let step = chunk / n;
+            let ch = Chunking { chunk, step, fade: chunk / 10, border: chunk - step };
+            for len in [1usize, 2, 30, 52, 99, 100, 101, 150, 199, 200, 201, 260, 333, 1000, 1037] {
+                let wav: Vec<f32> = (0..2 * len).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+                let mut calls = 0;
+                let a = separate_with(&wav, &ch, &model, &mut || calls += 1);
+                let b = demix_reference(&wav, &ch, &model);
+                assert_eq!(calls, ch.chunks(len), "chunk {chunk} n {n} len {len}");
+                assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "chunk {chunk} n {n} len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn fade_window() {
+        let ch = Chunking { chunk: 352800, step: 176400, fade: 35280, border: 176400 };
+        let w = ch.window();
+        assert_eq!((w[0], w[35279], w[35280], w[352800 - 35281], w[352799]), (0.0, 1.0, 1.0, 1.0, 0.0));
+        assert!((w[1] - 1.0 / 35279.0).abs() < 1e-9);
+        assert_eq!(ch.chunks(10 * 44100), 5); // padded to 441000 + 2 * 176400 samples
+        assert_eq!(ch.chunks(8 * 44100), 2); // not padded (not longer than 2 * border)
     }
 
     #[test]
