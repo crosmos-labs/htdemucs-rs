@@ -1,0 +1,5 @@
+{"model": "6s", "pass": "6s_s0", "audio_s": 30.0, "device": "cpu", "threads": 1, "cpu_s": 27.65, "wall_s": 28.13}
+{"model": "kim", "audio_s": 30.0, "wall_s": 430.69, "cpu_s": 428.73, "device": "cpu", "threads": 1, "fp32": false, "torch": "2.2.2+cu121"}
+{"model": "mega", "n_stems": 1, "audio_s": 30.0, "device": "cpu", "threads": 1, "overlap": 2, "cpu_s": 568.29, "wall_s": 569.98, "minus": false, "chunks": 5, "cpu_per_chunk": 114.31, "rate_long": 11.431}
+{"model": "mega", "n_stems": 3, "audio_s": 30.0, "device": "cpu", "threads": 1, "overlap": 2, "cpu_s": 561.6, "wall_s": 563.23, "minus": false, "chunks": 5, "cpu_per_chunk": 112.14, "rate_long": 11.214}
+{"model": "mega", "n_stems": 53, "audio_s": 30.0, "device": "cpu", "threads": 1, "overlap": 2, "cpu_s": 805.34, "wall_s": 807.47, "minus": false, "chunks": 5, "cpu_per_chunk": 160.25, "rate_long": 16.025}
