@@ -3,7 +3,8 @@
 //!     compare <ref.safetensors> <stem dir>      (stems as float32 WAV, --clip-mode none)
 //!
 //! Prints, per stem, SNR (dB), max abs error over the full length, and the reference stem's RMS
-//! level (a near-silent stem has a low SNR for the same absolute error).
+//! level and the error's RMS level against full scale (a near-silent stem has a low SNR for the
+//! same absolute error).
 
 use std::path::Path;
 
@@ -32,7 +33,8 @@ fn main() {
         let snr = if err == 0.0 { f64::INFINITY } else { 10.0 * (sig / err).log10() };
         worst = worst.min(snr);
         let rms_db = 10.0 * (sig / theirs.len() as f64).max(1e-30).log10();
-        row.push(format!("{n} {snr:.1} dB (max {mx:.1e}, level {rms_db:.0} dBFS)"));
+        let err_db = 10.0 * (err / theirs.len() as f64).max(1e-30).log10();
+        row.push(format!("{n} {snr:.1} dB (max {mx:.1e}, level {rms_db:.0} dBFS, error {err_db:.0} dBFS)"));
     }
     println!("{}: {} | min {worst:.1} dB", args[1], row.join(", "));
 }
