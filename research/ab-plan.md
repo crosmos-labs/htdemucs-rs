@@ -1,6 +1,8 @@
 # A/B plan: what to try, how to measure it, what to run first
 
-Companion to [survey.md](survey.md). Status: **plan only**. Nothing here has been run yet, except the small checks the survey marks *measured here*.
+Companion to [survey.md](survey.md). Status: Round 1 done, see [round1/round1.md](round1/round1.md). It found the 4-stem split 25 ms late (a pipeline bug); variant 1 (6s-only / average) is not a clean win; Kim's vocals show no downstream gain at ≈2× CPU. MUSDB18-HQ 12-track subset fetched (approved): next is SDR. Original plan below, unchanged.
+
+Status at writing: **plan only**. Nothing here has been run yet, except the small checks the survey marks *measured here*.
 
 ## 1. Decision rules (fixed before any result)
 
