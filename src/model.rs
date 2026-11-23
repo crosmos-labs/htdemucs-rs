@@ -8,7 +8,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::ops::{bias_gelu, dconv_rows, gelu, gelu1, glu_bias, group_norm1_glu_add_b, group_norm1_then, mean_std, plus_channel_bias, prof, Conv, ConvTr};
+use crate::ops::{bias_gelu, dconv_rows, gelu, glu_bias, group_norm1_gelu, group_norm1_glu_add_b, mean_std, plus_channel_bias, prof, Conv, ConvTr};
 use crate::stft::Stft;
 use crate::tensor::Tensor;
 use crate::transformer::CrossTransformer;
@@ -88,7 +88,7 @@ impl DConv {
         }
         for (d, l) in self.layers.iter().enumerate() {
             let mut y = l.conv1.forward(&x);
-            group_norm1_then(&mut y, &l.gn1.0, &l.gn1.1, gelu1);
+            group_norm1_gelu(&mut y, &l.gn1.0, &l.gn1.1);
             let y = l.conv2.forward_raw(&y);
             // x = x + LayerScale(GLU(GroupNorm(y + bias))), fused into one pass.
             let b = Some(&l.conv2.b[..]);

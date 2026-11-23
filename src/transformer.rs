@@ -107,7 +107,7 @@ simd_fn! {
 /// f = GELU(f + b), one row.
 fn bias_gelu_row(f: &mut [f32], b: &[f32]) {
     for i in 0..f.len() {
-        f[i] = crate::ops::gelu1(f[i] + b[i]);
+        f[i] = crate::ops::gelu1_g::<F>(f[i] + b[i]);
     }
 }
 }

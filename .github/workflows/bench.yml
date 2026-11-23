@@ -30,6 +30,9 @@ on:
       features:
         description: extra cargo features for the bench build
         default: ""
+      milestones:
+        description: "commits to time with .github/bench/cputime.rs on this runner (same machine, comparable)"
+        default: ""
       features_b:
         description: "features for a second bench build (variants with BIN=b use it)"
         default: ""
@@ -52,6 +55,7 @@ env:
   ROUNDS: ${{ inputs.rounds || '1' }}
   FEATURES: ${{ inputs.features || '' }}
   FEATURES_B: ${{ inputs.features_b || '' }}
+  MILESTONES: ${{ inputs.milestones || '' }}
   RUN_TORCH: ${{ github.event_name == 'push' || inputs.torch }}
   RUN_PARITY: ${{ github.event_name == 'push' || inputs.parity }}
 
@@ -61,6 +65,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: CPU
         run: |
@@ -175,6 +181,32 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Milestones (each commit's segment forward on this runner)
+        if: env.MILESTONES != ''
+        run: |
+          for c in $MILESTONES; do
+            git worktree add -f ../m-$c $c
+            cp .github/bench/cputime.rs ../m-$c/src/bin/cputime.rs
+            (cd ../m-$c && cargo build --release -q --bin cputime --target-dir "$GITHUB_WORKSPACE/target-m")
+            cp target-m/release/cputime cputime-$c
+          done
+          for r in $(seq 1 $ROUNDS); do
+            for m in $MODELS; do
+              for t in $THREADS; do
+                for c in $MILESTONES; do
+                  RAYON_NUM_THREADS=$t ./cputime-$c weights $m 3 | sed "s/^CPUTIME /CPUTIME commit=$c round=$r /" | tee -a milestones.txt
+                done
+              done
+            done
+          done
+          {
+            echo "### Milestones: CPU s per segment forward (each round)"
+            echo '```'
+            sed -E 's/.*commit=([^ ]*) round=[^ ]* model=([^ ]*) threads=([^ ]*) cpu=([^ ]*) .*/\2 t\3 \1 \4/' milestones.txt \
+              | awk '{k=$1" "$2" "$3; c[k]=c[k]" "$4} END {for (k in c) print k, c[k]}' | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Bench (PyTorch)
         if: env.RUN_TORCH == 'true'
         run: |
@@ -195,4 +227,5 @@ jobs:
             torch.txt
             parity-*.txt
             compare.txt
+            milestones.txt
           if-no-files-found: ignore

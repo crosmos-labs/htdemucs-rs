@@ -117,7 +117,7 @@ pub mod prof {
 
 /// True if the CPU has AVX2 and FMA (x86-64): elementwise kernels then run in versions compiled
 /// for them. (Without target-cpu flags, x86-64 code is SSE2-only; the GEMMs dispatch on their own.)
-/// Rust never contracts a * b + c into an FMA, so both versions compute the same bits.
+/// (Rust never contracts a * b + c into an FMA by itself; kernels opt in through `MulAdd`.)
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn avx2_fma() -> bool {
@@ -136,28 +136,56 @@ pub fn avx2_fma() -> bool {
     }
 }
 
+/// a * b + c: fused (one rounding) in code compiled for FMA hardware (`Fused`: the AVX2+FMA
+/// versions on x86-64, always on aarch64), else a multiply and an add (`Unfused`; without the
+/// target feature, mul_add would be a slow library call).
+pub trait MulAdd {
+    fn fma(a: f32, b: f32, c: f32) -> f32;
+}
+pub struct Fused;
+impl MulAdd for Fused {
+    #[inline(always)]
+    fn fma(a: f32, b: f32, c: f32) -> f32 {
+        a.mul_add(b, c)
+    }
+}
+pub struct Unfused;
+impl MulAdd for Unfused {
+    #[inline(always)]
+    fn fma(a: f32, b: f32, c: f32) -> f32 {
+        a * b + c
+    }
+}
+/// The baseline build's choice.
+#[cfg(target_arch = "aarch64")]
+pub type Native = Fused;
+#[cfg(not(target_arch = "aarch64"))]
+pub type Native = Unfused;
+
 /// Defines a function whose body is compiled twice on x86-64 - for the baseline and for
-/// AVX2 + FMA - and picks one at run time (see `avx2_fma`). Elsewhere, just the function.
+/// AVX2 + FMA - and picks one at run time (see `avx2_fma`). Elsewhere, just the function. The
+/// body sees a type `F: MulAdd` (Fused in the AVX2+FMA version and on aarch64).
 macro_rules! simd_fn {
     ($(#[$m:meta])* $vis:vis fn $name:ident($($a:ident : $t:ty),* $(,)?) $(-> $r:ty)? $body:block) => {
         $(#[$m])*
         #[allow(clippy::too_many_arguments)]
         $vis fn $name($($a: $t),*) $(-> $r)? {
+            // F: how a * b + c is evaluated (see MulAdd); bodies may use F::fma, exp_g::<F>, ...
             #[inline(always)]
-            #[allow(clippy::too_many_arguments)]
-            fn imp($($a: $t),*) $(-> $r)? $body
+            #[allow(clippy::too_many_arguments, unused)]
+            fn imp<F: crate::ops::MulAdd>($($a: $t),*) $(-> $r)? $body
             #[cfg(target_arch = "x86_64")]
             {
                 #[target_feature(enable = "avx2,fma")]
                 #[allow(clippy::too_many_arguments)]
                 unsafe fn v3($($a: $t),*) $(-> $r)? {
-                    imp($($a),*)
+                    imp::<crate::ops::Fused>($($a),*)
                 }
                 if crate::ops::avx2_fma() {
                     return unsafe { v3($($a),*) };
                 }
             }
-            imp($($a),*)
+            imp::<crate::ops::Native>($($a),*)
         }
     };
 }
@@ -418,7 +446,7 @@ fn dconv_row(xr: &[f32], yt: &mut [f32], y1: &mut [f32], z: &mut [f32], t: usize
         let scale = r * gn1.0[co];
         let shift = gn1.1[co] - m * scale;
         for v in &mut y1[co * t..(co + 1) * t] {
-            *v = gelu1(*v * scale + shift);
+            *v = gelu1_g::<F>(*v * scale + shift);
         }
     }
     sgemm_par(2 * c, t, cm, &conv2.w, cm, 1, y1, t, 1, z, t, false, false);
@@ -448,13 +476,13 @@ fn glu_add_row(x: &mut [f32], d: Option<&mut [f32]>, za: &[f32], zb: &[f32], ci:
     match d {
         None => {
             for i in 0..x.len() {
-                let v = ls[ci] * (((za[i] + ba) * sa + ha) * sigmoid((zb[i] + bb) * sb + hb));
+                let v = ls[ci] * (((za[i] + ba) * sa + ha) * sigmoid_g::<F>((zb[i] + bb) * sb + hb));
                 x[i] += v;
             }
         }
         Some(dd) => {
             for i in 0..x.len() {
-                let v = ls[ci] * (((za[i] + ba) * sa + ha) * sigmoid((zb[i] + bb) * sb + hb));
+                let v = ls[ci] * (((za[i] + ba) * sa + ha) * sigmoid_g::<F>((zb[i] + bb) * sb + hb));
                 dd[i] = v;
                 x[i] += v;
             }
@@ -833,6 +861,26 @@ fn gn_plane(plane: &mut [f32], t: usize, st: &[(f32, f32)], g: f32, b: f32, f: &
 }
 }
 
+/// GroupNorm(1) per sample of a (C, S, T) tensor, then GELU, in place.
+pub fn group_norm1_gelu(x: &mut Tensor, gamma: &[f32], beta: &[f32]) {
+    let _sc = prof::scope(prof::GROUPNORM);
+    let st = row_stats(x);
+    let (s, t) = (x.shape[1], x.shape[2]);
+    x.data.par_chunks_mut(s * t).enumerate().for_each(|(ci, plane)| gn_gelu_plane(plane, t, &st, gamma[ci], beta[ci]));
+}
+
+simd_fn! {
+fn gn_gelu_plane(plane: &mut [f32], t: usize, st: &[(f32, f32)], g: f32, b: f32) {
+    for (row, &(m, r)) in plane.chunks_mut(t).zip(st) {
+        let scale = r * g;
+        let shift = b - m * scale;
+        for v in row {
+            *v = gelu1_g::<F>(*v * scale + shift);
+        }
+    }
+}
+}
+
 /// GroupNorm(1) per sample of z (2C, S, T), GLU over channels, LayerScale, residual add:
 /// x += ls * (a * sigmoid(b)) with (a, b) the normalised halves of z - the tail of a DConv branch.
 /// If `delta` is given, the added values are also written there.
@@ -883,13 +931,13 @@ fn glu_add_plane(ci: usize, c: usize, t: usize, xp: &mut [f32], dp: Option<&mut 
         match dp.as_deref_mut() {
             None => {
                 for i in 0..t {
-                    let d = ls[ci] * (((ya[i] + ba) * sa + ha) * sigmoid((yb[i] + bb) * sb + hb));
+                    let d = ls[ci] * (((ya[i] + ba) * sa + ha) * sigmoid_g::<F>((yb[i] + bb) * sb + hb));
                     xa[i] += d;
                 }
             }
             Some(dp) => {
                 for i in 0..t {
-                    let d = ls[ci] * (((ya[i] + ba) * sa + ha) * sigmoid((yb[i] + bb) * sb + hb));
+                    let d = ls[ci] * (((ya[i] + ba) * sa + ha) * sigmoid_g::<F>((yb[i] + bb) * sb + hb));
                     dp[si * t + i] = d;
                     xa[i] += d;
                 }
@@ -945,19 +993,26 @@ fn affine_row(row: &mut [f32], r: f32, m: f32, gamma: &[f32], beta: &[f32]) {
 /// branch-free so loops over it vectorise. Inputs are clamped to the finite normal range.
 #[inline(always)]
 pub fn exp(x: f32) -> f32 {
+    exp_g::<Native>(x)
+}
+
+/// `exp` with the multiply-adds evaluated by F.
+#[inline(always)]
+pub fn exp_g<F: MulAdd>(x: f32) -> f32 {
     const LOG2E: f32 = std::f32::consts::LOG2_E;
     const C1: f32 = 0.693_359_4;
     const C2: f32 = -2.121_944_4e-4;
     const ROUND: f32 = 12_582_912.0; // 1.5 * 2^23: (v + ROUND) - ROUND rounds to nearest
     let x = x.clamp(-87.336_54, 88.722_83);
-    let n = (x * LOG2E + ROUND) - ROUND;
-    let r = x - n * C1 - n * C2;
+    let n = F::fma(x, LOG2E, ROUND) - ROUND;
+    let r = F::fma(-n, C2, F::fma(-n, C1, x));
     let z = r * r;
-    let p = ((((1.987_569_1e-4 * r + 1.398_199_9e-3) * r + 8.333_452e-3) * r + 4.166_579_6e-2) * r
-        + 1.666_666_5e-1)
-        * r
-        + 5.000_000_1e-1;
-    let y = p * z + r + 1.0;
+    let mut p = F::fma(1.987_569_1e-4, r, 1.398_199_9e-3);
+    p = F::fma(p, r, 8.333_452e-3);
+    p = F::fma(p, r, 4.166_579_6e-2);
+    p = F::fma(p, r, 1.666_666_5e-1);
+    p = F::fma(p, r, 5.000_000_1e-1);
+    let y = F::fma(p, z, r) + 1.0;
     // Scale by 2^n; n + 127 stays in [1, 254] for the clamped range, except n = 128 at the top,
     // which we split in two.
     let ni = n as i32;
@@ -969,16 +1024,25 @@ pub fn exp(x: f32) -> f32 {
 /// relative error < 1.2e-7 everywhere (so no cancellation for negative x, unlike 1 + erf).
 #[inline(always)]
 pub fn gelu1(x: f32) -> f32 {
+    gelu1_g::<Native>(x)
+}
+
+/// `gelu1` with the multiply-adds evaluated by F.
+#[inline(always)]
+pub fn gelu1_g<F: MulAdd>(x: f32) -> f32 {
     let u = -x * std::f32::consts::FRAC_1_SQRT_2;
     let z = u.abs();
-    let t = 1.0 / (1.0 + 0.5 * z);
-    let poly = -1.265_512_2
-        + t * (1.000_023_7
-            + t * (0.374_091_96
-                + t * (0.096_784_18
-                    + t * (-0.186_288_06
-                        + t * (0.278_868_07 + t * (-1.135_203_98 + t * (1.488_515_87 + t * (-0.822_152_23 + t * 0.170_872_77))))))));
-    let ans = t * exp(-z * z + poly);
+    let t = 1.0 / F::fma(0.5, z, 1.0);
+    let mut p = F::fma(t, 0.170_872_77, -0.822_152_23);
+    p = F::fma(t, p, 1.488_515_87);
+    p = F::fma(t, p, -1.135_203_98);
+    p = F::fma(t, p, 0.278_868_07);
+    p = F::fma(t, p, -0.186_288_06);
+    p = F::fma(t, p, 0.096_784_18);
+    p = F::fma(t, p, 0.374_091_96);
+    p = F::fma(t, p, 1.000_023_7);
+    let poly = F::fma(t, p, -1.265_512_2);
+    let ans = t * exp_g::<F>(F::fma(-z, z, poly));
     let erfc = if u >= 0.0 { ans } else { 2.0 - ans };
     0.5 * x * erfc
 }
@@ -991,14 +1055,19 @@ pub fn gelu(x: &mut [f32]) {
 simd_fn! {
 pub fn gelu_slice(x: &mut [f32]) {
     for v in x.iter_mut() {
-        *v = gelu1(*v);
+        *v = gelu1_g::<F>(*v);
     }
 }
 }
 
 #[inline(always)]
 pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + exp(-x))
+    sigmoid_g::<Native>(x)
+}
+
+#[inline(always)]
+pub fn sigmoid_g<F: MulAdd>(x: f32) -> f32 {
+    1.0 / (1.0 + exp_g::<F>(-x))
 }
 
 /// GLU over the first axis: (2C, ...) -> (C, ...), a * sigmoid(b).
@@ -1019,7 +1088,7 @@ pub fn glu(x: &Tensor) -> Tensor {
 simd_fn! {
 fn glu_slice(o: &mut [f32], a: &[f32], b: &[f32]) {
     for i in 0..o.len() {
-        o[i] = a[i] * sigmoid(b[i]);
+        o[i] = a[i] * sigmoid_g::<F>(b[i]);
     }
 }
 }
@@ -1060,7 +1129,7 @@ simd_fn! {
 /// v = GELU(v + b) over a slice.
 fn bias_gelu_slice(x: &mut [f32], b: f32) {
     for v in x.iter_mut() {
-        *v = gelu1(*v + b);
+        *v = gelu1_g::<F>(*v + b);
     }
 }
 }
@@ -1096,7 +1165,7 @@ pub fn glu_bias(x: &Tensor, bias: &[f32]) -> Tensor {
 simd_fn! {
 fn glu_bias_slice(o: &mut [f32], a: &[f32], b: &[f32], ba: f32, bb: f32) {
     for i in 0..o.len() {
-        o[i] = (a[i] + ba) * sigmoid(b[i] + bb);
+        o[i] = (a[i] + ba) * sigmoid_g::<F>(b[i] + bb);
     }
 }
 }
@@ -1134,7 +1203,7 @@ fn softmax_row(row: &mut [f32], scale: f32) {
     }
     let mx = m8.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     for s in row.iter_mut() {
-        *s = exp(*s * scale - mx);
+        *s = exp_g::<F>(*s * scale - mx);
     }
     let inv = (1.0 / sum64(row)) as f32;
     for s in row.iter_mut() {
@@ -1155,27 +1224,6 @@ fn attn_block() -> usize {
 fn attn_kernel() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *B.get_or_init(|| std::env::var("HTDEMUCS_ATTN_KERNEL").as_deref() == Ok("1"))
-}
-
-/// a * b + c, fused (one rounding) where the hardware has FMA, else two roundings.
-trait MulAdd {
-    fn fma(a: f32, b: f32, c: f32) -> f32;
-}
-struct Fused;
-impl MulAdd for Fused {
-    #[inline(always)]
-    fn fma(a: f32, b: f32, c: f32) -> f32 {
-        a.mul_add(b, c)
-    }
-}
-#[cfg(not(target_arch = "aarch64"))]
-struct Unfused;
-#[cfg(not(target_arch = "aarch64"))]
-impl MulAdd for Unfused {
-    #[inline(always)]
-    fn fma(a: f32, b: f32, c: f32) -> f32 {
-        a * b + c
-    }
 }
 
 /// Keys / values per chunk in `attn_kernel_task`: K^T and V chunks of d x 256 floats stay in L1/L2.
@@ -1399,17 +1447,42 @@ pub fn attention_into(q: &[f32], q_rs: usize, k: &[f32], k_rs: usize, v: &[f32],
 mod tests {
     use super::*;
 
-    #[test]
-    fn exp_accuracy() {
+    fn exp_worst<F: MulAdd>() -> f64 {
         let mut worst = 0f64;
         let mut x = -87.0f32;
         while x < 88.0 {
             let e = (x as f64).exp();
-            let rel = ((exp(x) as f64 - e) / e).abs();
+            let rel = ((exp_g::<F>(x) as f64 - e) / e).abs();
             worst = worst.max(rel);
             x += 0.001_37;
         }
-        assert!(worst < 2.5e-7, "exp rel err {worst}");
+        worst
+    }
+
+    #[test]
+    fn exp_accuracy() {
+        for (name, worst) in [("unfused", exp_worst::<Unfused>()), ("fused", exp_worst::<Fused>())] {
+            assert!(worst < 2.5e-7, "exp ({name}) rel err {worst}");
+        }
+    }
+
+    fn gelu_worst<F: MulAdd>() -> f64 {
+        let mut worst = 0f64;
+        let mut x = -12.0f32;
+        while x < 12.0 {
+            let xd = x as f64;
+            let g = 0.5 * xd * libm::erfc(-xd / std::f64::consts::SQRT_2);
+            worst = worst.max((gelu1_g::<F>(x) as f64 - g).abs() / g.abs().max(1e-4));
+            x += 0.000_97;
+        }
+        worst
+    }
+
+    #[test]
+    fn gelu_fused_accuracy() {
+        for (name, worst) in [("unfused", gelu_worst::<Unfused>()), ("fused", gelu_worst::<Fused>())] {
+            assert!(worst < 2e-6, "gelu ({name}) rel err {worst}");
+        }
     }
 
     #[test]
