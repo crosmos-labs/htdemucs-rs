@@ -81,7 +81,11 @@ pub fn separate(
         let kim = MelRoformer::load(weights, "melroformer")?;
         let ch = Chunking::new(&kim.cfg, kim_overlap.unwrap_or(kim.cfg.num_overlap))?;
         let mut err = None;
-        let f = |part: &[f32]| kim.forward(part, &mut Tracer::none());
+        // HTDEMUCS_CHAIN_DRYRUN=1 (memory measurements only): Kim's "vocals" are the mix itself, so
+        // the instrumental is silent and Demucs runs no segments - every track-long buffer is
+        // allocated and filled as in a real run, in seconds instead of hours.
+        let dry = std::env::var_os("HTDEMUCS_CHAIN_DRYRUN").is_some();
+        let f = |part: &[f32]| if dry { part.to_vec() } else { kim.forward(part, &mut Tracer::none()) };
         roformer::separate_stream(&mix, &ch, &f, progress, &mut |t0, l, r| {
             for (c, v) in [l, r].into_iter().enumerate() {
                 for (i, &x) in v.iter().enumerate() {

@@ -29,10 +29,11 @@ on:
   # A push that changes .github/bench/mr_run.env runs with the settings in that file (for branches,
   # where workflow_dispatch is not available until the workflow is on the default branch).
   push:
-    branches: [melroformer]
+    branches: [melroformer, chain]
     paths:
       - .github/workflows/bench-roformer.yml
       - .github/bench/mr_run.env
+      - .github/bench/chain_run.env
 
 concurrency:
   group: bench-roformer-${{ github.run_id }}
@@ -52,7 +53,8 @@ jobs:
       - name: Settings (inputs, or .github/bench/mr_run.env for push runs)
         run: |
           if [ "${{ github.event_name }}" = push ]; then
-            grep -E '^(THREADS|RUNS|VARIANTS|RUN_TORCH|RUN_PARITY)=' .github/bench/mr_run.env >> "$GITHUB_ENV"
+            grep -E '^(THREADS|RUNS|VARIANTS|RUN_TORCH|RUN_PARITY|RUN_CHAIN|CHAIN_SECONDS|CHAIN_THREADS|RUN_MR_BENCH)=' .github/bench/mr_run.env >> "$GITHUB_ENV"
+            [ -f .github/bench/chain_run.env ] && grep -E '^[A-Z_]+=' .github/bench/chain_run.env >> "$GITHUB_ENV" || true
           else
             {
               echo "THREADS=${{ inputs.threads }}"; echo "RUNS=${{ inputs.runs }}"; echo "VARIANTS=${{ inputs.variants }}"
@@ -82,7 +84,7 @@ jobs:
 
       - name: Need Python?
         run: |
-          if [ "$RUN_TORCH" = true ] || [ "$RUN_PARITY" = true ] || [ "${{ steps.ckpt.outputs.cache-hit }}" != true ]; then
+          if [ "$RUN_TORCH" = true ] || [ "$RUN_PARITY" = true ] || [ "$RUN_CHAIN" = true ] || [ "${{ steps.ckpt.outputs.cache-hit }}" != true ]; then
             echo NEED_PY=true >> "$GITHUB_ENV"
           fi
 
@@ -123,7 +125,7 @@ jobs:
         run: cargo build --release --bins && ls -l target/release/htdemucs-rs target/release/mr_bench
 
       - name: Tests
-        run: cargo test --release -q
+        run: cargo test --release -q --lib --bins --tests
 
       - name: Parity (synthetic 12 s clip; references made here)
         if: env.RUN_PARITY == 'true'
@@ -150,10 +152,32 @@ jobs:
             echo "- Rust full path: $(tail -1 rust-separate.txt)"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Chain (-n chain vs PyTorch, synthetic clip made here)
+        if: env.RUN_CHAIN == 'true'
+        run: |
+          pip install -q demucs==4.0.1
+          python tools/convert.py htdemucs htdemucs_6s
+          mkdir -p ref/ci
+          python .github/bench/synth.py ref/ci/c0.wav ${CHAIN_SECONDS:-30}
+          python -c "import soundfile as sf, numpy as np; x, r = sf.read('ref/ci/c0.wav', dtype='float32'); x += (np.random.default_rng(7).standard_normal(x.shape) * 1e-3).astype('float32'); sf.write('ref/ci/chain.wav', x, r, subtype='FLOAT')"
+          T=${CHAIN_THREADS:-2}
+          /usr/bin/time -f "rust chain: %e s wall, %U+%S s CPU, peak RSS %M KB" \
+            ./target/release/htdemucs-rs separate -q -v --threads $T -n chain --float32 --clip-mode none -o sep ref/ci/chain.wav 2>&1 | tee chain-rust.txt
+          /usr/bin/time -f "torch chain: %e s wall, %U+%S s CPU, peak RSS %M KB" \
+            python tools/chain_ref.py $KIM $CKPT ref/ci/chain.wav ref/ci/chain --threads $T 2>&1 | grep -v -i warn | tee chain-torch.txt
+          ./target/release/compare ref/ci/chain.4.safetensors sep/htdemucs/chain | tee -a chain-compare.txt
+          ./target/release/compare ref/ci/chain.6.safetensors sep/htdemucs_6s/chain | tee -a chain-compare.txt
+          {
+            echo "### Chain (${CHAIN_SECONDS:-30} s synthetic clip, $T threads)"
+            echo '```'; cat chain-rust.txt chain-torch.txt chain-compare.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Kernel micro-benchmarks (ns per element)
+        if: env.RUN_MR_BENCH != 'false'
         run: cargo run --release -q --example mr_micro | tee micro.txt
 
       - name: Bench (Rust)
+        if: env.RUN_MR_BENCH != 'false'
         run: |
           first=1
           for v in $VARIANTS; do
@@ -186,6 +210,9 @@ jobs:
             micro.txt
             torch.txt
             mr-parity.txt
+            chain-rust.txt
+            chain-torch.txt
+            chain-compare.txt
             compare.txt
             torch-separate.txt
             rust-separate.txt
