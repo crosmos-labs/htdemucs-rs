@@ -794,6 +794,31 @@ fn sqdev64(x: &[f32], m: f64) -> f64 {
 }
 }
 
+/// `mean_std` of a sequence that is never materialised: `fill(start, buf)` writes elements
+/// [start, start + buf.len()). Chunked exactly like `big_stats`, so the result is bit-identical to
+/// `mean_std` of the same values in a Vec.
+pub fn mean_std_by(len: usize, fill: impl Fn(usize, &mut [f32]) + Sync) -> (f32, f32) {
+    const B: usize = 1 << 16;
+    let n = len as f64;
+    let chunk = |k: usize, buf: &mut Vec<f32>| {
+        let a = k * B;
+        buf.resize((len - a).min(B), 0.0);
+        fill(a, buf);
+    };
+    let nb = len.div_ceil(B);
+    let parts: Vec<f64> = (0..nb).into_par_iter().map_init(Vec::new, |buf, k| {
+        chunk(k, buf);
+        sum64(buf)
+    }).collect();
+    let mean = parts.iter().sum::<f64>() / n;
+    let parts: Vec<f64> = (0..nb).into_par_iter().map_init(Vec::new, |buf, k| {
+        chunk(k, buf);
+        sqdev64(buf, mean)
+    }).collect();
+    let var = parts.iter().sum::<f64>() / n;
+    (mean as f32, (var * n / (n - 1.0)).sqrt() as f32)
+}
+
 /// Mean and biased variance of a large slice, f64 two-pass, in parallel. Partial sums are
 /// collected and added in a fixed order, so the result does not depend on the thread count.
 fn big_stats(x: &[f32]) -> (f64, f64) {

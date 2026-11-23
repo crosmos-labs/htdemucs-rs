@@ -7,6 +7,7 @@
 //! but still consumes generator output (getrandbits(1), repeated until it returns 0), so the
 //! second shift's offset depends on how many segments the first pass had.
 
+#[derive(Clone)]
 pub struct PyRandom {
     mt: [u32; 624],
     idx: usize,

@@ -87,6 +87,9 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     if !(0.0..1.0).contains(&a.opts.overlap) {
         return Err("--overlap must be in [0, 1)".into());
     }
+    if a.threads == Some(0) {
+        return Err("--threads must be at least 1".into());
+    }
     Ok(a)
 }
 
@@ -102,28 +105,6 @@ fn prevent_clip(x: &mut [f32], mode: &str) {
         "clamp" => x.iter_mut().for_each(|v| *v = v.clamp(-0.99, 0.99)),
         _ => {}
     }
-}
-
-/// Exactly how many segment forwards `apply::separate` will run: replays the shift offsets with
-/// the same CPython-compatible generator (each pass: randint, then one randrange(1) per segment).
-fn segment_count(model: &HTDemucs, len: usize, opts: &Options) -> usize {
-    let seg = model.cfg.training_length;
-    let stride = ((1.0 - opts.overlap) * seg as f32) as usize;
-    if opts.shifts == 0 {
-        return len.div_ceil(stride);
-    }
-    let ms = model.cfg.samplerate / 2;
-    let mut rng = htdemucs::pyrandom::PyRandom::new(opts.seed);
-    let mut total = 0;
-    for _ in 0..opts.shifts {
-        let offset = rng.randint(0, ms as u32) as usize;
-        let n = (len + ms - offset).div_ceil(stride);
-        for _ in 0..n {
-            rng.randrange(1);
-        }
-        total += n;
-    }
-    total
 }
 
 fn mmss(s: f64) -> String {
@@ -173,8 +154,12 @@ fn run(a: Args) -> Result<(), String> {
     }
     let t0 = Instant::now();
     let model = HTDemucs::load(&a.weights, &a.name)?;
+    apply::stride(&model, a.opts.overlap).map_err(|e| format!("--overlap: {e}"))?;
     let rate = model.cfg.samplerate as u32;
     let ch = model.cfg.audio_channels;
+    // Python's `random` as demucs sees it: seeded once, then carried on across the tracks of one
+    // run (demucs.separate separates them one after another with the same generator).
+    let mut rng = htdemucs::pyrandom::PyRandom::new(a.opts.seed);
     for track in &a.tracks {
         let t1 = Instant::now();
         let input = audio::decode(track)?;
@@ -183,7 +168,7 @@ fn run(a: Args) -> Result<(), String> {
         if a.verbose {
             eprintln!("{}: {:.1} s of audio, decoded in {:.2}s", track.display(), len as f64 / rate as f64, t1.elapsed().as_secs_f64());
         }
-        let total = segment_count(&model, len, &a.opts);
+        let total = apply::forwards(&model, len, &a.opts, &rng);
         let mut done = 0;
         let t2 = Instant::now();
         let show = a.progress;
@@ -197,9 +182,14 @@ fn run(a: Args) -> Result<(), String> {
                 tqdm_line(done, total, stride_sec, t2.elapsed().as_secs_f64());
             }
         };
-        let mut stems = apply::separate(&model, &input.data, ch, &a.opts, &mut progress);
+        let sep = apply::separate(&model, &input.data, ch, &a.opts, &mut rng, &mut progress);
+        drop(input); // not needed any more: free it before writing
+        let mut stems = sep.stems;
         if show {
             eprintln!();
+        }
+        if sep.silent {
+            eprintln!("warning: {}: the input is silent (or constant): writing silent stems", track.display());
         }
         if a.verbose {
             eprintln!("  separated in {:.1}s", t2.elapsed().as_secs_f64());
