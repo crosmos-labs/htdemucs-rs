@@ -144,8 +144,10 @@ pub fn separate(model: &HTDemucs, wav: &[f32], channels: usize, opts: &Options, 
 /// output). Each finished position is the passes' sum in pass order, as `separate` adds them, so
 /// the output is bit-identical to it.
 ///
-///     let mut s = Streamer::new(model, wav, channels, opts, rng);
-///     while s.step(progress) {}  // or interleave steps with `ready` / `take`
+/// ```text
+/// let mut s = Streamer::new(model, wav, channels, opts, rng);
+/// while s.step(progress) {}  // or interleave steps with `ready` / `take`
+/// ```
 pub struct Streamer<'a> {
     model: &'a HTDemucs,
     mix: Mix<'a>,
