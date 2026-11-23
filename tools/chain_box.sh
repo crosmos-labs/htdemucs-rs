@@ -51,6 +51,7 @@ sdr)
   done ;;
 memory)
   d=$OUT/memory; mkdir -p "$d"
+  [ -f "$SONGS/long22.wav" ] && ln -sf "$SONGS/long22.wav" "$d/long22.wav"  # the Demucs path's 22-min track
   [ -f "$d/long22.wav" ] || ffmpeg -v error -stream_loop 5 -i "$SONGS/system-of-a-down-aerials.wav" -t 1320 -c:a pcm_f32le "$d/long22.wav"
   for f in "$SONGS/system-of-a-down-aerials.wav" "$d/long22.wav"; do
     n=$(basename "$f" .wav); [ -f "$d/$n.txt" ] && continue
