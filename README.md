@@ -25,6 +25,15 @@ Same options and defaults as demucs where they exist (`-n`, `--shifts` (1), `--o
 `demucs_seeded.py` does), `--threads`, `--weights DIR` (or `$HTDEMUCS_WEIGHTS`), and
 `--clip-mode none`. No `--mp3`: write FLAC/WAV and encode afterwards.
 
+`-n ensemble` runs htdemucs_6s and htdemucs on one decode and averages them (vocals, drums,
+bass: the mean; 4-stem other: the mean of htdemucs' other and 6s' guitar + piano + other; the
+6-stem set keeps 6s' guitar and piano with other = that mean minus them, so both views agree and
+the stems sum as closely to the mix as each model does - `src/ensemble.rs`). It writes
+`DIR/htdemucs/<track>/` (4 stems, clip mode `--clip-mode-4`, default `--clip-mode`) and
+`DIR/htdemucs_6s/<track>/` (6 stems); each model gets its own seeded generator, so its part is
+exactly what its own run would give. Research round 2 scored it at shifts 0 above htdemucs at
+shifts 2 on every MUSDB stem at about half the CPU of running both models at shifts 2.
+
 Input: WAV (PCM / float), FLAC, MP3, AAC-LC in MP4/M4A, decoded in pure Rust (symphonia), converted
 like demucs (to 44.1 kHz only if needed, mono duplicated, more than 2 channels: the first two).
 MP4 edit lists are applied as ffmpeg does (symphonia ignores them), so an M4A decodes to the
