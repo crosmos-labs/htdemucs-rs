@@ -126,7 +126,12 @@ jobs:
         if: env.RUN_PARITY == 'true'
         run: |
           mkdir -p ref/ci
-          python .github/bench/synth.py ref/ci/synth.wav 12
+          python .github/bench/synth.py ref/ci/synth0.wav 12
+          # + a -60 dBFS white-noise floor: the synthetic mix leaves whole mel bands at FFT-rounding
+          # level, which the band split's RMSNorm scales to unit vectors - there PyTorch float32
+          # itself is 11 dB (band split) / 23 dB (output) from PyTorch float64, so no float32
+          # implementation can match it (see README).
+          python -c "import soundfile as sf, numpy as np; x, r = sf.read('ref/ci/synth0.wav', dtype='float32'); x += (np.random.default_rng(7).standard_normal(x.shape) * 1e-3).astype('float32'); sf.write('ref/ci/synth.wav', x, r, subtype='FLOAT')"
           python tools/melroformer.py segment $KIM $CKPT ref/ci/synth.wav ref/ci/seg.safetensors --chunk 1 --threads 2
           ./target/release/mr_parity weights ref/ci/seg.safetensors | tee mr-parity.txt
           rm ref/ci/seg.safetensors
