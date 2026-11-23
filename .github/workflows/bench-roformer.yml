@@ -155,7 +155,6 @@ jobs:
       - name: Chain (-n chain vs PyTorch, synthetic clip made here)
         if: env.RUN_CHAIN == 'true'
         run: |
-          pip install -q demucs==4.0.1
           python tools/convert.py htdemucs htdemucs_6s
           mkdir -p ref/ci
           python .github/bench/synth.py ref/ci/c0.wav ${CHAIN_SECONDS:-30}
