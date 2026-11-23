@@ -151,35 +151,36 @@ Speed, one segment on an M1 Pro (8 threads, quiet machine): PyTorch 2.2.2 CPU 3.
 ## Parity, full songs (vs PyTorch CPU float32, demucs' own code path)
 
 Fretboard's four test songs, decoded once by ffmpeg to float WAV (the same file feeds both),
-seed 0, SNR in dB per stem over the whole song (`tools/ref_songs.sh`, `tools/parity_songs.sh`,
-Accelerate build; the gemm build gives the same to within ~1 dB).
+seed 0, SNR in dB per stem over the whole song. Measured with the **default build** (the `gemm`
+crate: the Linux code path; here its NEON kernels) at `f23ab23`, 4 threads
+(`tools/parity_table.sh`); the earlier Accelerate-build table agreed to within ~4 dB everywhere.
 
 | htdemucs | shifts | drums | bass | other | vocals |
 |---|---|---|---|---|---|
-| Aerials | 2 | 116.1 | 122.0 | 125.4 | 129.4 |
-| Aerials | 0 | 113.2 | 118.7 | 122.6 | 126.9 |
-| The Man Who Sold the World | 2 | 119.3 | 122.1 | 125.5 | 128.0 |
-| The Man Who Sold the World | 0 | 116.7 | 119.4 | 122.7 | 125.0 |
-| Never Too Late | 2 | 118.7 | 125.1 | 124.2 | 129.0 |
-| Never Too Late | 0 | 115.7 | 122.3 | 121.3 | 126.3 |
-| Iss Tarah | 2 | 118.4 | 124.6 | 123.8 | 128.0 |
-| Iss Tarah | 0 | 116.0 | 121.4 | 120.4 | 125.5 |
+| Aerials | 2 | 116.0 | 120.5 | 124.8 | 128.6 |
+| Aerials | 0 | 113.1 | 118.1 | 122.2 | 126.2 |
+| The Man Who Sold the World | 2 | 119.1 | 121.5 | 125.0 | 128.0 |
+| The Man Who Sold the World | 0 | 116.3 | 118.7 | 122.3 | 125.1 |
+| Never Too Late | 2 | 118.6 | 124.9 | 123.9 | 128.4 |
+| Never Too Late | 0 | 115.6 | 122.1 | 121.0 | 125.6 |
+| Iss Tarah | 2 | 118.4 | 124.0 | 123.4 | 127.7 |
+| Iss Tarah | 0 | 116.2 | 122.0 | 120.3 | 124.8 |
 
 | htdemucs_6s | shifts | drums | bass | other | vocals | guitar | piano |
 |---|---|---|---|---|---|---|---|
-| Aerials | 2 | 124.0 | 120.9 | 111.8 | 128.8 | 124.4 | 101.9 |
-| Aerials | 0 | 121.3 | 117.9 | 113.8 | 126.3 | 122.2 | 94.3 |
-| The Man Who Sold the World | 2 | 120.9 | 120.6 | 109.2 | 126.5 | 123.4 | 94.7 |
-| The Man Who Sold the World | 0 | 119.0 | 117.8 | 112.0 | 124.7 | 120.8 | 95.0 |
-| Never Too Late | 2 | 125.7 | 124.8 | 108.3 | 128.4 | 124.9 | 100.0 |
-| Never Too Late | 0 | 122.9 | 122.0 | 107.4 | 125.9 | 122.2 | 103.8 |
-| Iss Tarah | 2 | 122.7 | 125.4 | 121.0 | 126.5 | 120.4 | 118.3 |
-| Iss Tarah | 0 | 119.6 | 122.0 | 117.9 | 124.0 | 116.4 | 116.7 |
+| Aerials | 2 | 123.4 | 120.0 | 113.1 | 128.0 | 124.2 | 100.2 |
+| Aerials | 0 | 120.6 | 117.1 | 111.2 | 125.2 | 121.5 | 93.8 |
+| The Man Who Sold the World | 2 | 119.4 | 119.4 | 104.8 | 126.5 | 122.4 | 93.3 |
+| The Man Who Sold the World | 0 | 118.2 | 117.0 | 106.7 | 123.9 | 120.1 | 95.3 |
+| Never Too Late | 2 | 125.0 | 124.3 | 108.8 | 127.9 | 124.4 | 102.5 |
+| Never Too Late | 0 | 122.3 | 121.6 | 107.9 | 125.3 | 121.7 | 100.0 |
+| Iss Tarah | 2 | 121.8 | 124.5 | 119.8 | 126.0 | 117.6 | 118.5 |
+| Iss Tarah | 0 | 118.8 | 121.4 | 118.5 | 124.3 | 116.5 | 116.4 |
 
-The absolute error is the same everywhere, -134 to -160 dBFS RMS (max abs error 0.4-10 x 1e-6);
+The absolute error is the same everywhere, -134 to -160 dBFS RMS (max abs error 0.4-12 x 1e-6);
 SNR is relative to each stem's own level, so the lower figures are near-silent stems: the 6-stem
 "piano" on the three rock songs sits at -49 to -67 dBFS RMS (e.g. The Man Who Sold the World,
-shifts 2: piano at -67 dBFS, 94.7 dB SNR, error -162 dBFS, max abs 5.8e-7), and "other" at
+shifts 2: piano at -67 dBFS, 93.3 dB SNR, error -160 dBFS), and "other" at
 -34 to -42 dBFS there.
 
 Decoder: symphonia (+ edit lists) vs ffmpeg on the four m4a files: same length, aligned, 127-134
