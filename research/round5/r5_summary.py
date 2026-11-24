@@ -35,10 +35,10 @@ ALL = {k: v for s in SETS for k, v in data[s].items()}
 vs = [v for v in ORDER if ALL and all(v in d for d in ALL.values())]
 f2 = lambda x: '–' if x is None or (isinstance(x, float) and np.isnan(x)) else f'{x:.2f}'
 
-def delta(D, v, k, key):
-    items = [i for i, d in D.items() if d[v][k][key] is not None and d['hyb6'][k][key] is not None]
-    dl = np.array([D[i][v][k][key] - D[i]['hyb6'][k][key] for i in items])
-    if v == 'hyb6' or not len(dl): return '–', dl
+def delta(D, v, k, key, base='hyb6'):
+    items = [i for i, d in D.items() if d[v][k][key] is not None and d[base][k][key] is not None]
+    dl = np.array([D[i][v][k][key] - D[i][base][k][key] for i in items])
+    if v == base or not len(dl): return '–', dl
     lo, hi = boot(dl); return f'{dl.mean():+.2f} [{lo:+.2f}, {hi:+.2f}] {int((dl > 0).sum())}/{len(dl)}', dl
 
 def table(D, title):
@@ -65,6 +65,20 @@ table(ALL, 'Pooled: 26 Cambridge-MT songs')
 for s, t in SETS.items():
     if data[s]: table(data[s], f'{s}: {t}')
 
+print('## Paired comparisons, pooled 26 songs (Δ uSDR [95 % CI] items up; for keys and other: items that have the part; '
+      '"removed" Δ over all 26 in brackets after)\n')
+PAIRS = [('mega_mix', 'hyb6'), ('kim_mega', 'hyb6'), ('mega_mix', 'chain'), ('kim_mega', 'chain'), ('kim_mega', 'mega_mix'),
+         ('chain', 'hyb6'), ('chain+mg', 'chain'), ('chain+mgk', 'chain')]
+PAIRS = [(a_, b_) for a_, b_ in PAIRS if a_ in vs and b_ in vs]
+print('| stem | ' + ' | '.join(f'`{a_}` − `{b_}`' for a_, b_ in PAIRS) + ' |\n|---|' + '---|' * len(PAIRS))
+for k in STEMS:
+    cells = []
+    for a_, b_ in PAIRS:
+        du, _ = delta(ALL, a_, k, 'usdr', b_); dr, x = delta(ALL, a_, k, 'removed', b_)
+        cells.append(f'{du} ({x.mean():+.2f} removed)' if len(x) else du)
+    print(f'| {k} | ' + ' | '.join(cells) + ' |')
+print()
+
 print('## Sum-to-mix residual per recipe (dB re the mix)\n')
 print('| variant | mean | min | max |\n|---|---|---|---|')
 for v in vs:
@@ -79,4 +93,15 @@ for k in STEMS:
     for i, d in ALL.items():
         if k not in d['_meta']['has']: continue
         print(f'| {i} | {d["_meta"]["stem_db_re_mix"][k]:.1f} | ' + ' | '.join(f2(d[v][k]['usdr']) for v in MAIN) + ' |')
+    print()
+
+cf = os.path.join(root, 'cost.jsonl')
+if os.path.exists(cf):
+    print('## Cost runs (scores/cost.jsonl; CPU = user + sys of the process, s per audio s)\n')
+    print('| host | pass | device | threads | input | audio s | CPU-s / audio-s | wall-s / audio-s | Mega long-track rate (per-chunk CPU) | peak RSS GB | GPU mem GB |')
+    print('|---|---|---|---|---|---|---|---|---|---|---|')
+    for l in open(cf):
+        c = json.loads(l)
+        print(f"| {c.get('host','')} | {c['pass']} | {c.get('device','cpu')} | {c['threads']} | {c['input']} | {c['audio_s']} | {c['cpu_per_audio_s']} | "
+              f"{c['wall_per_audio_s']} | {c.get('mega_rate_long') or '–'} | {c['peak_rss_gb']} | {c.get('gpu_mem_gb') or '–'} |")
     print()
