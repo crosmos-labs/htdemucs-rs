@@ -1,65 +1,45 @@
 #!/bin/bash
-# Round 5 CPU cost on the Mac (Apple M1 Pro: 6 performance + 2 efficiency cores, 16 GB), one job at a time under the
-# shared heavy lock. Every pass is timed by /usr/bin/time -l (user + sys CPU seconds, wall, peak RSS) and appended as a
-# JSON line to scores/cost.jsonl.   r5_cost.sh <tag> [<tag> ...]   tags: rust8 | rust8full | rust1 | mega | mega1 | mega1full
-# Inputs: the 30 s excerpt = the first 30 s of cmt8/AngelsInAmplifiers_ImAlright (its 60-90 s); the full song =
-# MUSDB18-HQ test "AM Contra - Heart Peripheral" (210.1 s).
+# Round 5 cost: CPU seconds per audio second of every pass, one job at a time under the shared heavy lock. Each pass runs
+# under r5_time.py (user + sys CPU of the child, wall, peak RSS) and appends a JSON line to scores/cost.jsonl.
+#   r5_cost.sh <tag> [<tag> ...]   tags: rust8 rust1 rust1full mega8 mega1 mega1full gpu
+# env: as r5_queue.sh (D, PY, MSST, M, W, LOCKCMD) plus FULL (the full song) and HOST (label written into each line).
+# Inputs: the 30 s excerpt = the first 30 s of cmt8/AngelsInAmplifiers_ImAlright (its 60-90 s of the song); the full
+# song = MUSDB18-HQ test "AM Contra - Heart Peripheral" (210.1 s).
 set -u
 R=$(cd "$(dirname "$0")/../.." && pwd); OUT=$R/research/round5/scores/cost.jsonl; mkdir -p "$(dirname "$OUT")"
-W=${W:-/Users/divyansh/work/mac-testing/r5cost}; mkdir -p "$W"
-PY=${PY:-/Users/divyansh/work/mac-testing/r5env/bin/python}; MSST=${MSST:-/Users/divyansh/work/mac-testing/Music-Source-Separation-Training}
-LOCK=/private/tmp/claude-503/heavy.lock; BIN=$R/target/release/htdemucs-rs; M=$R/research/round4/data/models
-export HTDEMUCS_WEIGHTS=$R/weights MELROFORMER_WEIGHTS=melroformer-f16
-EX=$W/ex30.wav; FULL="/Users/divyansh/datasets/musdb18hq/test/AM Contra - Heart Peripheral/mixture.wav"
-[ -f "$EX" ] || "$PY" -I -c "import soundfile as sf; x,sr=sf.read('/Users/divyansh/datasets/r4/cmt8/AngelsInAmplifiers_ImAlright/mixture.wav',dtype='float32'); sf.write('$EX',x[:30*sr],sr,subtype='FLOAT')"
-dur() { "$PY" -I -c "import soundfile as sf,sys; print(sf.info(sys.argv[1]).duration)" "$1"; }
+WK=${WK:-$HOME/work/round5/cost}; mkdir -p "$WK"
+D=${D:-/Users/divyansh/datasets/r4}; PY=${PY:-python3}; MSST=${MSST:?}; M=${M:?}
+LOCKCMD=${LOCKCMD:-lockf -k /private/tmp/claude-503/heavy.lock}; BIN=$R/target/release/htdemucs-rs; HOST=${HOST:-$(uname -n)}
+export HTDEMUCS_WEIGHTS=${W:-$R/weights} MELROFORMER_WEIGHTS=melroformer-f16
+EX=$WK/ex30.wav; FULL=${FULL:?}
+[ -f "$EX" ] || "$PY" -I -c "import soundfile as sf; x,sr=sf.read('$D/cmt8/AngelsInAmplifiers_ImAlright/mixture.wav',dtype='float32'); sf.write('$EX',x[:30*sr],sr,subtype='FLOAT')"
 
-run() {  # run <pass> <threads> <input name> <input> <cmd...>
-  local pass=$1 th=$2 iname=$3 in=$4; shift 4
-  local t=$W/time.txt log=$W/run.log
-  lockf -k $LOCK /usr/bin/time -l "$@" > "$log" 2> "$t" || { echo "FAIL $pass $th $iname"; tail -3 "$t"; return; }
-  "$PY" -I - "$pass" "$th" "$iname" "$(dur "$in")" "$t" "$log" >> "$OUT" <<'EOF'
-import json, re, sys
-p, th, iname, d, t, log = sys.argv[1:]; s = open(t).read(); d = float(d)
-real, user, sys_ = (float(x) for x in re.search(r'([\d.]+) real\s+([\d.]+) user\s+([\d.]+) sys', s).groups())
-rss = int(re.search(r'(\d+)\s+maximum resident set size', s).group(1))
-r = {'pass': p, 'threads': int(th), 'input': iname, 'audio_s': round(d, 2), 'cpu_s': round(user + sys_, 2), 'wall_s': real,
-     'cpu_per_audio_s': round((user + sys_) / d, 3), 'wall_per_audio_s': round(real / d, 3), 'peak_rss_gb': round(rss / 2**30, 2)}
-for line in open(log):   # r5_mega.py's own JSON (per-chunk CPU → long-track rate)
-    if line.startswith('{'): j = json.loads(line); r['mega_rate_long'] = j['rate_long']; r['mega_chunks'] = j['chunks']
-print(json.dumps(r)); sys.stderr.write(json.dumps(r) + '\n')
-EOF
+run() {  # run <pass> <threads> <input name> <input> <device> <cmd...>
+  local pass=$1 th=$2 iname=$3 in=$4 dev=$5; shift 5
+  $LOCKCMD "$PY" -I "$R/research/round5/r5_time.py" "$pass" "$th" "$iname" "$in" "$dev" "$HOST" -- "$@" >> "$OUT" || echo "FAIL $pass $th $iname"
+  tail -1 "$OUT"
 }
-
 rust() {  # <pass> <model> <threads> <iname> <input>
-  rm -rf "$W/o"; run "$1" "$3" "$4" "$5" "$BIN" separate -n "$2" --threads "$3" --float32 --clip-mode none -q -o "$W/o" "$5"
+  rm -rf "$WK/o"; run "$1" "$3" "$4" "$5" cpu "$BIN" separate -n "$2" --threads "$3" --float32 --clip-mode none -q -o "$WK/o" "$5"
 }
-mega() {  # <pass> <heads> <threads> <iname> <input> [--minus vocals.wav]
-  local p=$1 h=$2 th=$3 iname=$4 in=$5; shift 5
-  run "$p" "$th" "$iname" "$in" "$PY" -I "$R/research/round5/r5_mega.py" "$MSST" $M/mega53.ckpt $M/mega53.yaml "$in" "$W/m.npy" \
-    --stems "$h" --device cpu --threads "$th" "$@"
+mega() {  # <pass> <heads> <threads> <iname> <input> <device> [--minus vocals.wav]
+  local p=$1 h=$2 th=$3 iname=$4 in=$5 dev=$6; shift 6
+  run "$p" "$th" "$iname" "$in" "$dev" "$PY" -I "$R/research/round5/r5_mega.py" "$MSST" $M/mega53.ckpt $M/mega53.yaml "$in" "$WK/m.npy" \
+    --stems "$h" --device "$dev" --threads "$th" "$@"
 }
+kimvoc() { [ -f "$WK/kim/melroformer/ex30/vocals.wav" ] || $LOCKCMD "$BIN" separate -n melroformer --float32 --clip-mode none -q -o "$WK/kim" "$EX"; }
+H5=vocal,drums,bass,guitar,piano; H4=drums,bass,guitar,piano
 for tag in "$@"; do case $tag in
-  rust8)   # all cores
-    for x in "ex30:$EX" "full:$FULL"; do
-      rust hyb6 ensemble 8 "${x%%:*}" "${x#*:}"; rust chain chain 8 "${x%%:*}" "${x#*:}"; rust kim melroformer 8 "${x%%:*}" "${x#*:}"
-    done;;
-  rust8full)
-    rust chain chain 8 full "$FULL"; rust kim melroformer 8 full "$FULL";;
-  rust1)   # 1 thread: excerpt for all three, full song for hyb6 and chain (kim alone ~ chain - hyb6)
-    rust hyb6 ensemble 1 ex30 "$EX"; rust chain chain 1 ex30 "$EX"; rust kim melroformer 1 ex30 "$EX"
-    rust hyb6 ensemble 1 full "$FULL"; rust chain chain 1 full "$FULL";;
-  mega)   # 5 heads on the mix (mega_mix), 4 heads on Kim's instrumental (kim_mega), 1 head (guitar) for the per-head increment
-    rm -rf "$W/o"; lockf -k $LOCK "$BIN" separate -n melroformer --float32 --clip-mode none -q -o "$W/kim" "$EX"
-    for th in 8; do
-      mega mega5 vocal,drums,bass,guitar,piano $th ex30 "$EX"
-      mega mega4_inst drums,bass,guitar,piano $th ex30 "$EX" --minus "$W/kim/melroformer/ex30/vocals.wav"
-      mega mega1 guitar $th ex30 "$EX"
-      mega mega5 vocal,drums,bass,guitar,piano $th full "$FULL"
-    done;;
-  mega1)
-    mega mega5 vocal,drums,bass,guitar,piano 1 ex30 "$EX"
-    mega mega1 guitar 1 ex30 "$EX";;
-  mega1full)
-    mega mega5 vocal,drums,bass,guitar,piano 1 full "$FULL";;
+  rust8) for x in "ex30:$EX" "full:$FULL"; do for p in hyb6:ensemble chain:chain kim:melroformer; do
+           rust "${p%%:*}" "${p#*:}" 8 "${x%%:*}" "${x#*:}"; done; done;;
+  rust1) for p in hyb6:ensemble chain:chain kim:melroformer; do rust "${p%%:*}" "${p#*:}" 1 ex30 "$EX"; done;;
+  rust1full) rust hyb6 ensemble 1 full "$FULL"; rust chain chain 1 full "$FULL";;
+  mega8) kimvoc
+    mega mega5 $H5 8 ex30 "$EX" cpu; mega mega4_inst $H4 8 ex30 "$EX" cpu --minus "$WK/kim/melroformer/ex30/vocals.wav"
+    mega mega1 guitar 8 ex30 "$EX" cpu; mega mega5 $H5 8 full "$FULL" cpu;;
+  mega1) mega mega5 $H5 1 ex30 "$EX" cpu; mega mega1 guitar 1 ex30 "$EX" cpu;;
+  mega1full) mega mega5 $H5 1 full "$FULL" cpu;;
+  gpu) kimvoc
+    for x in "ex30:$EX" "full:$FULL"; do mega mega5 $H5 2 "${x%%:*}" "${x#*:}" cuda; mega mega1 guitar 2 "${x%%:*}" "${x#*:}" cuda; done
+    mega mega4_inst $H4 2 ex30 "$EX" cuda --minus "$WK/kim/melroformer/ex30/vocals.wav";;
 esac; done
