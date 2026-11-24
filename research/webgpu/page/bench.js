@@ -1,6 +1,7 @@
 // One-chunk benchmark of an exported separator core in onnxruntime-web. Query: model=<name in /models>, ep=webgpu|wasm,
 // threads (wasm), runs, save=1 (POST the output masks too), tag. Result JSON is POSTed to /result and left in window.__result.
 import * as ort from '/ort/ort.all.min.mjs';
+import { stft, maskIstft } from './dsp.js';
 const q = new URLSearchParams(location.search);
 const model = q.get('model'), ep = q.get('ep') || 'webgpu', runs = +(q.get('runs') || 3), threads = +(q.get('threads') || 1);
 const ref = q.get('ref') || model.replace(/_(fp16|w16|q8)$/, '');
@@ -31,7 +32,13 @@ try {
   if (ep === 'webgpu') ort.env.webgpu.powerPreference = 'high-performance';
   t = now(); const sess = await ort.InferenceSession.create(new Uint8Array(mbuf), opts); R.session_ms = now() - t;
   log(`session ${R.session_ms.toFixed(0)} ms, model ${R.model_mb.toFixed(0)} MB`);
-  const feeds = { X: new ort.Tensor('float32', X, meta.in_shape) };
+  let Xin = X, audio = null;
+  if (q.get('dsp') === '1') {      // the whole chunk path in the page: audio -> JS STFT -> model -> mask + JS iSTFT
+    audio = new Float32Array(await bin(`/models/${ref}_audio.bin`)); const L = meta.chunk;
+    t = now(); const S = stft([audio.subarray(0, L), audio.subarray(L, 2 * L)], meta.n_fft, meta.hop); R.stft_ms = now() - t;
+    R.stft_snr_db = snr(X, S.X); Xin = S.X; log(`JS STFT ${R.stft_ms.toFixed(0)} ms, SNR vs torch.stft ${R.stft_snr_db.toFixed(1)} dB`);
+  }
+  const feeds = { X: new ort.Tensor('float32', Xin, meta.in_shape) };
   R.run_ms = []; let out;
   for (let i = 0; i < runs + 1; i++) {
     t = now(); const o = await sess.run(feeds); out = o.masks; const d = await out.getData(); R.run_ms.push(now() - t);
@@ -43,6 +50,13 @@ try {
   const steady = R.run_ms.slice(1).sort((a, b) => a - b); R.median_ms = steady[Math.floor(steady.length / 2)];
   R.s_per_audio_s_chunk = R.median_ms / 1000 / meta.chunk_s;
   log(`mask SNR vs PyTorch ${R.mask_snr_db.toFixed(1)} dB, median ${R.median_ms.toFixed(0)} ms per ${meta.chunk_s} s chunk`);
+  if (audio) {
+    const n = meta.out_shape[1], L = meta.chunk;
+    t = now(); const ys = maskIstft(Xin, Y, n, meta.T, meta.F, 2, meta.n_fft, meta.hop, L, meta.zero_dc); R.istft_ms = now() - t;
+    const full = new Float32Array(await bin(`/models/${ref}_full.bin`));
+    R.audio_snr_db = []; for (let k = 0; k < n; k++) { const a = new Float32Array(2 * L); a.set(ys[2 * k], 0); a.set(ys[2 * k + 1], L); R.audio_snr_db.push(snr(full.subarray(2 * k * L, 2 * (k + 1) * L), a)); }
+    log(`mask + JS iSTFT ${R.istft_ms.toFixed(0)} ms; audio SNR vs PyTorch full model per stem: ${R.audio_snr_db.map(v => v.toFixed(1)).join(', ')} dB`);
+  }
   if (q.get('save') === '1') await fetch(`/result?name=${tag}_out.bin`, { method: 'POST', body: Y });
   await sess.release();
 } catch (e) { R.error = String(e && e.stack || e); log('ERROR', R.error); }
