@@ -541,7 +541,8 @@ the 53 mask heads are 656 M. `convert` keeps the 26.3 M backbone and the guitar 
 stored, float16 (77 MB; `--stem` picks another head). The rotary frequencies are float16-rounded in
 the checkpoint and PyTorch uses them so, so they are kept as stored. Because PyTorch itself
 widens the float16 weights to float32, float32 weights (`convert --float32`, 155 MB,
-`MEGAGUITAR_WEIGHTS=megaguitar-f32`) give bit-identical output: there is nothing to gain from them.
+`MEGAGUITAR_WEIGHTS=megaguitar-f32`) hold exactly the same values and should give the same
+output (measurement below).
 
 ### Parity (vs PyTorch 2.6.0 CPU float32, MSST code, r4_mega.py's chunking)
 
