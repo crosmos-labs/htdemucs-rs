@@ -13,7 +13,10 @@ Kim's Mel-Band RoFormer vocal model (vocals + instrumental; +3.7 dB vocal SDR ov
 MUSDB18-HQ), matching its PyTorch inference to 101-135 dB per stem on six full tracks with 37-60%
 less CPU than PyTorch on x86 (see *Mel-Band RoFormer*). `-n chain` runs round 3's best recipe -
 Kim's vocals, then the htdemucs + htdemucs_6s ensemble on Kim's instrumental - matching the
-PyTorch pipeline to 108-132 dB per stem (see *Chain*).
+PyTorch pipeline to 108-132 dB per stem (see *Chain*). `-n megaguitar` runs the guitar head of
+MVSEP's Mega 53 BS-RoFormer (the best guitar stem measured: +2.6 dB over htdemucs_6s on 26/26
+Cambridge-MT songs), matching PyTorch to 110-119 dB on a chunk and full tracks with 9-65% less CPU
+than PyTorch on x86 (on Apple silicon only with `--features accelerate`; see *Mega 53*).
 
 ## Usage
 
@@ -564,11 +567,83 @@ SNR over the whole file; reference level and error level):
 
 The chunk parity is the same 109.7 dB on the M1 Pro (NEON kernels) as on the Linux box (AVX2).
 
-**Determinism.** Bit-identical output at 1, 4 and 6 threads (M1 Pro, the 30 s excerpt, both
-stems, full path) and at 1 and 8 threads (Linux box); one chunk bit-identical at 1, 4 and 8
-threads on Blacksmith's AVX-512 EPYC (`MR_CHECK_THREADS`).
+Against round 4's numbers: run on the four Cambridge-MT remixes of round 4's `cmt8` set that were
+re-scored here, this port's guitar gives the same guitar uSDR as round 4's PyTorch (CUDA, fp32)
+`mega_mix` to the third decimal (Angels In Amplifiers 8.029 / 8.029 dB, Juliet's Rescue 7.893 /
+7.893, Forkupines 7.576 / 7.576, Al James 4.339 / 4.339).
 
-MEGA_RESULTS_PLACEHOLDER
+**Determinism.** Bit-identical output (full path, both stems, the 30 s excerpt) at 1, 4 and 8
+threads on the Linux box and at 1, 4 and 6 threads on the M1 Pro; one chunk bit-identical at 1, 4
+and 8 threads on the box and on Blacksmith's AVX-512 EPYC (`MR_CHECK_THREADS`).
+
+### Speed
+
+CPU seconds per second of audio **of one 20 s chunk** forward (`mr_bench`, `bsroformer.py
+bench`); a whole track costs about twice that per second of music (every sample is in two
+chunks), plus the 10 s of padding at each end.
+
+| machine | threads | htdemucs-rs | PyTorch 2.6.0 | |
+|---|---|---|---|---|
+| AMD EPYC (Blacksmith 8 vCPU, AVX-512) | 1 | 3.02 (60.3 CPU-s / chunk) | 8.59 (171.8) | **65% less CPU** |
+| same | 8 | 3.93 (10.3 s wall / chunk) | 17.4 (47.3 s wall) | 4.6x faster wall |
+| Intel i5-12450H (the Linux box, AVX2) | 1 | 5.20 (103.9 CPU-s / chunk) | 5.72 (114.3, round 4's `r4_cputime.sh`) | 9% less CPU |
+| same | 8 | 9.46 (24.6 s wall / chunk) | 13.9 (278 CPU-s / chunk in a 30 s run) | 32% less CPU |
+| Apple M1 Pro, default (`gemm` crate, NEON) build | 1 | 7.45 (149.0 CPU-s / chunk) | **4.64 (92.8)** | **PyTorch is faster: 1.6x less CPU** (Accelerate's AMX GEMMs) |
+| same | 4 | 8.21 (41.9 s wall / chunk) | 6.99 (34.1 s wall) | PyTorch faster |
+| Apple M1 Pro, `--features accelerate` build | 1 | **2.36 (47.2 CPU-s / chunk)** | 4.64 (92.8) | 49% less CPU |
+| same | 4 | 3.50 (16.7 s wall / chunk) | 6.99 (34.1 s wall) | 2.0x faster wall |
+
+The Accelerate build is bit-identical across 1 and 4 threads, but its parity against PyTorch was
+not measured (its GEMM roundings differ from the `gemm` crate's; the parity figures above are the
+default build's). Profile (1 thread, any machine): the time transformer is 71-75% of the forward,
+attention alone (QK^T, softmax, AV over 1723 frames) 45-52%; the GEMMs run at 190-230 GFLOP/s per
+thread on the EPYC, 113-128 on the box, 80-92 on the M1 Pro (NEON).
+
+Whole tracks (`htdemucs-rs separate`, CPU-s per second of music; wall time):
+
+| machine, threads | Al James 30 s excerpt | MUSDB Angels In Amplifiers 179.6 s | Aerials 243.6 s | 22 min (long22, 1320 s) |
+|---|---|---|---|---|
+| Linux box, 8 | 118 s wall (PyTorch 192 s, 46.3 CPU-s/s) | - | 21.4; 678 s wall | 19.4; 3338 s (\*) |
+| M1 Pro (NEON), 6 | 28.7 (PyTorch 28.1) | 20.1; 629 s wall (PyTorch 19.2; 588 s) | 20.3; 861 s | 19.2; 4399 s |
+| Blacksmith EPYC, 8 (240 s synthetic) | | | 6.5; 207 s | |
+
+(\*) the CLI's own (monotonic) clock; the wrapper's wall clock said 3958 s, the gap matching a
+pause of the machine (CPU time 25638 s). Short excerpts cost more per second than long tracks
+because of the 10 s of padding at each end.
+
+### Memory
+
+Peak RSS, `--flac --clip-mode clamp`: weights (77 MB float16, widened to 155 MB float32 at load)
++ the decoded input (2 x 4 bytes x samples: 86 MB at 4 min, 466 MB at 22 min) + one chunk's
+activations (~0.1 GB of tokens plus per-thread scratch) + the one-chunk overlap-add window; both
+stems are written as they are finalised.
+
+| | Aerials (4 min) | long22 (22 min) | 30 s / 3 min |
+|---|---|---|---|
+| Linux box, 8 threads (VmHWM) | **672 MB** | **1055 MB** | 557 MB (30 s); PyTorch 3.37 GB |
+| M1 Pro, 6 threads (peak memory footprint / max RSS) | 530 MB / 1.22 GB | 954 MB / 1.81 GB | Angels: 520 MB / 1.19 GB; PyTorch 3.56 GB max RSS |
+| Blacksmith EPYC, 8 threads (240 s synthetic) | 645 MB | | |
+
+### Cheaper settings (chunk size, overlap): quality cost
+
+MUSDB has no guitar stem, so these are scored on round 4's Cambridge-MT remixes, whose guitar is
+known exactly: 4 of the 8 `cmt8` songs (Angels In Amplifiers, Juliet's Rescue, Forkupines, Al
+James; 90 s each), on the mix, Linux box, 8 threads. Guitar uSDR as round 4 defines it; "SNR vs
+full" is each variant's guitar against the full-settings output (how different, not how good).
+
+| setting | CPU vs default | guitar uSDR (mean of 4) | Δ vs default, items worse | guitar removed uSDR | SNR vs full |
+|---|---|---|---|---|---|
+| default: 20 s chunks, `--num-overlap 2` | 1.00 (2094 CPU-s per song) | **6.959** | - | 13.900 | - |
+| `--num-overlap 1` | 0.46 | 6.871 | -0.088, 4/4 | 13.812 | 17.6-24.0 dB |
+| `--chunk-size 441000` (10 s, the training length) | 0.68 | 6.931 | -0.028, 4/4 (Juliet's Rescue -0.001) | 13.872 | 17.1-22.8 dB |
+| 10 s chunks, `--num-overlap 1` | 0.31 | 6.845 | -0.115, 4/4 | 13.785 | 16.2-21.4 dB |
+
+On four MUSDB18-HQ test songs (Angels full, 60 s excerpts of three more; M1 Pro) the variants are
+14-23 dB from the full-settings output, the same range. The cost is small next to Mega's +2.6 dB
+over htdemucs_6s: 10 s chunks keep all but 0.03 dB for 32% less CPU, 10 s chunks at overlap 1 all
+but 0.12 dB for 69% less. With `--num-overlap 1` the chunks abut and each chunk's first and last
+sample get zero weight (MSST's linear fades start and end at 0), so the two samples at every chunk
+boundary (every 20 s, or 10 s) come out 0; inaudible, but it is there. The defaults stay MSST's.
 
 ## Demucs behaviour worth knowing
 
@@ -584,6 +659,11 @@ MEGA_RESULTS_PLACEHOLDER
   row separately.
 
 ## Credits
+
+Mega 53 BS-RoFormer: the BS-RoFormer architecture is by Wei-Tsung Lu, Ju-Chiang Wang, Qiuqiang Kong
+and Yun-Ning Hung (ByteDance, arXiv:2309.02612), the implementation by Phil Wang
+(lucidrains/BS-RoFormer, MIT) as adapted in ZFTurbo's Music-Source-Separation-Training (MIT), the
+53-stem model trained by ZFTurbo / MVSEP (weights MIT per MSST #245; not in this repository).
 
 Mel-Band RoFormer: the architecture is by Ju-Chiang Wang, Wei-Tsung Lu and Minz Won (ByteDance,
 arXiv:2310.01809), the PyTorch implementation by Phil Wang (lucidrains/BS-RoFormer, MIT), the
