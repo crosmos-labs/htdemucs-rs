@@ -39,6 +39,7 @@ def delta(D, v, k, key, base='hyb6'):
     items = [i for i, d in D.items() if d[v][k][key] is not None and d[base][k][key] is not None]
     dl = np.array([D[i][v][k][key] - D[i][base][k][key] for i in items])
     if v == base or not len(dl): return '–', dl
+    if not np.any(dl): return 'same stem', dl
     lo, hi = boot(dl); return f'{dl.mean():+.2f} [{lo:+.2f}, {hi:+.2f}] {int((dl > 0).sum())}/{len(dl)}', dl
 
 def table(D, title):
@@ -75,7 +76,7 @@ for k in STEMS:
     cells = []
     for a_, b_ in PAIRS:
         du, _ = delta(ALL, a_, k, 'usdr', b_); dr, x = delta(ALL, a_, k, 'removed', b_)
-        cells.append(f'{du} ({x.mean():+.2f} removed)' if len(x) else du)
+        cells.append(f'{du} ({x.mean():+.2f} removed)' if len(x) and du != 'same stem' and k in ('keys', 'other') else du)
     print(f'| {k} | ' + ' | '.join(cells) + ' |')
 print()
 
