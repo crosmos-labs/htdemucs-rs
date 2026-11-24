@@ -69,7 +69,8 @@ for s, t in SETS.items():
 print('## Paired comparisons, pooled 26 songs (Δ uSDR [95 % CI] items up; for keys and other: items that have the part; '
       '"removed" Δ over all 26 in brackets after)\n')
 PAIRS = [('mega_mix', 'hyb6'), ('kim_mega', 'hyb6'), ('mega_mix', 'chain'), ('kim_mega', 'chain'), ('kim_mega', 'mega_mix'),
-         ('chain', 'hyb6'), ('chain+mg', 'chain'), ('chain+mgk', 'chain')]
+         ('chain', 'hyb6'), ('mega_mix_keys', 'hyb6'), ('kim_mega_keys', 'hyb6'), ('kim_mega_keys', 'chain'), ('chain+mg', 'chain'),
+         ('chain+mgk', 'chain')]
 PAIRS = [(a_, b_) for a_, b_ in PAIRS if a_ in vs and b_ in vs]
 print('| stem | ' + ' | '.join(f'`{a_}` − `{b_}`' for a_, b_ in PAIRS) + ' |\n|---|' + '---|' * len(PAIRS))
 for k in STEMS:
@@ -88,7 +89,7 @@ for v in vs:
     print(f'| `{v}` | {r.mean():.1f} | {r.min():.1f} | {r.max():.1f} |')
 print()
 print('## Per-item uSDR (main recipes)\n')
-MAIN = [v for v in ('hyb6', 'chain', 'mega_mix', 'mega_mix_pk', 'kim_mega', 'kim_mega_pk') if v in vs]
+MAIN = [v for v in ('hyb6', 'chain', 'mega_mix', 'mega_mix_keys', 'mega_mix_pk', 'kim_mega', 'kim_mega_keys', 'kim_mega_pk') if v in vs]
 for k in STEMS:
     print(f'### {k}\n\n| item | {k} dB re mix | ' + ' | '.join(f'`{v}`' for v in MAIN) + ' |\n|---|---|' + '---|' * len(MAIN))
     for i, d in ALL.items():
