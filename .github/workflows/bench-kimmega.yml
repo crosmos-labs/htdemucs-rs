@@ -1,0 +1,204 @@
+# -n kimmega (Kim vocals, then Mega 53's drums / bass / guitar / keys heads on Kim's instrumental) on
+# Linux x86-64 runners: weights converted here from the public checkpoints, synthetic clips made here
+# (no copyrighted audio), parity against the PyTorch references (one chunk, the full path, the
+# end-to-end PyTorch recipe), and CPU time / peak memory of whole tracks for kimmega, chain and
+# ensemble at 8 threads (job `parity`, 8 vCPU) and at 1 thread (jobs `one-thread-*`, `ONE_RUNNER`).
+name: bench-kimmega
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "8-thread / parity machine (blacksmith-8vcpu-ubuntu-2404 counts 4x against the 3000 free 2-vCPU minutes a month)"
+        default: blacksmith-8vcpu-ubuntu-2404
+      one_runner:
+        description: "1-thread machine (2 vCPU counts 1x)"
+        default: blacksmith-2vcpu-ubuntu-2404
+  # A push that changes .github/bench/km_run.env runs with the settings in that file (for branches,
+  # where workflow_dispatch is not available until the workflow is on the default branch).
+  push:
+    branches: [mega5]
+    paths:
+      - .github/bench/km_run.env
+
+concurrency:
+  group: bench-kimmega-${{ github.run_id }}
+
+env:
+  CARGO_TERM_COLOR: never
+  MSST: msst
+  KIM: kim
+  MEGA_CKPT: ckpt/mega53.ckpt
+  MEGA_CFG: ckpt/mega53.yaml
+  KIM_CKPT: ckpt/MelBandRoformer.ckpt
+  REL: https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/download/v1.0.21
+
+jobs:
+  parity:
+    runs-on: ${{ inputs.runner || 'blacksmith-8vcpu-ubuntu-2404' }}
+    timeout-minutes: 75
+    outputs:
+      one_runner: ${{ steps.settings.outputs.one_runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Settings (inputs, or .github/bench/km_run.env for push runs)
+        id: settings
+        run: |
+          if [ "${{ github.event_name }}" = push ]; then
+            grep -E '^[A-Z_0-9]+=' .github/bench/km_run.env >> "$GITHUB_ENV"
+            echo "one_runner=$(grep -E '^ONE_RUNNER=' .github/bench/km_run.env | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          else
+            echo "one_runner=${{ inputs.one_runner }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: CPU
+        run: |
+          lscpu; echo "nproc $(nproc)"; free -g
+          { echo "### Runner (parity, 8 threads)"; echo '```'; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|L2|L3'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python envs (Kim + Demucs on torch 2.2.2; Mega on torch 2.6.0)
+        run: |
+          python -m venv /tmp/kpy && /tmp/kpy/bin/pip install -q -r .github/bench/mr_requirements.txt
+          python -m venv /tmp/mpy && /tmp/mpy/bin/pip install -q -r .github/bench/bsr_requirements.txt
+
+      - name: Checkpoints (MIT) and upstream code
+        run: |
+          git clone -q https://github.com/ZFTurbo/Music-Source-Separation-Training $MSST && git -C $MSST checkout -q 1523206
+          git clone -q https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model $KIM && git -C $KIM checkout -q 25f44ff
+          mkdir -p ckpt
+          curl -sSfL -o $MEGA_CKPT $REL/mvsep_mega_model_bs_roformer_53_stems_v1.ckpt
+          curl -sSfL -o $MEGA_CFG $REL/mvsep_mega_model_bs_roformer_53_stems.yaml
+          curl -sSfL -o $KIM_CKPT https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt
+          sha256sum -c <<SUMS
+          c62820893bbf86d4e734f966bd142d9157cfc8bb8e79e9d8f9ea553f3ff3519f  $MEGA_CKPT
+          7e198062a251587088adb91215a4f44ab59e67bd62fcc805cf54d6e7dfc51103  $MEGA_CFG
+          87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e  $KIM_CKPT
+          SUMS
+
+      - name: Convert weights (Kim f32 + f16, Mega backbone + 4 heads, megaguitar, htdemucs, htdemucs_6s)
+        run: |
+          /tmp/kpy/bin/python tools/melroformer.py convert $KIM $KIM_CKPT
+          /tmp/kpy/bin/python tools/melroformer.py convert $KIM $KIM_CKPT --float32
+          /tmp/mpy/bin/python tools/bsroformer.py convert $MEGA_CKPT $MEGA_CFG --name mega
+          /tmp/mpy/bin/python tools/bsroformer.py convert $MEGA_CKPT $MEGA_CFG
+          /tmp/kpy/bin/python tools/convert.py htdemucs htdemucs_6s
+          ls -l weights
+
+      - uses: actions/cache/save@v4
+        with:
+          path: weights
+          key: kimmega-weights-${{ github.run_id }}
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bins
+
+      - name: Tests
+        run: cargo test --release -q --lib --bins --tests
+
+      - name: Parity (synthetic 30 s clip + -60 dBFS noise; references made here)
+        if: env.RUN_PARITY != 'false'
+        run: |
+          mkdir -p ref/ci
+          /tmp/mpy/bin/python .github/bench/synth.py ref/ci/synth0.wav 30
+          /tmp/mpy/bin/python -c "import soundfile as sf, numpy as np; x, r = sf.read('ref/ci/synth0.wav', dtype='float32'); x += (np.random.default_rng(7).standard_normal(x.shape) * 1e-3).astype('float32'); sf.write('ref/ci/synth.wav', x, r, subtype='FLOAT')"
+          export MELROFORMER_WEIGHTS=melroformer-f32
+          /usr/bin/time -f "rust kimmega: %e s wall, %U+%S s CPU, peak RSS %M KB" \
+            ./target/release/htdemucs-rs separate -q -v -n kimmega --threads 8 --float32 --clip-mode none -o sep ref/ci/synth.wav 2>&1 | tee km-rust.txt
+          V=sep/kimmega/synth/vocals.wav
+          /tmp/mpy/bin/python tools/bsroformer.py segment $MSST $MEGA_CKPT $MEGA_CFG ref/ci/synth.wav ref/ci/seg.safetensors --name mega --minus $V --chunk 1 --threads 8
+          ./target/release/mr_parity weights ref/ci/seg.safetensors mega | tee km-chunk.txt
+          rm ref/ci/seg.safetensors
+          /tmp/mpy/bin/python tools/bsroformer.py separate $MSST $MEGA_CKPT $MEGA_CFG ref/ci/synth.wav ref/ci/km_rk.safetensors --name mega --minus $V --recipe --threads 8 | tee km-torch-mega.txt
+          ./target/release/compare ref/ci/km_rk.safetensors sep/kimmega/synth | tee km-compare.txt
+          /tmp/kpy/bin/python tools/melroformer.py separate $KIM $KIM_CKPT ref/ci/synth.wav ref/ci/kim.safetensors --threads 8 | tee km-torch-kim.txt
+          /tmp/mpy/bin/python tools/bsroformer.py separate $MSST $MEGA_CKPT $MEGA_CFG ref/ci/synth.wav ref/ci/km_tk.safetensors --name mega --minus ref/ci/kim.safetensors --recipe --threads 8
+          ./target/release/compare ref/ci/km_tk.safetensors sep/kimmega/synth | tee -a km-compare.txt
+          {
+            echo "### Parity (synthetic 30 s clip, 8 threads)"
+            echo "- one chunk, 4 heads (Mega on Rust Kim's instrumental): $(grep 'final output' km-chunk.txt)"
+            echo '```'; grep -E '^\| (mask|output)' km-chunk.txt; echo '```'
+            echo "- full path vs PyTorch Mega on Rust Kim's instrumental: $(head -1 km-compare.txt)"
+            echo "- full path vs the PyTorch recipe end to end (PyTorch Kim -> PyTorch Mega): $(tail -1 km-compare.txt)"
+            echo "- PyTorch Mega: $(tail -1 km-torch-mega.txt)"
+            echo "- Rust: $(tail -1 km-rust.txt)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -rf sep ref/ci/*.safetensors
+
+      - name: Whole tracks, 8 threads (kimmega / chain / ensemble on synthetic clips of SECONDS)
+        run: PY=/tmp/mpy/bin/python .github/bench/km_time.sh 8 "${SECONDS_8:-30 180}" "${RECIPES_8:-kimmega chain ensemble}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-kimmega-parity-logs
+          path: |
+            km-*.txt
+            time-*.txt
+          if-no-files-found: ignore
+
+  one-thread:
+    needs: parity
+    runs-on: ${{ needs.parity.outputs.one_runner || inputs.one_runner || 'blacksmith-2vcpu-ubuntu-2404' }}
+    timeout-minutes: 90
+    strategy:
+      matrix:
+        part: [a, b]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Settings
+        run: |
+          [ "${{ github.event_name }}" = push ] && grep -E '^[A-Z_0-9]+=' .github/bench/km_run.env >> "$GITHUB_ENV" || true
+
+      - name: CPU
+        run: |
+          lscpu; echo "nproc $(nproc)"; free -g
+          { echo "### Runner (1 thread, part ${{ matrix.part }})"; echo '```'; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|L2|L3'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: weights
+          key: kimmega-weights-${{ github.run_id }}
+          fail-on-cache-miss: true
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bins
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: numpy (synthetic clips)
+        run: pip install -q numpy
+
+      # part a: kimmega on the long clip (the longest run); part b: everything else at 1 thread.
+      - name: Whole tracks, 1 thread
+        run: |
+          if [ "${{ matrix.part }}" = a ]; then
+            .github/bench/km_time.sh 1 "${SECONDS_1A:-180}" "${RECIPES_1A:-kimmega}"
+          else
+            .github/bench/km_time.sh 1 "${SECONDS_1B:-30}" "${RECIPES_1B:-kimmega chain ensemble}"
+            .github/bench/km_time.sh 1 "${SECONDS_1C:-180}" "${RECIPES_1C:-chain ensemble}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-kimmega-one-thread-${{ matrix.part }}
+          path: time-*.txt
+          if-no-files-found: ignore
