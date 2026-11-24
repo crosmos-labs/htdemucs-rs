@@ -65,10 +65,11 @@ table(ALL, 'Pooled: 26 Cambridge-MT songs')
 for s, t in SETS.items():
     if data[s]: table(data[s], f'{s}: {t}')
 
-print('## Sum-to-mix residual per recipe (dB re the mix; −inf-like values mean "exact by construction")\n')
+print('## Sum-to-mix residual per recipe (dB re the mix)\n')
 print('| variant | mean | min | max |\n|---|---|---|---|')
 for v in vs:
     r = np.array([d['_resid'][v] for d in ALL.values()])
+    if r.max() < -200: print(f'| `{v}` | exact (other = mix − the rest; ≤ {r.max():.0f}) | | |'); continue
     print(f'| `{v}` | {r.mean():.1f} | {r.min():.1f} | {r.max():.1f} |')
 print()
 print('## Per-item uSDR (main recipes)\n')

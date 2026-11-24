@@ -1,7 +1,7 @@
 #!/bin/bash
 # Round 5 CPU cost on the Mac (Apple M1 Pro: 6 performance + 2 efficiency cores, 16 GB), one job at a time under the
 # shared heavy lock. Every pass is timed by /usr/bin/time -l (user + sys CPU seconds, wall, peak RSS) and appended as a
-# JSON line to scores/cost.jsonl.   r5_cost.sh <tag> [<tag> ...]   tags: rust | mega | mega1 (1-thread Mega, slow)
+# JSON line to scores/cost.jsonl.   r5_cost.sh <tag> [<tag> ...]   tags: rust8 | rust8full | rust1 | mega | mega1 | mega1full
 # Inputs: the 30 s excerpt = the first 30 s of cmt8/AngelsInAmplifiers_ImAlright (its 60-90 s); the full song =
 # MUSDB18-HQ test "AM Contra - Heart Peripheral" (210.1 s).
 set -u
@@ -40,10 +40,15 @@ mega() {  # <pass> <heads> <threads> <iname> <input> [--minus vocals.wav]
     --stems "$h" --device cpu --threads "$th" "$@"
 }
 for tag in "$@"; do case $tag in
-  rust)
-    for th in 8 1; do for x in "ex30:$EX" "full:$FULL"; do
-      rust hyb6 ensemble $th "${x%%:*}" "${x#*:}"; rust chain chain $th "${x%%:*}" "${x#*:}"; rust kim melroformer $th "${x%%:*}" "${x#*:}"
-    done; done;;
+  rust8)   # all cores
+    for x in "ex30:$EX" "full:$FULL"; do
+      rust hyb6 ensemble 8 "${x%%:*}" "${x#*:}"; rust chain chain 8 "${x%%:*}" "${x#*:}"; rust kim melroformer 8 "${x%%:*}" "${x#*:}"
+    done;;
+  rust8full)
+    rust chain chain 8 full "$FULL"; rust kim melroformer 8 full "$FULL";;
+  rust1)   # 1 thread: excerpt for all three, full song for hyb6 and chain (kim alone ~ chain - hyb6)
+    rust hyb6 ensemble 1 ex30 "$EX"; rust chain chain 1 ex30 "$EX"; rust kim melroformer 1 ex30 "$EX"
+    rust hyb6 ensemble 1 full "$FULL"; rust chain chain 1 full "$FULL";;
   mega)   # 5 heads on the mix (mega_mix), 4 heads on Kim's instrumental (kim_mega), 1 head (guitar) for the per-head increment
     rm -rf "$W/o"; lockf -k $LOCK "$BIN" separate -n melroformer --float32 --clip-mode none -q -o "$W/kim" "$EX"
     for th in 8; do
