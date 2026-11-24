@@ -9,9 +9,9 @@ MIT) at 1523206 as <repo> (only models/bs_roformer is imported), with
 research/round4/r4_msst_env.txt (torch 2.6.0, rotary_embedding_torch 0.3.5, einops, beartype):
 
     PY="uv run --quiet --python 3.11 --with-requirements research/round4/r4_msst_env.txt python"
-    $PY tools/bsroformer.py convert  <ckpt> <yaml> [--stem guitar] [--name megaguitar] [--f32]
+    $PY tools/bsroformer.py convert  <ckpt> <yaml> [--stem guitar] [--name megaguitar] [--float32]
         -> weights/megaguitar.safetensors (the backbone + the guitar head as mask_estimators.0,
-           PyTorch names, float16 - the checkpoint's own precision, so lossless; --f32: the same
+           PyTorch names, float16 - the checkpoint's own precision, so lossless; --float32: the same
            values as float32, megaguitar-f32.safetensors) + weights/megaguitar.json (constructor
            kwargs, inference settings, bands)
     $PY tools/bsroformer.py segment  <repo> <ckpt> <yaml> <in.wav> <out.safetensors> [--chunk K]
@@ -113,8 +113,8 @@ def convert(a):
     state, exact = {}, 0
     for k, v in sd.items():
         exact += int(v.dtype == torch.float16)
-        # float16 as stored (lossless: the checkpoint is float16); --f32 the same values widened.
-        state[k] = v.float().contiguous() if a.f32 else v.contiguous()
+        # float16 as stored (lossless: the checkpoint is float16); --float32 the same values widened.
+        state[k] = v.float().contiguous() if a.float32 else v.contiguous()
     rot = [v for k, v in sd.items() if k.endswith("rotary_embed.freqs")]
     # The rotary frequencies are float16-rounded in the checkpoint and the model uses them as
     # loaded (into float32 parameters), so they are kept exactly as stored.
@@ -148,7 +148,7 @@ def convert(a):
     }
     out = ROOT / "weights"
     out.mkdir(exist_ok=True)
-    name = f"{a.name}-f32" if a.f32 else a.name
+    name = f"{a.name}-f32" if a.float32 else a.name
     st.save(out / f"{name}.safetensors", state, metadata={"model": a.name, "checkpoint": config["checkpoint"], "stem": a.stem})
     (out / f"{a.name}.json").write_text(json.dumps(config) + "\n")
     n = sum(v.numel() for v in state.values())
@@ -325,7 +325,7 @@ if __name__ == "__main__":
 
     c = sub.add_parser("convert")
     common(c, repo=False)
-    c.add_argument("--f32", action="store_true")
+    c.add_argument("--float32", action="store_true")
     s = sub.add_parser("segment")
     common(s)
     s.add_argument("inp"); s.add_argument("out")
