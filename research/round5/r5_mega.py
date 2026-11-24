@@ -84,9 +84,9 @@ if n0 > 2 * border and border > 0: out = out[..., border:-border]
 out = torch.nan_to_num(out).numpy().astype(np.float32)
 cpu, wall = time.process_time() - c0, time.time() - w0
 import resource
-rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**30   # bytes on macOS
-mps = torch.mps.driver_allocated_memory() / 2**30 if a.device == 'mps' else 0
+rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**30 if sys.platform == 'darwin' else 2**20)   # bytes on macOS, KiB on Linux
+mps = torch.mps.driver_allocated_memory() / 2**30 if a.device == 'mps' else (torch.cuda.max_memory_allocated() / 2**30 if a.device == 'cuda' else 0)
 np.save(a.out, out)
 print(json.dumps({'stems': want, 'audio_s': round(n0 / sr, 2), 'device': a.device, 'threads': a.threads, 'overlap': a.overlap,
                   'cpu_s': round(cpu, 2), 'wall_s': round(wall, 2), 'minus': bool(a.minus), 'chunks': len(per),
-                  'peak_rss_gb': round(rss, 2), 'mps_driver_gb': round(mps, 2), 'cpu_per_chunk': round(float(np.median(per)), 2), 'rate_long': round(float(np.median(per)) * a.overlap / (chunk / sr), 3)}))
+                  'peak_rss_gb': round(rss, 2), 'gpu_mem_gb': round(mps, 2), 'cpu_per_chunk': round(float(np.median(per)), 2), 'rate_long': round(float(np.median(per)) * a.overlap / (chunk / sr), 3)}))
