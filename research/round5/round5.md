@@ -49,7 +49,10 @@ Pooled over the 26 songs it compares with the current candidate `hyb6` (Demucs o
 5. **Drums: a tie with the chain, and better than `hyb6` on 20/26.**
    - +0.73 dB on the 18 non-MUSDB excerpts (16/18), but −0.51 on the 8 MUSDB test songs (4/8).
    - Two songs carry the loss: Enda Reilly 16.0 → 10.6 dB and Angels In Amplifiers 8.6 → 5.8. Their drum groups include brushes and a percussion track.
-   - Mega has separate `percussion`, `tambourine` and `congas` heads, so those parts are probably not in its `drums` head. This is the likely cause, but it is **not tested yet** (`r5_drums.py` is written but was not run; see *What to try next*).
+   - Mega's separate `percussion`, `tambourine` and `congas` heads are **not** the cause (tested 2026-11-25, `r5_drums.sh` → `scores/drums.json`; heads on Kim's instrumental, CUDA fp32 as above):
+     - `drums` + `percussion` + `tambourine` + `congas` vs the `drums` head alone: −0.10 [−0.38, +0.12], 13/26 up. It helps where a percussion track exists (Enda Reilly 10.6 → 11.5, Al James 8.4 → 9.6) but costs Butterfly Effect 8.5 → 5.7, and Angels stays at 5.7 (chain 8.8).
+     - The kit-piece heads (`kick` + `snare` + `toms` + `hh` + the three percussion heads) in place of `drums`: −3.03 [−3.54, −2.55], 0/26. The `drums` head is far better than its parts.
+     - So the `drums` head alone stays in the recipe. The two MUSDB losses are something else (brushes, or how these mixes differ from Mega's training data); untested.
 6. **Other: no measurable difference, and the comparison is unfair to Mega.**
    - Mega has no "other" head, so other = mix − the five stems. That makes it carry every error of the other five.
    - Demucs' other built the same way loses as well: `hyb6_fix` is −0.63 dB uSDR and −1.76 "removed" against `hyb6`'s own other.
@@ -220,13 +223,13 @@ Only the three GPU lines above were measured before the box was needed back.
    - all five keyboard heads summed;
    - the residual other built from the chain plus Mega's guitar (`chain+mg`: other −4.6 dB removed). Mixing models makes the residual worse.
 4. **Before shipping:**
-   - Check the drum loss on brushes / percussion (Enda Reilly, Angels).
+   - ~~Check the drum loss on brushes / percussion~~: done, adding percussion heads does not help (item 5).
    - Do a blind listen of the "other" stem on two or three songs without "other" parts.
    - Re-time on x86.
 
 ## What to try next
 
-1. **Drums + percussion heads.** Score Mega's `drums` + `percussion` + `tambourine` + `congas` (and the kit-piece heads) against the drum group. `r5_drums.py` does this from a `mega_drums.npy` pass of heads `drums,percussion,tambourine,congas,kick,snare,toms,hh` on Kim's instrumental. It is written but has not been run (the box was needed back). On the GPU it takes about 10 min for all 26 songs.
+1. ~~**Drums + percussion heads.**~~ Done: −0.10 dB, no gain (see *Findings* 5).
 2. **The box cost runs** (`r5_box.sh cost`), as listed above.
 3. **Vocals ensemble.** Mega's vocals beat Kim's on 5 of 26 songs, by up to 3.7 dB (JetB). Averaging the two might beat either, but it needs Mega's `vocal` head on the mix, a second Mega pass of about 10 CPU-s per audio-s. Score it on these 26 songs before paying for it.
 4. **A Rust export of 4–5 Mega heads** (backbone + `drums`, `bass`, `guitar`, `keys`), and parity against `r5_mega.py`.
