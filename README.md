@@ -15,7 +15,7 @@ less CPU than PyTorch on x86 (see *Mel-Band RoFormer*). `-n chain` runs round 3'
 Kim's vocals, then the htdemucs + htdemucs_6s ensemble on Kim's instrumental - matching the
 PyTorch pipeline to 108-132 dB per stem (see *Chain*). `-n megaguitar` runs the guitar head of
 MVSEP's Mega 53 BS-RoFormer (the best guitar stem measured: +2.6 dB over htdemucs_6s on 26/26
-Cambridge-MT songs), matching PyTorch to 110-119 dB on a chunk and full tracks with 9-65% less CPU
+Cambridge-MT songs), matching PyTorch to 109.7-119.4 dB (guitar) on a chunk and full tracks with 9-65% less CPU
 than PyTorch on x86 (on Apple silicon only with `--features accelerate`; see *Mega 53*).
 
 ## Usage
