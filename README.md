@@ -415,8 +415,9 @@ tracks: vocals +3.44, drums +0.65, bass +0.17, other +1.24 dB uSDR. Same folders
 `--shifts` / `--overlap` (Demucs runs at shifts 0, overlap 0.25; Kim at `--num-overlap`, 2).
 
 **Sum to the mix.** Not forced, as in round 3: the chain's stems sum to the mix within -24 to
--33 dB (residual energy re the mix; round 3: mean -26.4 dB), and folding the residual into
-"other" was neutral on typical tracks. `-v` prints it per track (Signe Jakobsen -28.6 dB,
+-33 dB on 11 of round 3's 12 MUSDB tracks (residual energy re the mix; mean -26.4 dB), but only
+-8.3 dB on Little Chicago's Finest, whose bass also loses 3.9 dB against 6s at shifts 2. Folding
+the residual into "other" was neutral on typical tracks; the outlier is not understood. `-v` prints it per track (Signe Jakobsen -28.6 dB,
 Angels In Amplifiers -24.2 dB - the PyTorch pipeline's -28.57 / -24.25).
 
 **Memory.** Demucs' whole-track normalisation needs the whole instrumental before its first
