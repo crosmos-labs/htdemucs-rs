@@ -139,6 +139,9 @@ src/chain.rs         -n chain: Kim vocals, then the ensemble on the instrumental
 tools/chain_ref.py   its PyTorch reference (round 3's k+chain_avg on CPU float32)
 tools/chain_box.sh, chain_musdb.sh, measure.sh   its parity / uSDR / memory / CPU runs on Linux
 .github/workflows/bench-roformer.yml   its x86 parity / speed runs (settings: .github/bench/mr_run.env)
+tools/bsroformer.py  Mega 53 BS-RoFormer (-n megaguitar): converter (backbone + one head), PyTorch
+                     references (chunk dump, full song as r4_mega.py, float64), timing
+.github/workflows/bench-megaguitar.yml   its x86 parity / speed runs (settings: .github/bench/mg_run.env)
 ```
 
 ## Reproducing
@@ -499,6 +502,64 @@ passes (round 3's PyTorch estimate was 8.97 CPU-s per audio-s with Kim at one th
 The Mac (M1 Pro) is not measured here: the machine is shared and the chain is now run only on the
 Linux box. For Kim alone the Mac gemm build was 1.8x PyTorch's CPU (PyTorch uses AMX there; see
 *Mel-Band RoFormer*).
+
+## Mega 53 BS-RoFormer guitar (`-n megaguitar`)
+
+MVSEP's 53-stem BS-RoFormer ("Mega 53"), its `guitar` mask head only: the best guitar stem
+measured so far (research round 4: +2.64 dB guitar uSDR over htdemucs_6s on 26/26 Cambridge-MT
+songs).
+
+```sh
+PY="uv run --quiet --python 3.11 --with-requirements research/round4/r4_msst_env.txt python"
+$PY tools/bsroformer.py convert mvsep_mega_model_bs_roformer_53_stems_v1.ckpt mvsep_mega_model_bs_roformer_53_stems.yaml
+# -> weights/megaguitar.safetensors (77 MB, float16) + weights/megaguitar.json
+htdemucs-rs separate -n megaguitar --flac --clip-mode clamp -o out song.m4a
+# -> out/megaguitar/song/{guitar,no_guitar}.flac      (no_guitar = mix - guitar)
+```
+
+**What it computes** (MSST `BSRoformer` @1523206, CPU, float32, with the chunking of
+`research/round4/r4_mega.py`, i.e. MSST's generic `demix`): chunks of 882000 samples (20 s)
+every 441000 (`--num-overlap 2`), the track reflect-padded by 10 s at both ends, linear fades of
+2 s, outputs overlap-added and divided by the summed windows. Per chunk: STFT (2048 / hop 512,
+centred; 1723 frames) -> 62 fixed, non-overlapping bands of bins (24 bands of 2 bins, 12 of 4,
+8 of 12, 8 of 24, 8 of 48, then 128 and 129), each RMSNorm + Linear to 256 -> 12 x (time transformer over each band's 1723
+frames, frequency transformer over each frame's 62 bands; RoPE, gated attention, 8 x 64 heads,
+GELU MLP; no per-transformer output norm) -> one final RMSNorm -> per band Linear(256, 512) ->
+tanh -> Linear -> GLU -> complex mask -> DC bin zeroed (`zero_dc`) -> iSTFT to 882000 samples.
+
+It is the Mel-RoFormer code path (`src/roformer.rs`) with the differences read from the config
+(`weights/megaguitar.json`): bands, `transformer_norm_output: false` + `final_norm`, a 2-layer
+mask MLP 4 x narrower than Kim's, `zero_dc`, and MSST's two chunk-edge rules (a short last chunk is
+reflect-padded when longer than C/2 rather than C/2 + 1; the end fade is dropped for every chunk
+with i + step >= total, the first included). Thread determinism, streaming and the kernels are
+shared with `-n melroformer`.
+
+**Weights.** The checkpoint (`mvsep_mega_model_bs_roformer_53_stems_v1.ckpt` from [MSST release
+v1.0.21](https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/tag/v1.0.21), 1.37 GB,
+sha256 `c6282089…3519f`; MIT per its trainer in MSST #245) is float16: 682 M parameters, of which
+the 53 mask heads are 656 M. `convert` keeps the 26.3 M backbone and the guitar head (12.4 M) as
+stored, float16 (77 MB; `--stem` picks another head). The rotary frequencies are float16-rounded in
+the checkpoint and PyTorch uses them so, so they are kept as stored. Because PyTorch itself
+widens the float16 weights to float32, float32 weights (`convert --float32`, 155 MB,
+`MEGAGUITAR_WEIGHTS=megaguitar-f32`) give bit-identical output: there is nothing to gain from them.
+
+### Parity (vs PyTorch 2.6.0 CPU float32, MSST code, r4_mega.py's chunking)
+
+One chunk (`mr_parity`; chunk 1 of a 30 s excerpt of MUSDB18-HQ test "Al James - Schoolboy
+Facination", 60-90 s, i.e. its first 20 s of music): output **109.7 dB**; band split 105.6 dB, the
+transformers 102.6-113.3 dB along the stack; every transformer run alone on PyTorch's own input
+122.5-131.5 dB. Against a float64 PyTorch run of the same chunk this crate is 112.5 dB and PyTorch
+float32 itself 111.2 dB: the remaining difference is float32 rounding on both sides.
+
+Full path (`htdemucs-rs separate` vs `tools/bsroformer.py separate`, the same float WAV into both;
+SNR over the whole file; reference level and error level):
+
+| input | guitar | no_guitar | levels (guitar / no_guitar), error |
+|---|---|---|---|
+| Al James excerpt (30 s, 5 chunks) | 113.8 dB | 128.3 dB | -35 / -21 dBFS; error -149 dBFS, max 4.6e-7 |
+| synthetic CI clip + -60 dBFS noise (30 s, Blacksmith EPYC, AVX-512) | 96.8 dB | 155.0 dB | -80 / -16 dBFS; error -177 dBFS (the clip has almost no "guitar") |
+
+MEGA_RESULTS_PLACEHOLDER
 
 ## Demucs behaviour worth knowing
 
