@@ -44,16 +44,54 @@ def snr(ref, x):
     return float(10 * np.log10((ref ** 2).sum() / max(((ref - x) ** 2).sum(), 1e-300)))
 
 
-def sliced(mod, x, s):
-    """mod over batch slices of x of at most s rows (cat of the results): same arithmetic, bounded intermediates."""
-    if x.shape[0] <= s: return mod(x)
-    return torch.cat([mod(x[i:i + s]) for i in range(0, x.shape[0], s)], 0)
-
-
 def slice_rows(n_seq, dim, heads, ff_mult, budget):
-    """Largest batch slice whose attention matrix (heads x n x n) and FF hidden (n x dim*ff_mult) fit in budget bytes."""
+    """Largest batch slice whose attention matrix (heads x n x n), FF hidden (n x dim*ff_mult) and qkv fit in budget bytes."""
     per = max(heads * n_seq * n_seq, n_seq * dim * ff_mult, n_seq * heads * 64 * 3) * 4
     return max(1, int(budget // per))
+
+
+class FastTransformer(nn.Module):
+    """One time or frequency Transformer of the RoFormers (pre-norm attention with rotary embedding and per-head sigmoid
+    gates, then a GELU feed-forward, then an output RMSNorm), written with few, static-shape ops so the exported graph
+    stays small: weights pre-transposed once, rotary cos/sin precomputed for the sequence length, rotate_half as a 64x64
+    matmul, and the whole block run on batch slices of at most S rows (bounded intermediates)."""
+    def __init__(s, tr, n_seq, S):
+        super().__init__(); s.S = S; s.blocks = []
+        attn0 = tr.layers[0][0]; rot = attn0.rotary_embed; s.H = attn0.heads; s.scale = attn0.scale
+        f = rot.forward(lambda: rot.get_seq_pos(n_seq, device='cpu', dtype=torch.float32, offset=0))   # (n, Dh), as the module
+        s.register_buffer('cos', f.cos().contiguous()); s.register_buffer('sin', f.sin().contiguous())
+        Dh = f.shape[-1]; R = torch.zeros(Dh, Dh)
+        for i in range(Dh // 2): R[2 * i + 1, 2 * i] = -1.0; R[2 * i, 2 * i + 1] = 1.0   # x @ R == rotate_half(x)
+        s.register_buffer('R', R); s.Dh = Dh
+        s.ps = nn.ParameterList(); idx = []
+        def P(t): s.ps.append(nn.Parameter(t.detach().clone().contiguous(), requires_grad=False)); return len(s.ps) - 1
+        for attn, ff in tr.layers:
+            lin1, lin2 = ff.net[1], ff.net[4]
+            idx.append(dict(an=P(attn.norm.gamma * attn.norm.scale), qkv=P(attn.to_qkv.weight.t()), gw=P(attn.to_gates.weight.t()),
+                            gb=P(attn.to_gates.bias), o=P(attn.to_out[0].weight.t()), fn=P(ff.net[0].gamma * ff.net[0].scale),
+                            w1=P(lin1.weight.t()), b1=P(lin1.bias), w2=P(lin2.weight.t()), b2=P(lin2.bias)))
+        s.idx = idx; s.on = P(tr.norm.gamma * tr.norm.scale) if not isinstance(tr.norm, nn.Identity) else None
+
+    @staticmethod
+    def rms(x, g): return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-12) * g
+
+    def block(s, x):
+        b, n, d = x.shape; H, Dh, p = s.H, s.Dh, s.ps
+        for L in s.idx:
+            h = s.rms(x, p[L['an']])
+            qkv = (h @ p[L['qkv']]).reshape(b, n, 3, H, Dh).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            q = q * s.cos + (q @ s.R) * s.sin; k = k * s.cos + (k @ s.R) * s.sin
+            a = torch.softmax((q * s.scale) @ k.transpose(-1, -2), dim=-1) @ v               # (b, H, n, Dh)
+            g = torch.sigmoid(h @ p[L['gw']] + p[L['gb']]).permute(0, 2, 1).unsqueeze(-1)     # (b, H, n, 1)
+            x = x + ((a * g).permute(0, 2, 1, 3).reshape(b, n, H * Dh) @ p[L['o']])
+            h = s.rms(x, p[L['fn']])
+            x = x + (F.gelu(h @ p[L['w1']] + p[L['b1']]) @ p[L['w2']] + p[L['b2']])
+        return s.rms(x, p[s.on]) if s.on is not None else x
+
+    def forward(s, x):
+        if x.shape[0] <= s.S: return s.block(x)
+        return torch.cat([s.block(x[i:i + s.S]) for i in range(0, x.shape[0], s.S)], 0)
 
 
 # ---------------------------------------------------------------- models
@@ -106,16 +144,18 @@ print(f'{name}: chunk {chunk} samples, T={T} frames, F={Fq}, bands={n_bands}, sl
 
 
 class MegaCore(nn.Module):
-    def __init__(s, m): super().__init__(); s.m = m
+    def __init__(s, m):
+        super().__init__(); s.m = m
+        s.tt = nn.ModuleList([FastTransformer(blk[-2], T, S_time) for blk in m.layers])
+        s.ft = nn.ModuleList([FastTransformer(blk[-1], n_bands, S_freq) for blk in m.layers])
     def forward(s, X):                                    # X (1, T, Fq*2*2)
         m = s.m; x = m.band_split(X)                      # (1, T, bands, d)
-        for blk in m.layers:
-            tt, ft = blk[-2], blk[-1]
+        for tt, ft in zip(s.tt, s.ft):
             b, t, f, d = x.shape
             x = x.permute(0, 2, 1, 3).reshape(b * f, t, d)
-            x = sliced(tt, x, S_time)
+            x = tt(x)
             x = x.reshape(b, f, t, d).permute(0, 2, 1, 3).reshape(b * t, f, d)
-            x = sliced(ft, x, S_freq)
+            x = ft(x)
             x = x.reshape(b, t, f, d)
         x = m.final_norm(x)
         return torch.stack([fn(x) for fn in m.mask_estimators], dim=1)   # (1, n, T, Fq*2*2)
@@ -124,6 +164,8 @@ class MegaCore(nn.Module):
 class KimCore(nn.Module):
     def __init__(s, m):
         super().__init__(); s.m = m
+        s.tt = nn.ModuleList([FastTransformer(tt, T, S_time) for tt, _ in m.layers])
+        s.ft = nn.ModuleList([FastTransformer(ft, n_bands, S_freq) for _, ft in m.layers])
         fi = m.freq_indices.long()                        # indices into (f s) = 2*Fq rows, with repeats (overlapping bands)
         rows = 2 * Fq; pos = [[] for _ in range(rows)]
         for j, r in enumerate(fi.tolist()): pos[r].append(j)
@@ -138,12 +180,12 @@ class KimCore(nn.Module):
         m = s.m; b, t, _ = X.shape
         x = X.reshape(b, t, s.rows, 2).index_select(2, s.fi).reshape(b, t, -1)
         x = m.band_split(x)
-        for tt, ft in m.layers:
+        for tt, ft in zip(s.tt, s.ft):
             _, _, f, d = x.shape
             x = x.permute(0, 2, 1, 3).reshape(b * f, t, d)
-            x = sliced(tt, x, S_time)
+            x = tt(x)
             x = x.reshape(b, f, t, d).permute(0, 2, 1, 3).reshape(b * t, f, d)
-            x = sliced(ft, x, S_freq)
+            x = ft(x)
             x = x.reshape(b, t, f, d)
         mk = m.mask_estimators[0](x).reshape(b, t, -1, 2)            # per band-frequency masks
         avg = (mk.index_select(2, s.idx).reshape(b, t, s.rows, s.K, 2) * s.w).sum(3)
@@ -151,6 +193,7 @@ class KimCore(nn.Module):
 
 
 core = (MegaCore if a.which == 'mega' else KimCore)(model).eval()
+for p_ in core.parameters(): p_.requires_grad_(False)
 
 # ---------------------------------------------------------------- one real chunk, and the reference
 mix, sr = sf.read(a.wav, dtype='float32', always_2d=True); assert sr == 44100
@@ -195,10 +238,10 @@ with torch.no_grad():
 t_exp = time.time() - t0
 import onnx
 om = onnx.load(onnx_path, load_external_data=False)
+params_m = round(sum(int(np.prod(i.dims)) for i in om.graph.initializer if i.data_type == 1) / 1e6, 2)
 info = dict(name=name, which=a.which, stems=stems, chunk=chunk, chunk_s=chunk / 44100, hop=hop, n_fft=n_fft, T=T, F=Fq,
             in_shape=list(X.shape), out_shape=list(M.shape), bands=n_bands, slice_time=S_time, slice_freq=S_freq,
-            budget_mb=a.budget_mb, zero_dc=bool(a.which == 'mega' and getattr(model, 'zero_dc', False)),
-            params_m=round(sum(p.numel() for p in core.parameters()) / 1e6, 2),
+            budget_mb=a.budget_mb, params_m=params_m, zero_dc=bool(a.which == 'mega' and getattr(model, 'zero_dc', False)),
             onnx_mb=round(os.path.getsize(onnx_path) / 1e6, 1), nodes=len(om.graph.node), export_s=round(t_exp, 1),
             core_vs_full_snr_db=core_vs_full, wav=os.path.basename(os.path.dirname(a.wav)), start_s=a.start_s,
             torch_cpu4_core_s=round(t_core, 2))
