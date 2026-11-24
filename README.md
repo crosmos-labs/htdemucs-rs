@@ -398,6 +398,108 @@ footprint** (1.44 GB max RSS); before streaming the loader and the output, 1.83 
 
 Binary: 2.5 MB (macOS) / 4.4 MB (Linux x86-64) with both models and the AVX-512 kernels.
 
+## Chain (`-n chain`): Kim vocals, then the ensemble on the instrumental
+
+```sh
+htdemucs-rs separate -n chain --flac --clip-mode clamp -o out song.m4a
+# -> out/htdemucs/song/{drums,bass,other,vocals}.flac           (4-stem view, --clip-mode-4)
+#    out/htdemucs_6s/song/{drums,bass,other,vocals,guitar,piano}.flac
+```
+
+Round 3's best recipe, `k+chain_avg` (research/round3/round3.md, section 2): Kim's Mel-Band RoFormer
+vocals; htdemucs and htdemucs_6s at shifts 0 on Kim's instrumental (mix - vocals); drums, bass and
+other averaged across the two models as `-n ensemble` averages them (`ensemble::combine_with`),
+guitar and piano from 6s. Against today's mixer split (htdemucs_6s, 2 shifts) on 12 MUSDB18-HQ
+tracks: vocals +3.44, drums +0.65, bass +0.17, other +1.24 dB uSDR. Same folders and stems as
+`-n ensemble`, vocals being Kim's in both; `--clip-mode-4` and `--ensemble-4` work as there; no
+`--shifts` / `--overlap` (Demucs runs at shifts 0, overlap 0.25; Kim at `--num-overlap`, 2).
+
+**Sum to the mix.** Not forced, as in round 3: the chain's stems sum to the mix within -24 to
+-33 dB (residual energy re the mix; round 3: mean -26.4 dB), and folding the residual into
+"other" was neutral on typical tracks. `-v` prints it per track (Signe Jakobsen -28.6 dB,
+Angels In Amplifiers -24.2 dB - the PyTorch pipeline's -28.57 / -24.25).
+
+**Memory.** Demucs' whole-track normalisation needs the whole instrumental before its first
+segment, so one track-long buffer is unavoidable besides the decode: the instrumental
+(2 x 4 bytes x samples). Everything else streams - Kim's vocals go to both views' writers as Kim
+finalises them, the decoded mix is freed once the instrumental is complete, Kim's 0.91 GB of
+weights are freed before the Demucs models (0.28 GB) are loaded, and Demucs runs through
+`apply::Streamer` window by window. Peak RSS (VmHWM) on the Linux box, 8 threads:
+
+| track | length | peak RSS | of which track-long (mix + instrumental, float32) |
+|---|---|---|---|
+| Aerials | 4.1 min | **1.34 GB** | 0.17 GB |
+| Aerials looped (the Demucs path's 22-min test) | 22 min | **2.08 GB** | 0.93 GB |
+
+The difference is exactly those two buffers growing. During Kim both exist, because Kim reads the
+mix (reflect-padded at both ends) while the instrumental is being written; overwriting the mix in
+place would save 0.47 GB at 22 min but needs care with that reflection, and is not done.
+
+### Parity (vs the PyTorch pipeline round 3 scored, CPU float32: tools/chain_ref.py)
+
+Two MUSDB18-HQ test tracks on the Linux box (i5-12450H), the same WAV into both; SNR per stem
+over the whole track, and the error's level:
+
+| track | view | vocals | drums | bass | other | guitar | piano |
+|---|---|---|---|---|---|---|---|
+| Signe Jakobsen, What Have You Done To Me | 4 | 131.8 | 119.5 | 123.5 | 123.4 | | |
+| | 6 | 131.8 | 119.5 | 123.5 | 108.7 | 120.5 | 118.7 |
+| Angels In Amplifiers, I'm Alright | 4 | 132.2 | 121.5 | 126.5 | 123.3 | | |
+| | 6 | 132.2 | 121.5 | 126.5 | 108.3 | 119.4 | 114.5 |
+
+The error is -144 to -157 dBFS on every stem; the 6-stem "other" scores lower only because it is
+quiet (-38 / -39 dBFS: guitar and piano are taken out of it). On the CI runner's synthetic clip
+(Xeon 6975P, -60 dBFS noise floor) every stem is 91.9-122.8 dB, the error at most -141 dBFS.
+
+And the scores themselves: with float32 Kim weights, the chain's uSDR (r2_score.py) on four MUSDB
+tracks equals round 3's PyTorch `k+chain_avg` scores - vocals to all four decimals, the other
+stems within 0.002 dB (round 3 ran its Demucs passes on MPS).
+
+### Float16 Kim weights
+
+The checkpoint is float32, and none of its tensors is exactly float16, so float16 weights change
+the model's output (Kim's chunk parity against PyTorch float32: 128 dB -> 72 dB). What that costs
+in separation quality, the chain with float32 and with float16 Kim weights on four MUSDB18-HQ
+tracks, scored with research/round2/r2_score.py (uSDR, float32 / float16):
+
+| track | vocals | drums | bass | other | accompaniment |
+|---|---|---|---|---|---|
+| Signe Jakobsen | 14.2991 / 14.2991 | 6.7664 / 6.7663 | 3.2100 / 3.2100 | 6.6414 / 6.6413 | 16.7997 / 16.7997 |
+| Angels In Amplifiers | 13.8809 / 13.8812 | 8.0086 / 8.0087 | 10.7113 / 10.7112 | 9.1856 / 9.1856 | 16.9100 / 16.9103 |
+| Enda Reilly | 18.5387 / 18.5390 | 13.6319 / 13.6319 | 11.4105 / 11.4106 | 12.8993 / 12.8993 | 22.6026 / 22.6028 |
+| Al James | 10.9387 / 10.9390 | 7.6269 / 7.6269 | 11.0154 / 11.0155 | 5.7101 / 5.7104 | 12.2219 / 12.2223 |
+
+At most 0.0004 dB on any stem, in either direction - far under the 0.05 dB bar. So the converter
+now writes **float16 Kim weights by default** (`weights/melroformer.safetensors`, 457 MB instead
+of 913); `convert --float32` writes `melroformer-f32.safetensors`, which the parity checks against
+PyTorch float32 load (`MELROFORMER_WEIGHTS=melroformer-f32`). The weights are widened to float32
+on load, so this halves the download and the file, not the memory.
+
+### CPU
+
+CPU seconds per second of audio for the whole chain (Kim + both Demucs passes, decode and writing
+included), Rust against tools/chain_ref.py on PyTorch 2.2.2 CPU, same machine, same input:
+
+| machine | threads | input | Rust CPU-s / audio-s | PyTorch CPU-s / audio-s | Rust wall vs PyTorch wall |
+|---|---|---|---|---|---|
+| Linux box, i5-12450H (4 P + 4 E cores, 12 threads, AVX2) | 8 | Aerials, 2 min from 1:00 | **16.0** | 30.0 | 267 s vs 492 s |
+| same | 4 | same | **9.8** | 13.7 | 308 s vs 421 s |
+| same | 8 | 4 MUSDB tracks, 3-3.3 min | 15.1-15.9 | 35-53 (2 tracks, box shared) | 394-429 s per track |
+| GitHub runner, Xeon 6975P-C (AVX-512) | 2 (1 core) | 30 s synthetic clip | **14.5** | 20.0 | 223 s vs 311 s |
+
+(The 1-thread runs were cut short when the box went offline; at one thread the Kim part alone
+measured 4.90 CPU-s per audio-s of chunk against PyTorch's 7.76 on a Zen 3 runner - see
+*Mel-Band RoFormer*.)
+Every figure uses 27-47% less CPU than PyTorch. On the box, 8 threads buy Rust 13% less wall time than 4 for
+63% more CPU (the four extra threads are hyperthreads and E-cores); PyTorch gets slower (492 s vs
+421 s). On a CPU-billed container, threads = physical cores is the efficient setting. The 30 s clip carries proportionally more of Kim's 4 s padding at each end, so its
+per-second figures run high; a 4-minute track costs about 2 x Kim's chunk rate plus Demucs' two
+passes (round 3's PyTorch estimate was 8.97 CPU-s per audio-s with Kim at one thread).
+
+The Mac (M1 Pro) is not measured here: the machine is shared and the chain is now run only on the
+Linux box. For Kim alone the Mac gemm build was 1.8x PyTorch's CPU (PyTorch uses AMX there; see
+*Mel-Band RoFormer*).
+
 ## Demucs behaviour worth knowing
 
 - `separate.py` standardises the whole track first: `ref = wav.mean(0)`, `wav = (wav -
