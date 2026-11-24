@@ -54,7 +54,7 @@ jobs:
       - name: Settings (inputs, or .github/bench/mg_run.env for push runs)
         run: |
           if [ "${{ github.event_name }}" = push ]; then
-            grep -E '^(THREADS|RUNS|VARIANTS|RUN_TORCH|RUN_PARITY)=' .github/bench/mg_run.env >> "$GITHUB_ENV"
+            grep -E '^(THREADS|RUNS|VARIANTS|RUN_TORCH|RUN_PARITY|MEM_SECONDS)=' .github/bench/mg_run.env >> "$GITHUB_ENV"
           else
             {
               echo "THREADS=${{ inputs.threads }}"; echo "RUNS=${{ inputs.runs }}"; echo "VARIANTS=${{ inputs.variants }}"
@@ -129,6 +129,17 @@ jobs:
             echo "- Rust full path: $(tail -1 rust-separate.txt)"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Whole-track CPU and peak memory (synthetic clips of MEM_SECONDS, 8 threads; push runs only)
+        if: env.MEM_SECONDS != ''
+        run: |
+          for secs in $MEM_SECONDS; do
+            python .github/bench/synth.py mem$secs.wav $secs
+            /usr/bin/time -f "separate megaguitar $secs s: %e s wall, %U+%S s CPU, peak RSS %M KB" \
+              ./target/release/htdemucs-rs separate -q -n megaguitar --threads 8 --flac --clip-mode clamp -o memsep mem$secs.wav 2>&1 | tee -a mem.txt
+            rm -rf mem$secs.wav memsep
+          done
+          { echo "### Whole tracks"; echo '```'; cat mem.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Bench (Rust)
         run: |
           first=1
@@ -164,4 +175,5 @@ jobs:
             compare.txt
             torch-separate.txt
             rust-separate.txt
+            mem.txt
           if-no-files-found: ignore
