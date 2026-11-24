@@ -565,20 +565,22 @@ fn run_kimmega(a: Args) -> Result<(), String> {
         if show {
             tqdm_line(0, total, step_sec, 0.0);
         }
-        let mut t_kim = None;
+        let (mut t_kim, kim_chunks) = (0.0, plan.kim.chunks(len));
         let res = kimmega::separate(
             &a.weights,
             input.data,
             &plan,
             &mut || {
                 done += 1;
+                if done == kim_chunks {
+                    t_kim = t2.elapsed().as_secs_f64();
+                }
                 if show {
                     tqdm_line(done, total, step_sec, t2.elapsed().as_secs_f64());
                 }
             },
             &mut |l, r| writers.borrow_mut()[0].push(&[l, r]),
             &mut |rows| {
-                t_kim.get_or_insert_with(|| t2.elapsed().as_secs_f64());
                 let mut ws = writers.borrow_mut();
                 ws[1..].par_iter_mut().enumerate().try_for_each(|(k, w)| w.push(&[rows[2 * k], rows[2 * k + 1]]))
             },
@@ -590,9 +592,9 @@ fn run_kimmega(a: Args) -> Result<(), String> {
         writers.into_inner().into_par_iter().try_for_each(|w| w.finish())?;
         if a.verbose {
             eprintln!(
-                "  separated in {:.1}s (Kim ~{:.1}s), written in {:.1}s; stems sum to the mix within {:.1} dB (residual energy re the mix, upper bound)",
+                "  separated in {:.1}s (Kim's chunks done at {:.1}s), written in {:.1}s; stems sum to the mix within {:.1} dB (residual energy re the mix, upper bound)",
                 t3.duration_since(t2).as_secs_f64(),
-                t_kim.unwrap_or(0.0),
+                t_kim,
                 t3.elapsed().as_secs_f64(),
                 res.db()
             );
