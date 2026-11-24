@@ -1,20 +1,31 @@
-//! Kim's Mel-Band RoFormer vocal model (github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model,
-//! lucidrains' `MelBandRoformer`), eval mode, for one chunk; `separate` is upstream's
-//! `demix_track` (chunks, linear fades, overlap-add). Weights and config: tools/melroformer.py.
+//! RoFormer source separators, eval mode, for one chunk; `separate` is the chunked overlap-add
+//! around it. Two checkpoints, one code path:
 //!
-//! Forward, for a stereo chunk of T samples (T = 352800 -> 801 STFT frames):
-//! 1. STFT per channel (n_fft 2048, hop 441, periodic Hann, centred with reflect padding, not
+//! * Kim's Mel-Band RoFormer vocal model (github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model,
+//!   lucidrains' `MelBandRoformer`), with upstream's `demix_track`. Weights: tools/melroformer.py.
+//! * MVSEP's "Mega 53" BS-RoFormer (Music-Source-Separation-Training's `BSRoformer` @1523206), one
+//!   mask head kept (guitar), with research/round4/r4_mega.py's chunking (MSST's generic demix).
+//!   Weights: tools/bsroformer.py.
+//!
+//! The two differ only where the config says so (`Config`): which bins form each band (mel bands
+//! that overlap, or fixed non-overlapping ranges), whether every transformer ends with its own
+//! RMSNorm (Mel) or the whole stack with one (BS), the mask MLP's depth and width, whether the DC
+//! bin is zeroed before the iSTFT (BS), and the chunking's two edge rules.
+//!
+//! Forward, for a stereo chunk of T samples (Kim: T = 352800, hop 441 -> 801 STFT frames; Mega:
+//! T = 882000, hop 512 -> 1723 frames):
+//! 1. STFT per channel (n_fft 2048, periodic Hann, centred with reflect padding, not
 //!    normalised): (frames, 1025 bins, 2 channels, re/im).
-//! 2. Band split: 60 mel bands, each a contiguous range of bins (neighbouring bands overlap); a
-//!    band's features at one frame are its bins x channels x re/im, RMSNorm'd and projected
-//!    (Linear) to 384. Tokens: (band, frame).
-//! 3. 6 x (time transformer over each band's 801 frames, then frequency transformer over each
-//!    frame's 60 bands). Each transformer: one pre-norm block - RMSNorm, attention with rotary
+//! 2. Band split: each band a contiguous range of bins (Kim: 60 mel bands, neighbours overlap;
+//!    Mega: 62 fixed bands); a band's features at one frame are its bins x channels x re/im,
+//!    RMSNorm'd and projected (Linear) to dim. Tokens: (band, frame).
+//! 3. depth x (time transformer over each band's frames, then frequency transformer over each
+//!    frame's bands). Each transformer: one pre-norm block - RMSNorm, attention with rotary
 //!    position embeddings (8 heads x 64) and a per-head sigmoid gate, residual; RMSNorm, GELU
-//!    feed-forward (x4), residual - then a final RMSNorm.
-//! 4. Mask estimator per band: Linear -> tanh -> Linear -> tanh -> Linear -> GLU, giving a
-//!    complex mask per (bin, channel) of the band; bins in two bands average their two masks.
-//! 5. Masked STFT -> iSTFT -> vocals.
+//!    feed-forward (x4), residual - then (Mel) a final RMSNorm. BS: one RMSNorm after the stack.
+//! 4. Mask estimator per band: Linear -> tanh -> ... -> Linear -> GLU, giving a complex mask per
+//!    (bin, channel) of the band; bins in two bands average their two masks.
+//! 5. Masked STFT (BS: DC bin zeroed) -> iSTFT (to T samples) -> the target stem.
 //!
 //! RMSNorm is `F.normalize(x) * sqrt(dim) * gamma` (L2-normalise, then scale): computed as
 //! x / max(||x||, 1e-12) with the norm accumulated in f64, then the two multiplies in float32.
@@ -113,7 +124,8 @@ pub mod prof {
     }
 }
 
-/// tools/melroformer.py's JSON: the upstream constructor kwargs plus inference settings and bands.
+/// tools/melroformer.py's or tools/bsroformer.py's JSON: the upstream constructor kwargs plus
+/// inference settings and bands. Fields after `num_bands_per_freq` default to Kim's model.
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub name: String,
@@ -141,6 +153,39 @@ pub struct Config {
     /// Bins of each band, ascending.
     pub bands: Vec<Vec<usize>>,
     pub num_bands_per_freq: Vec<usize>,
+    /// Every time / frequency transformer ends with its own RMSNorm (Mel-RoFormer's
+    /// `norm_output=True`); BS-RoFormer builds them with `norm_output=False`.
+    #[serde(default = "yes")]
+    pub transformer_norm_output: bool,
+    /// One RMSNorm (`final_norm`) after the whole transformer stack (BS-RoFormer).
+    #[serde(default)]
+    pub final_norm: bool,
+    /// Linear layers in each band's mask MLP (tanh between them, GLU after the last): Kim's
+    /// `MLP` makes depth + 1, MSST's BS-RoFormer `MLP` makes depth.
+    #[serde(default = "three")]
+    pub mask_estimator_linears: usize,
+    /// The masked spectrum's DC bin is zeroed before the iSTFT (BS-RoFormer's `zero_dc`).
+    #[serde(default)]
+    pub zero_dc: bool,
+    /// The chunking's edge rules: "kim" (demix_track) or "msst" (r4_mega.py, MSST's generic demix).
+    #[serde(default = "kim")]
+    pub demix: String,
+    /// Output stems: the model's target and the mix minus it.
+    #[serde(default = "kim_sources")]
+    pub sources: [String; 2],
+}
+
+fn yes() -> bool {
+    true
+}
+fn three() -> usize {
+    3
+}
+fn kim() -> String {
+    "kim".into()
+}
+fn kim_sources() -> [String; 2] {
+    ["vocals".into(), "instrumental".into()]
 }
 
 impl Config {
@@ -152,7 +197,7 @@ impl Config {
         Ok(cfg)
     }
 
-    /// The configuration of Kim's checkpoint; refuse others rather than compute something else.
+    /// The configurations this port computes; refuse others rather than compute something else.
     fn check(&self) -> Result<(), String> {
         let mut bad = vec![];
         let mut need = |ok: bool, what: &str| {
@@ -162,12 +207,13 @@ impl Config {
         };
         need(self.stereo && self.num_stems == 1, "stereo, one stem");
         need(self.time_transformer_depth == 1 && self.freq_transformer_depth == 1, "transformer depth 1");
-        need(self.mask_estimator_depth == 2, "mask estimator depth 2");
+        need(self.mask_estimator_linears >= 2, "mask estimator of 2+ linear layers");
         need(self.stft_win_length == self.stft_n_fft && !self.stft_normalized, "win = n_fft, not normalised");
         need(self.dim_freqs_in == self.stft_n_fft / 2 + 1, "dim_freqs_in = n_fft / 2 + 1");
         need(self.bands.len() == self.num_bands, "num_bands");
         need(self.heads * self.dim_head > 0 && self.dim_head % 2 == 0, "heads, even dim_head");
-        need(self.num_overlap >= 1 && self.chunk_size >= self.num_overlap && self.chunk_size % self.stft_hop_length == 0, "chunking");
+        need(self.num_overlap >= 1 && self.chunk_size >= self.num_overlap && self.chunk_size > self.stft_n_fft / 2, "chunking");
+        need(self.demix == "kim" || self.demix == "msst", "demix kim or msst");
         // Every band a non-empty contiguous range (so a band's features are one slice of a frame).
         need(self.bands.iter().all(|b| !b.is_empty() && b.windows(2).all(|w| w[1] == w[0] + 1)), "contiguous bands");
         let mut count = vec![0usize; self.dim_freqs_in];
@@ -179,7 +225,7 @@ impl Config {
             }
         }
         need(count == self.num_bands_per_freq && count.iter().all(|&c| c > 0), "bands cover every bin");
-        if bad.is_empty() { Ok(()) } else { Err(format!("unsupported Mel-RoFormer config: {}", bad.join(", "))) }
+        if bad.is_empty() { Ok(()) } else { Err(format!("unsupported RoFormer config: {}", bad.join(", "))) }
     }
 }
 
@@ -243,13 +289,13 @@ impl Spec {
         out
     }
 
-    /// y: (frames, bins, 2, 2). Returns 2 channels x (frames - 1) * hop samples (torch.istft with
-    /// center=True and no length: the overlap-added frames / the summed squared window, minus
-    /// n_fft/2 samples at each end).
-    pub fn istft(&self, y: &[f32], frames: usize) -> Vec<f32> {
+    /// y: (frames, bins, 2, 2). Returns 2 channels x `len` samples (torch.istft with center=True
+    /// and length=len: the overlap-added frames / the summed squared window from sample n_fft/2
+    /// on; without a length torch gives (frames - 1) * hop samples, the same values).
+    pub fn istft(&self, y: &[f32], frames: usize, len: usize) -> Vec<f32> {
         let _sc = prof::scope(prof::STFT);
         let (nfft, hop, bins) = (self.n_fft, self.hop, self.bins());
-        let len = (frames - 1) * hop;
+        assert!(len + nfft / 2 <= (frames - 1) * hop + nfft, "iSTFT length past the last frame");
         let ifft = RealFftPlanner::<f64>::new().plan_fft_inverse(nfft);
         let scale = 1.0 / nfft as f64;
         // Windowed inverse FFT of every frame, both channels: (frames, 2, nfft).
@@ -460,7 +506,7 @@ fn rope_row(x: &mut [f32], c: &[f32], s: &[f32]) {
 }
 
 /// One `Transformer` of depth 1: Attention (RMSNorm, qkv, rotary, attention, gates, to_out),
-/// FeedForward (RMSNorm, Linear, GELU, Linear), each residual, then the output RMSNorm.
+/// FeedForward (RMSNorm, Linear, GELU, Linear), each residual, then the output RMSNorm if any.
 struct Block {
     attn_norm: Vec<f32>,
     /// to_qkv (3 * inner rows: q, k, v, each (head, dim_head)) then to_gates (heads rows).
@@ -472,7 +518,7 @@ struct Block {
     b1: Vec<f32>,
     w2: Vec<f32>,
     b2: Vec<f32>,
-    out_norm: Vec<f32>,
+    out_norm: Option<Vec<f32>>,
     freqs: Vec<f32>,
 }
 
@@ -509,7 +555,7 @@ fn attn_rows() -> usize {
 }
 
 impl Block {
-    fn load(st: &mut SafeTensors, p: &str, heads: usize) -> Self {
+    fn load(st: &mut SafeTensors, p: &str, heads: usize, norm_output: bool) -> Self {
         let mut t = |n: &str| st.take(&format!("{p}.{n}")).data;
         let mut w_qkvg = t("layers.0.0.to_qkv.weight");
         w_qkvg.extend_from_slice(&t("layers.0.0.to_gates.weight"));
@@ -523,7 +569,7 @@ impl Block {
             b1: t("layers.0.1.net.1.bias"),
             w2: t("layers.0.1.net.4.weight"),
             b2: t("layers.0.1.net.4.bias"),
-            out_norm: t("norm.gamma"),
+            out_norm: norm_output.then(|| t("norm.gamma")),
             freqs: t("layers.0.0.rotary_embed.freqs"),
         };
         assert_eq!(b.b_gates.len(), heads);
@@ -644,9 +690,11 @@ impl Block {
             }
         }
         // Output norm.
-        rms_norm_rows(x, h, dim, scale, &self.out_norm);
-        let _p = prof::scope(prof::COPY);
-        x.copy_from_slice(&h[..n * dim]);
+        if let Some(g) = &self.out_norm {
+            rms_norm_rows(x, h, dim, scale, g);
+            let _p = prof::scope(prof::COPY);
+            x.copy_from_slice(&h[..n * dim]);
+        }
     }
 }
 
@@ -667,23 +715,24 @@ struct BandIn {
     b: Vec<f32>,
 }
 
-/// Mask estimator MLP for one band: dim -> hidden -> hidden -> 2 * dim_in, GLU.
+/// Mask estimator MLP for one band: dim -> hidden (-> hidden ...) -> 2 * dim_in, tanh between
+/// the layers, GLU after the last. (weight (out, in), bias) per layer.
 struct BandOut {
-    w1: Vec<f32>,
-    b1: Vec<f32>,
-    w2: Vec<f32>,
-    b2: Vec<f32>,
-    w3: Vec<f32>,
-    b3: Vec<f32>,
+    layers: Vec<(Vec<f32>, Vec<f32>)>,
 }
 
-pub struct MelRoformer {
+/// A RoFormer separator (Kim's Mel-Band RoFormer or a BS-RoFormer; see the module doc).
+pub struct Roformer {
     pub cfg: Config,
     spec: Spec,
     band_in: Vec<BandIn>,
     layers: Vec<(Block, Block)>,
+    final_norm: Option<Vec<f32>>,
     band_out: Vec<BandOut>,
 }
+
+/// The name this port started with (Kim's model only).
+pub type MelRoformer = Roformer;
 
 /// K transposed per head before the QK^T GEMMs (MR_ATTN_KT=1; off by default: on the runners
 /// the faster QK^T GEMM about paid for the transposes, no more).
@@ -699,13 +748,16 @@ fn freq_group() -> usize {
     knob("MR_FREQ_GROUP", &C, 16)
 }
 
-impl MelRoformer {
-    /// Loads `<dir>/melroformer.json` and `<dir>/<name>.safetensors` (float32 or float16;
-    /// `$MELROFORMER_WEIGHTS` overrides the name, e.g. melroformer-f32 for parity checks).
+impl Roformer {
+    /// Loads `<dir>/<model>.json` and `<dir>/<name>.safetensors` (float32 or float16), where
+    /// <model> is `name` up to its first '-' (melroformer-f16 -> melroformer.json).
+    /// `$<MODEL>_WEIGHTS` overrides the name for measurements (MELROFORMER_WEIGHTS=melroformer-f32,
+    /// MEGAGUITAR_WEIGHTS=megaguitar-f32).
     pub fn load(dir: impl AsRef<Path>, name: &str) -> Result<Self, String> {
         let dir = dir.as_ref();
-        let name = std::env::var("MELROFORMER_WEIGHTS").unwrap_or_else(|_| name.to_string());
-        let cfg = Config::load(dir.join("melroformer.json"))?;
+        let model = name.split('-').next().unwrap_or(name).to_string();
+        let name = std::env::var(format!("{}_WEIGHTS", model.to_uppercase())).unwrap_or_else(|_| name.to_string());
+        let cfg = Config::load(dir.join(format!("{model}.json")))?;
         let mut st = SafeTensors::load(dir.join(format!("{name}.safetensors")))?;
         let m = Self::from_weights(cfg, &mut st)?;
         if !st.tensors.is_empty() {
@@ -739,17 +791,19 @@ impl MelRoformer {
                 b: need(format!("{p}.1.bias"), &[dim])?,
             });
             let p = format!("mask_estimators.0.to_freqs.{b}.0");
-            band_out.push(BandOut {
-                w1: need(format!("{p}.0.weight"), &[hid, dim])?,
-                b1: need(format!("{p}.0.bias"), &[hid])?,
-                w2: need(format!("{p}.2.weight"), &[hid, hid])?,
-                b2: need(format!("{p}.2.bias"), &[hid])?,
-                w3: need(format!("{p}.4.weight"), &[2 * din, hid])?,
-                b3: need(format!("{p}.4.bias"), &[2 * din])?,
-            });
+            let nl = cfg.mask_estimator_linears;
+            let layers = (0..nl)
+                .map(|j| {
+                    let (o, i) = (if j + 1 == nl { 2 * din } else { hid }, if j == 0 { dim } else { hid });
+                    Ok((need(format!("{p}.{}.weight", 2 * j), &[o, i])?, need(format!("{p}.{}.bias", 2 * j), &[o])?))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            band_out.push(BandOut { layers });
         }
+        let final_norm = if cfg.final_norm { Some(need("final_norm.gamma".into(), &[dim])?) } else { None };
+        let no = cfg.transformer_norm_output;
         let layers = (0..cfg.depth)
-            .map(|i| (Block::load(st, &format!("layers.{i}.0"), cfg.heads), Block::load(st, &format!("layers.{i}.1"), cfg.heads)))
+            .map(|i| (Block::load(st, &format!("layers.{i}.0"), cfg.heads, no), Block::load(st, &format!("layers.{i}.1"), cfg.heads, no)))
             .collect::<Vec<_>>();
         let inner = cfg.heads * cfg.dim_head;
         for (t, f) in &layers {
@@ -760,7 +814,7 @@ impl MelRoformer {
             }
         }
         let spec = Spec::new(cfg.stft_n_fft, cfg.stft_hop_length);
-        Ok(MelRoformer { cfg, spec, band_in, layers, band_out })
+        Ok(Roformer { cfg, spec, band_in, layers, final_norm, band_out })
     }
 
     /// Layer i's time transformer on x (band, frame, dim): one task per band.
@@ -823,12 +877,12 @@ impl MelRoformer {
         }
     }
 
-    pub fn sources(&self) -> [&'static str; 2] {
-        ["vocals", "instrumental"]
+    /// The output stems: the target (vocals, guitar) and the mix minus it.
+    pub fn sources(&self) -> [&str; 2] {
+        [&self.cfg.sources[0], &self.cfg.sources[1]]
     }
 
-    /// One chunk: `mix` is 2 channels x len samples (len a multiple of the hop); returns the
-    /// vocals, 2 x len.
+    /// One chunk: `mix` is 2 channels x len samples; returns the target stem, 2 x len.
     pub fn forward(&self, mix: &[f32], tr: &mut Tracer) -> Vec<f32> {
         let cfg = &self.cfg;
         let len = mix.len() / 2;
@@ -886,6 +940,18 @@ impl MelRoformer {
                 tr.emit(&format!("layers.{i}.freq"), &Tensor::new(&[frames, nb, dim], band_to_frame(&x, nb, frames, dim)));
             }
         }
+        if let Some(g) = &self.final_norm {
+            prof::part(3);
+            let scale = (dim as f64).sqrt() as f32;
+            x.par_chunks_mut(frames * dim).for_each_init(Vec::new, |buf, xb| {
+                let h = grow(buf, frames * dim);
+                rms_norm_rows(xb, h, dim, scale, g);
+                xb.copy_from_slice(h);
+            });
+            if tr.on() {
+                tr.emit("final_norm", &Tensor::new(&[frames, nb, dim], band_to_frame(&x, nb, frames, dim)));
+            }
+        }
 
         // Mask estimators: per band (frames, dim_in) complex masks, (bin, channel, re/im) per frame.
         prof::part(3);
@@ -895,35 +961,43 @@ impl MelRoformer {
                 .map_init(
                     || (Vec::new(), Vec::new()),
                     |(h1, h2), (xb, (bo, bi))| {
-                        let hid = bo.b1.len();
+                        let hid = bo.layers[0].1.len();
                         let din = 4 * bi.nf;
-                        let h1 = grow(h1, frames * hid.max(2 * din));
-                        let h2 = grow(h2, frames * hid);
+                        let nl = bo.layers.len();
+                        // Hidden activations ping-pong between the two buffers: `a` holds the
+                        // current layer's input, the GEMM writes `b`, then they swap.
+                        let n = frames * hid.max(2 * din);
+                        let (mut a, mut b) = (grow(h1, n), grow(h2, n));
+                        let (w, bias) = &bo.layers[0];
                         {
                             let _p = prof::gemm(prof::MASKMLP, frames, hid, dim);
-                            sgemm_par(frames, hid, dim, xb, dim, 1, &bo.w1, 1, dim, h1, hid, false, false);
+                            sgemm_par(frames, hid, dim, xb, dim, 1, w, 1, dim, a, hid, false, false);
                         }
                         {
                             let _p = prof::scope(prof::ACT);
-                            h1[..frames * hid].chunks_exact_mut(hid).for_each(|r| bias_tanh_row(r, &bo.b1));
+                            a[..frames * hid].chunks_exact_mut(hid).for_each(|r| bias_tanh_row(r, bias));
                         }
-                        {
-                            let _p = prof::gemm(prof::MASKMLP, frames, hid, hid);
-                            sgemm_par(frames, hid, hid, h1, hid, 1, &bo.w2, 1, hid, h2, hid, false, false);
+                        for (w, bias) in &bo.layers[1..nl - 1] {
+                            {
+                                let _p = prof::gemm(prof::MASKMLP, frames, hid, hid);
+                                sgemm_par(frames, hid, hid, a, hid, 1, w, 1, hid, b, hid, false, false);
+                            }
+                            {
+                                let _p = prof::scope(prof::ACT);
+                                b[..frames * hid].chunks_exact_mut(hid).for_each(|r| bias_tanh_row(r, bias));
+                            }
+                            std::mem::swap(&mut a, &mut b);
                         }
-                        {
-                            let _p = prof::scope(prof::ACT);
-                            h2.chunks_exact_mut(hid).for_each(|r| bias_tanh_row(r, &bo.b2));
-                        }
-                        let o = &mut h1[..frames * 2 * din];
+                        let (w3, b3) = &bo.layers[nl - 1];
+                        let o = &mut b[..frames * 2 * din];
                         {
                             let _p = prof::gemm(prof::MASKMLP, frames, 2 * din, hid);
-                            sgemm_par(frames, 2 * din, hid, h2, hid, 1, &bo.w3, 1, hid, o, 2 * din, false, false);
+                            sgemm_par(frames, 2 * din, hid, a, hid, 1, w3, 1, hid, o, 2 * din, false, false);
                         }
                         let _p = prof::scope(prof::ACT);
                         let mut m = vec![0.0f32; frames * din];
                         for (mr, or) in m.chunks_exact_mut(din).zip(o.chunks_exact(2 * din)) {
-                            glu_bias_row(mr, &or[..din], &or[din..], &bo.b3[..din], &bo.b3[din..]);
+                            glu_bias_row(mr, &or[..din], &or[din..], &b3[..din], &b3[din..]);
                         }
                         m
                     },
@@ -948,6 +1022,7 @@ impl MelRoformer {
         let mut y = spec;
         {
             let nbpf = &cfg.num_bands_per_freq;
+            let zero_dc = cfg.zero_dc;
             y.par_chunks_mut(bins * 4).enumerate().for_each(|(t, row)| {
                 let _p = prof::scope(prof::APPLY);
                 let mut acc = vec![0.0f32; bins * 4];
@@ -967,9 +1042,12 @@ impl MelRoformer {
                         row[i + 1] = xr * mi + xi * mr;
                     }
                 }
+                if zero_dc {
+                    row[..4].fill(0.0);
+                }
             });
         }
-        let out = self.spec.istft(&y, frames);
+        let out = self.spec.istft(&y, frames, len);
         tr.emit("output", &Tensor::new(&[2, len], out.clone()));
         out
     }
@@ -979,21 +1057,36 @@ impl MelRoformer {
 /// both ends of each chunk's window (none at the track's two ends), outputs overlap-added and
 /// divided by the summed windows; the track is reflect-padded by C - step at both ends when it
 /// is longer than twice that.
+///
+/// The two edge rules differ between Kim's `demix_track` and MSST's generic demix as
+/// research/round4/r4_mega.py runs it (`msst`):
+/// * a short last chunk is reflect-padded to C when longer than C/2 + 1 (Kim) or C/2 (MSST),
+///   else zero-padded;
+/// * the end fade is dropped (window ones) for the chunk with i + C >= total, unless it is the
+///   first (Kim: `elif`), or for every chunk with i + step >= total, the first included (MSST).
 pub struct Chunking {
     pub chunk: usize,
     pub step: usize,
     pub fade: usize,
     pub border: usize,
+    pub msst: bool,
 }
 
 impl Chunking {
     pub fn new(cfg: &Config, num_overlap: usize) -> Result<Self, String> {
-        let c = cfg.chunk_size;
+        Self::with_chunk(cfg, cfg.chunk_size, num_overlap)
+    }
+
+    /// `new` with another chunk length (samples; the model takes any length above n_fft / 2).
+    pub fn with_chunk(cfg: &Config, c: usize, num_overlap: usize) -> Result<Self, String> {
+        if c <= cfg.stft_n_fft / 2 || c < 10 {
+            return Err(format!("chunk size must be above {} samples", (cfg.stft_n_fft / 2).max(9)));
+        }
         if num_overlap == 0 || num_overlap > c {
             return Err(format!("num_overlap must be in 1..={c}"));
         }
         let step = c / num_overlap;
-        Ok(Chunking { chunk: c, step, fade: c / 10, border: c - step })
+        Ok(Chunking { chunk: c, step, fade: c / 10, border: c - step, msst: cfg.demix == "msst" })
     }
 
     fn padded(&self, len: usize) -> bool {
@@ -1008,6 +1101,17 @@ impl Chunking {
     /// Number of model forwards for a track of `len` samples.
     pub fn chunks(&self, len: usize) -> usize {
         self.total(len).div_ceil(self.step)
+    }
+
+    /// Drops the fades at the track's ends from chunk i's window (see the type's doc).
+    fn edges(&self, w: &mut [f32], i: usize, total: usize) {
+        let c = self.chunk;
+        if i == 0 {
+            w[..self.fade].fill(1.0);
+        }
+        if (self.msst && i + self.step >= total) || (!self.msst && i != 0 && i + c >= total) {
+            w[c - self.fade..].fill(1.0);
+        }
     }
 
     /// get_windowing_array: ones with linspace fades (torch.linspace's float32 arithmetic).
@@ -1106,11 +1210,12 @@ pub fn separate_stream(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec
     while i < total {
         flush(&mut res, &mut cnt, &mut wbase, i);
         let length = c.min(total - i);
+        let reflect_min = if ch.msst { c / 2 } else { c / 2 + 1 };
         part.par_chunks_mut(c).enumerate().for_each(|(s, row)| {
             for (q, v) in row.iter_mut().enumerate() {
                 *v = if q < length {
                     at(s, i + q)
-                } else if length > c / 2 + 1 {
+                } else if length > reflect_min {
                     at(s, i + 2 * (length - 1) - q) // reflect-pad the short last chunk
                 } else {
                     0.0
@@ -1120,11 +1225,7 @@ pub fn separate_stream(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec
         let y = model(&part);
         progress();
         let mut w = base.clone();
-        if i == 0 {
-            w[..ch.fade].fill(1.0);
-        } else if i + c >= total {
-            w[c - ch.fade..].fill(1.0);
-        }
+        ch.edges(&mut w, i, total);
         let rel = i - wbase;
         for s in 0..2 {
             for q in 0..length {
@@ -1210,7 +1311,7 @@ mod tests {
                 for q in 0..c {
                     part[s * c + q] = if q < length {
                         mix[s * total + i + q]
-                    } else if length > c / 2 + 1 {
+                    } else if (ch.msst && length > c / 2) || (!ch.msst && length > c / 2 + 1) {
                         mix[s * total + i + refl(q as isize, length)]
                     } else {
                         0.0
@@ -1219,7 +1320,15 @@ mod tests {
             }
             let y = model(&part);
             let mut w = w0.clone();
-            if i == 0 {
+            if ch.msst {
+                // r4_mega.py: two independent ifs.
+                if i == 0 {
+                    w[..ch.fade].fill(1.0);
+                }
+                if i + ch.step >= total {
+                    w[c - ch.fade..].fill(1.0);
+                }
+            } else if i == 0 {
                 w[..ch.fade].fill(1.0);
             } else if i + c >= total {
                 w[c - ch.fade..].fill(1.0);
@@ -1246,23 +1355,23 @@ mod tests {
         // windows show; small chunks so every branch (padding, short last chunk reflect / zero
         // padded, one-chunk tracks) is reached.
         let model = |x: &[f32]| -> Vec<f32> { x.iter().enumerate().map(|(i, v)| v * 0.5 + (i % 7) as f32 * 1e-3).collect() };
-        for (chunk, n) in [(100usize, 2usize), (100, 4), (100, 1), (120, 3)] {
+        for (chunk, n, msst) in [(100usize, 2usize, false), (100, 4, false), (100, 1, false), (120, 3, false), (100, 2, true), (100, 4, true), (100, 1, true), (120, 3, true), (101, 2, true)] {
             let step = chunk / n;
-            let ch = Chunking { chunk, step, fade: chunk / 10, border: chunk - step };
+            let ch = Chunking { chunk, step, fade: chunk / 10, border: chunk - step, msst };
             for len in [1usize, 2, 30, 52, 99, 100, 101, 150, 199, 200, 201, 260, 333, 1000, 1037] {
                 let wav: Vec<f32> = (0..2 * len).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
                 let mut calls = 0;
                 let a = separate_with(&wav, &ch, &model, &mut || calls += 1);
                 let b = demix_reference(&wav, &ch, &model);
-                assert_eq!(calls, ch.chunks(len), "chunk {chunk} n {n} len {len}");
-                assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "chunk {chunk} n {n} len {len}");
+                assert_eq!(calls, ch.chunks(len), "chunk {chunk} n {n} len {len} msst {msst}");
+                assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "chunk {chunk} n {n} len {len} msst {msst}");
             }
         }
     }
 
     #[test]
     fn fade_window() {
-        let ch = Chunking { chunk: 352800, step: 176400, fade: 35280, border: 176400 };
+        let ch = Chunking { chunk: 352800, step: 176400, fade: 35280, border: 176400, msst: false };
         let w = ch.window();
         assert_eq!((w[0], w[35279], w[35280], w[352800 - 35281], w[352799]), (0.0, 1.0, 1.0, 1.0, 0.0));
         assert!((w[1] - 1.0 / 35279.0).abs() < 1e-9);
@@ -1276,7 +1385,7 @@ mod tests {
         let s = Spec::new(2048, 441);
         let len = 441 * 40;
         let x: Vec<f32> = (0..2 * len).map(|i| ((i * 7919 % 1000) as f32 / 500.0 - 1.0) * 0.5).collect();
-        let y = s.istft(&s.stft(&x, len), s.frames(len));
+        let y = s.istft(&s.stft(&x, len), s.frames(len), len);
         let err = x.iter().zip(&y).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         assert!(err < 1e-6, "round trip error {err}");
     }

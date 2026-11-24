@@ -12,7 +12,7 @@ use htdemucs::audio::{self, Format};
 use htdemucs::{HTDemucs, Tensor};
 use rayon::prelude::*;
 
-const USAGE: &str = "usage: htdemucs-rs separate -n <htdemucs|htdemucs_6s|ensemble|melroformer|chain> [options] <tracks>...
+const USAGE: &str = "usage: htdemucs-rs separate -n <htdemucs|htdemucs_6s|ensemble|melroformer|chain|megaguitar> [options] <tracks>...
 
 options (demucs' names and defaults where they exist):
   -n, --name NAME        model (default htdemucs), or ensemble: htdemucs and htdemucs_6s on one
@@ -21,12 +21,15 @@ options (demucs' names and defaults where they exist):
                          or melroformer: Kim's Mel-Band RoFormer, vocals + instrumental;
                          or chain: Kim's vocals, then the ensemble (shifts 0) on Kim's
                          instrumental; same two folders as ensemble - see src/chain.rs
+                         or megaguitar: MVSEP Mega 53 BS-RoFormer's guitar head, guitar +
+                         no_guitar (mix - guitar)
   --weights DIR          converted weights (default $HTDEMUCS_WEIGHTS, else ./weights)
   -o, --out DIR          output root (default separated); files go to DIR/NAME/<track>/<stem>.<ext>
   --shifts N             random time shifts averaged (default 1)
   --seed S               seed of the shifts' random offsets, as random.seed(S) in Python (default 0)
   --overlap F            overlap between segments (default 0.25)
-  --num-overlap N        melroformer only: chunks overlapping each position (default 2, as upstream)
+  --num-overlap N        melroformer / megaguitar: chunks overlapping each position (default 2, as upstream)
+  --chunk-size N         melroformer / megaguitar: samples per chunk (default the model's: 352800 / 882000)
   --threads T            worker threads (default: all cores)
   --float32              write float32 WAV (default: 16-bit WAV)
   --flac                 write 16-bit FLAC
@@ -52,6 +55,7 @@ struct Args {
     average_four: bool,
     own_6s: bool,
     num_overlap: Option<usize>,
+    chunk_size: Option<usize>,
     verbose: bool,
     progress: bool,
     tracks: Vec<PathBuf>,
@@ -70,6 +74,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         average_four: true,
         own_6s: false,
         num_overlap: None,
+        chunk_size: None,
         verbose: false,
         progress: true,
         tracks: vec![],
@@ -85,6 +90,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--seed" => a.opts.seed = val(&mut it, &arg)?.parse().map_err(|_| "--seed: not an integer".to_string())?,
             "--overlap" => a.opts.overlap = num(val(&mut it, &arg)?, &arg)? as f32,
             "--num-overlap" => a.num_overlap = Some(num(val(&mut it, &arg)?, &arg)? as usize),
+            "--chunk-size" => a.chunk_size = Some(num(val(&mut it, &arg)?, &arg)? as usize),
             "--threads" | "-j" => a.threads = Some(num(val(&mut it, &arg)?, &arg)? as usize),
             "--float32" => a.format = Format::WavF32,
             "--flac" => a.format = Format::Flac16,
@@ -174,8 +180,8 @@ fn run(a: Args) -> Result<(), String> {
     if let Some(t) = a.threads {
         rayon::ThreadPoolBuilder::new().num_threads(t).build_global().map_err(|e| e.to_string())?;
     }
-    if a.name == "melroformer" {
-        return run_melroformer(a);
+    if a.name == "melroformer" || a.name == "megaguitar" {
+        return run_roformer(a);
     }
     if a.name == "chain" {
         return run_chain(a);
@@ -306,16 +312,18 @@ fn write_window(writers: &mut [audio::StemWriter], data: &[f32], ch: usize, w: u
     })
 }
 
-/// `-n melroformer`: Kim's Mel-Band RoFormer (src/roformer.rs) with upstream's chunking; writes
-/// vocals and instrumental (mix - vocals, as upstream's inference.py) to DIR/melroformer/<track>/.
-fn run_melroformer(a: Args) -> Result<(), String> {
-    use htdemucs::roformer::{self, Chunking, MelRoformer};
+/// `-n melroformer` (Kim's Mel-Band RoFormer) or `-n megaguitar` (Mega 53 BS-RoFormer, guitar
+/// head), src/roformer.rs, with their upstream's chunking; writes the target stem and the mix minus
+/// it (vocals + instrumental as Kim's inference.py; guitar + no_guitar) to DIR/<name>/<track>/.
+fn run_roformer(a: Args) -> Result<(), String> {
+    use htdemucs::roformer::{self, Chunking, Roformer};
     if a.opts.shifts > 1 || a.opts.overlap != Options::default().overlap {
-        return Err("melroformer takes no --shifts / --overlap (it is deterministic; see --num-overlap)".into());
+        return Err(format!("{} takes no --shifts / --overlap (it is deterministic; see --num-overlap)", a.name));
     }
     let t0 = Instant::now();
-    let model = MelRoformer::load(&a.weights, "melroformer")?;
-    let ch = Chunking::new(&model.cfg, a.num_overlap.unwrap_or(model.cfg.num_overlap)).map_err(|e| format!("--num-overlap: {e}"))?;
+    let model = Roformer::load(&a.weights, &a.name)?;
+    let ch = Chunking::with_chunk(&model.cfg, a.chunk_size.unwrap_or(model.cfg.chunk_size), a.num_overlap.unwrap_or(model.cfg.num_overlap))
+        .map_err(|e| format!("--num-overlap / --chunk-size: {e}"))?;
     let rate = model.cfg.sample_rate as u32;
     for track in &a.tracks {
         let t1 = Instant::now();
@@ -331,12 +339,13 @@ fn run_melroformer(a: Args) -> Result<(), String> {
             tqdm_line(0, total, step_sec, 0.0);
         }
         // Both stems are written as the chunks finalise them (audio::StemWriter, as the Demucs
-        // path): vocals, and instrumental = mix - vocals (upstream inference.py).
+        // path): the target, and mix - target (upstream inference.py's instrumental).
         let name = track.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
-        let dir = a.out.join("melroformer").join(name);
+        let dir = a.out.join(&a.name).join(name);
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let clip = audio::Clip::parse(&a.clip).ok_or(format!("clip mode {}", a.clip))?;
-        let mut writers = ["vocals", "instrumental"]
+        let mut writers = model
+            .sources()
             .iter()
             .map(|src| audio::StemWriter::create(&dir.join(format!("{src}.{}", a.format.ext())), 2, len, rate, a.format, clip))
             .collect::<Result<Vec<_>, _>>()?;
