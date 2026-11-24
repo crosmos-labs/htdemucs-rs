@@ -1,14 +1,16 @@
 // One-chunk benchmark of an exported separator core in onnxruntime-web. Query: model=<name in /models>, ep=webgpu|wasm,
 // threads (wasm), runs, save=1 (POST the output masks too), tag. Result JSON is POSTed to /result and left in window.__result.
-import * as ort from '/ort/ort.all.min.mjs';
 import { stft, maskIstft } from './dsp.js';
 const q = new URLSearchParams(location.search);
+// bundle=native (default): ort.webgpu.min.mjs, the C++ WebGPU EP on Dawn (asyncify build); bundle=jsep: ort.all.min.mjs, the JS EP
+const bundle = q.get('bundle') || 'native';
+const ort = await import(bundle === 'jsep' ? '/ort/ort.all.min.mjs' : '/ort/ort.webgpu.min.mjs');
 const model = q.get('model'), ep = q.get('ep') || 'webgpu', runs = +(q.get('runs') || 3), threads = +(q.get('threads') || 1);
 const ref = q.get('ref') || model.replace(/_(fp16|w16|q8)$/, '');
 const tag = q.get('tag') || `${model}_${ep}${ep === 'wasm' ? threads : ''}`;
 const logEl = document.getElementById('log'); const lines = [];
 const log = (...a) => { lines.push(a.join(' ')); logEl.textContent = lines.join('\n'); console.log(...a); };
-const R = { tag, model, ep, threads, ua: navigator.userAgent, hw: navigator.hardwareConcurrency, deviceMemory: navigator.deviceMemory ?? null };
+const R = { tag, model, ep, bundle, threads, ua: navigator.userAgent, hw: navigator.hardwareConcurrency, deviceMemory: navigator.deviceMemory ?? null };
 const now = () => performance.now();
 async function bin(u) { const r = await fetch(u); if (!r.ok) throw new Error(u + ' ' + r.status); return r.arrayBuffer(); }
 function snr(a, b) { let s = 0, e = 0; for (let i = 0; i < a.length; i++) { s += a[i] * a[i]; const d = a[i] - b[i]; e += d * d; } return 10 * Math.log10(s / Math.max(e, 1e-300)); }

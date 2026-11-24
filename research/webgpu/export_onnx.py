@@ -66,8 +66,13 @@ def band_split(bs, x):
 
 
 def mask_head(me, x):
-    """MaskEstimator.forward with a Gather per band instead of unbind (a many-output Split)."""
-    return cat_tree([mlp(x[:, :, i]) for i, mlp in enumerate(me.to_freqs)], -1)
+    """MaskEstimator.forward with a Gather per band instead of unbind (a many-output Split), and the GLU as two Slices
+    (onnxruntime-web 1.31's WebGPU Split produced a zero-sized second output here)."""
+    def glu_mlp(seq, xb):
+        mlp, glu = seq[0], seq[1]; assert isinstance(glu, nn.GLU) and glu.dim == -1
+        y = mlp(xb); h = y.shape[-1] // 2
+        return y[..., :h] * torch.sigmoid(y[..., h:])
+    return cat_tree([glu_mlp(seq, x[:, :, i]) for i, seq in enumerate(me.to_freqs)], -1)
 
 
 class FastTransformer(nn.Module):
@@ -259,7 +264,7 @@ t_exp = time.time() - t0
 import onnx
 om = onnx.load(onnx_path, load_external_data=False)
 wide = max(((len(n.input) + len(n.output)), n.op_type) for n in om.graph.node)
-print('widest node (inputs + outputs):', wide, flush=True)
+print('widest node (inputs + outputs):', wide, '; Split nodes:', sum(n.op_type == 'Split' for n in om.graph.node), flush=True)
 params_m = round(sum(int(np.prod(i.dims)) for i in om.graph.initializer if i.data_type == 1) / 1e6, 2)
 info = dict(name=name, which=a.which, stems=stems, chunk=chunk, chunk_s=chunk / 44100, hop=hop, n_fft=n_fft, T=T, F=Fq,
             in_shape=list(X.shape), out_shape=list(M.shape), bands=n_bands, slice_time=S_time, slice_freq=S_freq,
