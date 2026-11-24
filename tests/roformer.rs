@@ -1,5 +1,5 @@
 //! RoFormer behaviour that needs the converted weights (./weights/melroformer.*, made by
-//! tools/melroformer.py; ./weights/megaguitar.*, made by tools/bsroformer.py; each test is
+//! tools/melroformer.py; ./weights/megaguitar.* and ./weights/mega.*, made by tools/bsroformer.py; each test is
 //! skipped with a note when they are missing). Release builds only: one chunk is ~3e12 flops
 //! (Kim) / ~1e13 (Mega).
 
@@ -101,5 +101,34 @@ fn megaguitar_silent_input_gives_silence() {
         assert_eq!(v.len(), 2 * len);
         assert!(v.iter().all(|x| *x == 0.0), "len {len}");
         assert_eq!(calls, ch.chunks(len));
+    }
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release only (slow)")]
+fn mega_heads_equal_one_head_models() {
+    // ./weights/mega.* (tools/bsroformer.py convert --name mega: drums, bass, guitar, keys) runs the
+    // backbone once and every head off it; each head must give exactly what a one-head model of it
+    // gives (megaguitar: the guitar head), at any thread count.
+    let (Some(mega), Some(mg)) = (load("mega"), load("megaguitar")) else { return };
+    let g = mega.cfg.heads().iter().position(|h| h == "guitar").expect("mega has a guitar head");
+    let len = 3 * 44100; // one 3 s forward (the model takes any length above n_fft / 2)
+    let x = clip(len);
+    let tr = || htdemucs::Tracer::none();
+    let one = mg.forward(&x, &mut tr());
+    let run = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        pool.install(|| mega.forward(&x, &mut tr()))
+    };
+    let all = run(3);
+    assert_eq!(all.len(), mega.num_heads() * 2 * len);
+    let guitar = &all[g * 2 * len..(g + 1) * 2 * len];
+    assert!(guitar.iter().zip(&one).all(|(p, q)| p.to_bits() == q.to_bits()), "mega's guitar head differs from megaguitar");
+    assert!(all.iter().all(|v| v.is_finite()));
+    let all1 = run(1);
+    assert!(all.iter().zip(&all1).all(|(p, q)| p.to_bits() == q.to_bits()), "1 vs 3 threads differ");
+    // The heads differ from each other (each mask head really is its own).
+    for k in 1..mega.num_heads() {
+        assert!(all[..2 * len].iter().zip(&all[k * 2 * len..(k + 1) * 2 * len]).any(|(p, q)| p != q), "head {k} equals head 0");
     }
 }

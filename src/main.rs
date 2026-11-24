@@ -12,24 +12,35 @@ use htdemucs::audio::{self, Format};
 use htdemucs::{HTDemucs, Tensor};
 use rayon::prelude::*;
 
-const USAGE: &str = "usage: htdemucs-rs separate -n <htdemucs|htdemucs_6s|ensemble|melroformer|chain|megaguitar> [options] <tracks>...
+const USAGE: &str = "usage: htdemucs-rs separate -n <kimmega|htdemucs|htdemucs_6s|ensemble|melroformer|chain|megaguitar|mega> [options] <tracks>...
 
 options (demucs' names and defaults where they exist):
-  -n, --name NAME        model (default htdemucs), or ensemble: htdemucs and htdemucs_6s on one
+  -n, --name NAME        model (default htdemucs); kimmega (alias kim_mega_keys, research round 5's
+                         pick): Kim's vocals, then Mega 53's drums, bass, guitar and keys heads on
+                         Kim's instrumental, other = the rest; writes DIR/kimmega/<track>/
+                         {vocals,drums,bass,guitar,piano,other} - see src/kimmega.rs;
+                         or ensemble: htdemucs and htdemucs_6s on one
                          decode, averaged; writes DIR/htdemucs/<track>/ (4 stems) and
                          DIR/htdemucs_6s/<track>/ (6 stems) - see src/ensemble.rs;
                          or melroformer: Kim's Mel-Band RoFormer, vocals + instrumental;
                          or chain: Kim's vocals, then the ensemble (shifts 0) on Kim's
                          instrumental; same two folders as ensemble - see src/chain.rs
                          or megaguitar: MVSEP Mega 53 BS-RoFormer's guitar head, guitar +
-                         no_guitar (mix - guitar)
+                         no_guitar (mix - guitar); or mega: its drums, bass, guitar and
+                         keys heads off one backbone pass, + rest (mix - the four)
   --weights DIR          converted weights (default $HTDEMUCS_WEIGHTS, else ./weights)
   -o, --out DIR          output root (default separated); files go to DIR/NAME/<track>/<stem>.<ext>
   --shifts N             random time shifts averaged (default 1)
   --seed S               seed of the shifts' random offsets, as random.seed(S) in Python (default 0)
   --overlap F            overlap between segments (default 0.25)
-  --num-overlap N        melroformer / megaguitar: chunks overlapping each position (default 2, as upstream)
-  --chunk-size N         melroformer / megaguitar: samples per chunk (default the model's: 352800 / 882000)
+  --num-overlap N        melroformer / megaguitar / mega, and Kim in chain / kimmega: chunks
+                         overlapping each position (default 2, as upstream)
+  --chunk-size N         melroformer / megaguitar / mega, and Kim in kimmega: samples per chunk
+                         (default the model's: 352800 (8 s) / 882000 (20 s))
+  --mega-chunk-size N    kimmega (and mega / megaguitar): Mega's samples per chunk (default
+                         882000 = 20 s; 441000 = 10 s: -0.03 dB guitar for 32% less CPU)
+  --mega-num-overlap N   kimmega (and mega / megaguitar): Mega's chunk overlap (default 2; 1 with
+                         10 s chunks: -0.12 dB for 69% less CPU)
   --threads T            worker threads (default: all cores)
   --float32              write float32 WAV (default: 16-bit WAV)
   --flac                 write 16-bit FLAC
@@ -56,6 +67,8 @@ struct Args {
     own_6s: bool,
     num_overlap: Option<usize>,
     chunk_size: Option<usize>,
+    mega_num_overlap: Option<usize>,
+    mega_chunk_size: Option<usize>,
     verbose: bool,
     progress: bool,
     tracks: Vec<PathBuf>,
@@ -75,6 +88,8 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         own_6s: false,
         num_overlap: None,
         chunk_size: None,
+        mega_num_overlap: None,
+        mega_chunk_size: None,
         verbose: false,
         progress: true,
         tracks: vec![],
@@ -91,6 +106,8 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--overlap" => a.opts.overlap = num(val(&mut it, &arg)?, &arg)? as f32,
             "--num-overlap" => a.num_overlap = Some(num(val(&mut it, &arg)?, &arg)? as usize),
             "--chunk-size" => a.chunk_size = Some(num(val(&mut it, &arg)?, &arg)? as usize),
+            "--mega-num-overlap" => a.mega_num_overlap = Some(num(val(&mut it, &arg)?, &arg)? as usize),
+            "--mega-chunk-size" => a.mega_chunk_size = Some(num(val(&mut it, &arg)?, &arg)? as usize),
             "--threads" | "-j" => a.threads = Some(num(val(&mut it, &arg)?, &arg)? as usize),
             "--float32" => a.format = Format::WavF32,
             "--flac" => a.format = Format::Flac16,
@@ -131,6 +148,21 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if a.threads == Some(0) {
         return Err("--threads must be at least 1".into());
+    }
+    if a.name == "kim_mega_keys" {
+        a.name = "kimmega".into();
+    }
+    let mega = ["kimmega", "mega", "megaguitar"].contains(&a.name.as_str());
+    if !mega && (a.mega_chunk_size.is_some() || a.mega_num_overlap.is_some()) {
+        return Err(format!("--mega-chunk-size / --mega-num-overlap: {} has no Mega part", a.name));
+    }
+    if a.name != "kimmega" && mega {
+        // -n mega / megaguitar: the Mega options are the model's own.
+        if (a.chunk_size.is_some() && a.mega_chunk_size.is_some()) || (a.num_overlap.is_some() && a.mega_num_overlap.is_some()) {
+            return Err(format!("{}: give --chunk-size / --num-overlap or their --mega- forms, not both", a.name));
+        }
+        a.chunk_size = a.chunk_size.or(a.mega_chunk_size);
+        a.num_overlap = a.num_overlap.or(a.mega_num_overlap);
     }
     Ok(a)
 }
@@ -180,11 +212,14 @@ fn run(a: Args) -> Result<(), String> {
     if let Some(t) = a.threads {
         rayon::ThreadPoolBuilder::new().num_threads(t).build_global().map_err(|e| e.to_string())?;
     }
-    if a.name == "melroformer" || a.name == "megaguitar" {
+    if a.name == "melroformer" || a.name == "megaguitar" || a.name == "mega" {
         return run_roformer(a);
     }
     if a.name == "chain" {
         return run_chain(a);
+    }
+    if a.name == "kimmega" {
+        return run_kimmega(a);
     }
     let t0 = Instant::now();
     // `-n ensemble`: htdemucs_6s and htdemucs on one decode, averaged (src/ensemble.rs).
@@ -312,9 +347,10 @@ fn write_window(writers: &mut [audio::StemWriter], data: &[f32], ch: usize, w: u
     })
 }
 
-/// `-n melroformer` (Kim's Mel-Band RoFormer) or `-n megaguitar` (Mega 53 BS-RoFormer, guitar
-/// head), src/roformer.rs, with their upstream's chunking; writes the target stem and the mix minus
-/// it (vocals + instrumental as Kim's inference.py; guitar + no_guitar) to DIR/<name>/<track>/.
+/// `-n melroformer` (Kim's Mel-Band RoFormer), `-n megaguitar` (Mega 53 BS-RoFormer, guitar
+/// head) or `-n mega` (Mega 53, several heads off one backbone pass), src/roformer.rs, with their
+/// upstream's chunking; writes each head's stem and the mix minus them (vocals + instrumental as
+/// Kim's inference.py; guitar + no_guitar; drums, bass, guitar, keys + rest) to DIR/<name>/<track>/.
 fn run_roformer(a: Args) -> Result<(), String> {
     use htdemucs::roformer::{self, Chunking, Roformer};
     if a.opts.shifts > 1 || a.opts.overlap != Options::default().overlap {
@@ -351,10 +387,12 @@ fn run_roformer(a: Args) -> Result<(), String> {
             .collect::<Result<Vec<_>, _>>()?;
         let (mut err, mut inst) = (None, vec![]);
         let mix = &input.data;
+        let nh = model.num_heads();
         let model_fn = |part: &[f32]| model.forward(part, &mut htdemucs::Tracer::none());
-        roformer::separate_stream(
+        roformer::separate_stream_n(
             mix,
             &ch,
+            nh,
             &model_fn,
             &mut || {
                 done += 1;
@@ -362,15 +400,24 @@ fn run_roformer(a: Args) -> Result<(), String> {
                     tqdm_line(done, total, step_sec, t2.elapsed().as_secs_f64());
                 }
             },
-            &mut |t0, l, r| {
+            &mut |t0, rows| {
                 if err.is_some() {
                     return;
                 }
+                let w = rows[0].len();
                 inst.clear();
-                inst.extend(l.iter().enumerate().map(|(i, v)| mix[t0 + i] - v));
-                inst.extend(r.iter().enumerate().map(|(i, v)| mix[len + t0 + i] - v));
-                let (il, ir) = inst.split_at(l.len());
-                err = writers[0].push(&[l, r]).and_then(|_| writers[1].push(&[il, ir])).err();
+                if nh == 1 {
+                    // mix - target in float32 (one rounding either way).
+                    inst.extend(rows[0].iter().enumerate().map(|(i, v)| mix[t0 + i] - v));
+                    inst.extend(rows[1].iter().enumerate().map(|(i, v)| mix[len + t0 + i] - v));
+                } else {
+                    // mix - the heads' sum, summed in float64.
+                    for c in 0..2 {
+                        inst.extend((0..w).map(|i| (mix[c * len + t0 + i] as f64 - (0..nh).map(|k| rows[2 * k + c][i] as f64).sum::<f64>()) as f32));
+                    }
+                }
+                let (il, ir) = inst.split_at(w);
+                err = (0..nh).try_for_each(|k| writers[k].push(&[rows[2 * k], rows[2 * k + 1]])).and_then(|_| writers[nh].push(&[il, ir])).err();
             },
         );
         if let Some(e) = err {
@@ -473,6 +520,79 @@ fn run_chain(a: Args) -> Result<(), String> {
             eprintln!(
                 "  separated in {:.1}s, written in {:.1}s; stems sum to the mix within {:.1} dB (residual energy re the mix)",
                 t3.duration_since(t2).as_secs_f64(),
+                t3.elapsed().as_secs_f64(),
+                res.db()
+            );
+        }
+    }
+    if a.verbose {
+        eprintln!("done in {:.1}s, peak RSS {:.0} MB", t0.elapsed().as_secs_f64(), peak_rss_mb());
+    }
+    Ok(())
+}
+
+/// `-n kimmega`: Kim's vocals, then Mega 53's heads on Kim's instrumental, other = the rest
+/// (src/kimmega.rs). Writes DIR/kimmega/<track>/{vocals,drums,bass,guitar,piano,other}.
+fn run_kimmega(a: Args) -> Result<(), String> {
+    use htdemucs::kimmega::{self, Plan, Settings};
+    if a.opts.shifts > 1 || a.opts.overlap != Options::default().overlap || a.own_6s || a.clip4.is_some() || !a.average_four {
+        return Err("kimmega takes no --shifts / --overlap / --ensemble-* / --clip-mode-4 (see --num-overlap, --mega-chunk-size, --mega-num-overlap)".into());
+    }
+    let t0 = Instant::now();
+    let settings = Settings { kim_chunk: a.chunk_size, kim_overlap: a.num_overlap, mega_chunk: a.mega_chunk_size, mega_overlap: a.mega_num_overlap };
+    let plan = Plan::new(&a.weights, &settings)?;
+    let rate = htdemucs::roformer::Config::load(a.weights.join(format!("{}.json", kimmega::KIM)))?.sample_rate as u32;
+    for track in &a.tracks {
+        let t1 = Instant::now();
+        let input = audio::decode(track)?;
+        let input = audio::resample(audio::to_channels(input, 2)?, rate)?;
+        let len = input.frames();
+        if a.verbose {
+            eprintln!("{}: {:.1} s of audio, decoded in {:.2}s", track.display(), len as f64 / rate as f64, t1.elapsed().as_secs_f64());
+        }
+        let name = track.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+        let dir = a.out.join("kimmega").join(name);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let clip = audio::Clip::parse(&a.clip).ok_or(format!("clip mode {}", a.clip))?;
+        let writers = plan
+            .sources
+            .iter()
+            .map(|src| audio::StemWriter::create(&dir.join(format!("{src}.{}", a.format.ext())), 2, len, rate, a.format, clip))
+            .collect::<Result<Vec<_>, _>>()?;
+        let writers = std::cell::RefCell::new(writers);
+        let (total, mut done) = (plan.forwards(len), 0);
+        let (t2, show, step_sec) = (Instant::now(), a.progress, len as f64 / rate as f64 / total.max(1) as f64);
+        if show {
+            tqdm_line(0, total, step_sec, 0.0);
+        }
+        let mut t_kim = None;
+        let res = kimmega::separate(
+            &a.weights,
+            input.data,
+            &plan,
+            &mut || {
+                done += 1;
+                if show {
+                    tqdm_line(done, total, step_sec, t2.elapsed().as_secs_f64());
+                }
+            },
+            &mut |l, r| writers.borrow_mut()[0].push(&[l, r]),
+            &mut |rows| {
+                t_kim.get_or_insert_with(|| t2.elapsed().as_secs_f64());
+                let mut ws = writers.borrow_mut();
+                ws[1..].par_iter_mut().enumerate().try_for_each(|(k, w)| w.push(&[rows[2 * k], rows[2 * k + 1]]))
+            },
+        )?;
+        if show {
+            eprintln!();
+        }
+        let t3 = Instant::now();
+        writers.into_inner().into_par_iter().try_for_each(|w| w.finish())?;
+        if a.verbose {
+            eprintln!(
+                "  separated in {:.1}s (Kim ~{:.1}s), written in {:.1}s; stems sum to the mix within {:.1} dB (residual energy re the mix, upper bound)",
+                t3.duration_since(t2).as_secs_f64(),
+                t_kim.unwrap_or(0.0),
                 t3.elapsed().as_secs_f64(),
                 res.db()
             );
