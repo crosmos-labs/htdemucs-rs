@@ -541,8 +541,8 @@ the 53 mask heads are 656 M. `convert` keeps the 26.3 M backbone and the guitar 
 stored, float16 (77 MB; `--stem` picks another head). The rotary frequencies are float16-rounded in
 the checkpoint and PyTorch uses them so, so they are kept as stored. Because PyTorch itself
 widens the float16 weights to float32, float32 weights (`convert --float32`, 155 MB,
-`MEGAGUITAR_WEIGHTS=megaguitar-f32`) hold exactly the same values and should give the same
-output (measurement below).
+`MEGAGUITAR_WEIGHTS=megaguitar-f32`) hold exactly the same values and give bit-identical output
+(measured: the 30 s excerpt below, both stems, M1 Pro): there is nothing to gain from them.
 
 ### Parity (vs PyTorch 2.6.0 CPU float32, MSST code, r4_mega.py's chunking)
 
@@ -557,8 +557,16 @@ SNR over the whole file; reference level and error level):
 
 | input | guitar | no_guitar | levels (guitar / no_guitar), error |
 |---|---|---|---|
-| Al James excerpt (30 s, 5 chunks) | 113.8 dB | 128.3 dB | -35 / -21 dBFS; error -149 dBFS, max 4.6e-7 |
+| Al James excerpt (30 s, 5 chunks), Linux box (i5-12450H, AVX2) | 113.8 dB | 128.3 dB | -35 / -21 dBFS; error -149 dBFS, max 4.6e-7 |
+| the same, Apple M1 Pro (NEON) | 112.7 dB | 127.2 dB | -35 / -21 dBFS; error -148 dBFS, max 6.5e-7 |
+| MUSDB18-HQ test: Angels In Amplifiers, I'm Alright (179.6 s, 20 chunks), M1 Pro | 119.4 dB | 124.8 dB | -25 / -20 dBFS; error -144 dBFS, max 1.9e-6 |
 | synthetic CI clip + -60 dBFS noise (30 s, Blacksmith EPYC, AVX-512) | 96.8 dB | 155.0 dB | -80 / -16 dBFS; error -177 dBFS (the clip has almost no "guitar") |
+
+The chunk parity is the same 109.7 dB on the M1 Pro (NEON kernels) as on the Linux box (AVX2).
+
+**Determinism.** Bit-identical output at 1, 4 and 6 threads (M1 Pro, the 30 s excerpt, both
+stems, full path) and at 1 and 8 threads (Linux box); one chunk bit-identical at 1, 4 and 8
+threads on Blacksmith's AVX-512 EPYC (`MR_CHECK_THREADS`).
 
 MEGA_RESULTS_PLACEHOLDER
 
