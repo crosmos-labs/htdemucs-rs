@@ -50,6 +50,26 @@ def slice_rows(n_seq, dim, heads, ff_mult, budget):
     return max(1, int(budget // per))
 
 
+def cat_tree(xs, dim, k=6):
+    """torch.cat in groups of at most k inputs: ORT's WebGPU kernels bind one storage buffer per input/output and the
+    default per-stage limit is 8 (a 63-way Split failed validation)."""
+    while len(xs) > k: xs = [torch.cat(xs[i:i + k], dim) if len(xs[i:i + k]) > 1 else xs[i] for i in range(0, len(xs), k)]
+    return torch.cat(xs, dim) if len(xs) > 1 else xs[0]
+
+
+def band_split(bs, x):
+    """BandSplit.forward with Slice ops instead of one many-output Split."""
+    outs, s0 = [], 0
+    for d_in, net in zip(bs.dim_inputs, bs.to_features):
+        outs.append(net(x[..., s0:s0 + d_in]).unsqueeze(-2)); s0 += d_in
+    return cat_tree(outs, -2)
+
+
+def mask_head(me, x):
+    """MaskEstimator.forward with a Gather per band instead of unbind (a many-output Split)."""
+    return cat_tree([mlp(x[:, :, i]) for i, mlp in enumerate(me.to_freqs)], -1)
+
+
 class FastTransformer(nn.Module):
     """One time or frequency Transformer of the RoFormers (pre-norm attention with rotary embedding and per-head sigmoid
     gates, then a GELU feed-forward, then an output RMSNorm), written with few, static-shape ops so the exported graph
@@ -91,7 +111,7 @@ class FastTransformer(nn.Module):
 
     def forward(s, x):
         if x.shape[0] <= s.S: return s.block(x)
-        return torch.cat([s.block(x[i:i + s.S]) for i in range(0, x.shape[0], s.S)], 0)
+        return cat_tree([s.block(x[i:i + s.S]) for i in range(0, x.shape[0], s.S)], 0)
 
 
 # ---------------------------------------------------------------- models
@@ -149,7 +169,7 @@ class MegaCore(nn.Module):
         s.tt = nn.ModuleList([FastTransformer(blk[-2], T, S_time) for blk in m.layers])
         s.ft = nn.ModuleList([FastTransformer(blk[-1], n_bands, S_freq) for blk in m.layers])
     def forward(s, X):                                    # X (1, T, Fq*2*2)
-        m = s.m; x = m.band_split(X)                      # (1, T, bands, d)
+        m = s.m; x = band_split(m.band_split, X)                      # (1, T, bands, d)
         for tt, ft in zip(s.tt, s.ft):
             b, t, f, d = x.shape
             x = x.permute(0, 2, 1, 3).reshape(b * f, t, d)
@@ -158,7 +178,7 @@ class MegaCore(nn.Module):
             x = ft(x)
             x = x.reshape(b, t, f, d)
         x = m.final_norm(x)
-        return torch.stack([fn(x) for fn in m.mask_estimators], dim=1)   # (1, n, T, Fq*2*2)
+        return torch.stack([mask_head(fn, x) for fn in m.mask_estimators], dim=1)   # (1, n, T, Fq*2*2)
 
 
 class KimCore(nn.Module):
@@ -179,7 +199,7 @@ class KimCore(nn.Module):
     def forward(s, X):                                    # X (1, T, rows*2)
         m = s.m; b, t, _ = X.shape
         x = X.reshape(b, t, s.rows, 2).index_select(2, s.fi).reshape(b, t, -1)
-        x = m.band_split(x)
+        x = band_split(m.band_split, x)
         for tt, ft in zip(s.tt, s.ft):
             _, _, f, d = x.shape
             x = x.permute(0, 2, 1, 3).reshape(b * f, t, d)
@@ -187,7 +207,7 @@ class KimCore(nn.Module):
             x = x.reshape(b, f, t, d).permute(0, 2, 1, 3).reshape(b * t, f, d)
             x = ft(x)
             x = x.reshape(b, t, f, d)
-        mk = m.mask_estimators[0](x).reshape(b, t, -1, 2)            # per band-frequency masks
+        mk = mask_head(m.mask_estimators[0], x).reshape(b, t, -1, 2)            # per band-frequency masks
         avg = (mk.index_select(2, s.idx).reshape(b, t, s.rows, s.K, 2) * s.w).sum(3)
         return avg.reshape(b, 1, t, s.rows * 2)
 
@@ -238,10 +258,12 @@ with torch.no_grad():
 t_exp = time.time() - t0
 import onnx
 om = onnx.load(onnx_path, load_external_data=False)
+wide = max(((len(n.input) + len(n.output)), n.op_type) for n in om.graph.node)
+print('widest node (inputs + outputs):', wide, flush=True)
 params_m = round(sum(int(np.prod(i.dims)) for i in om.graph.initializer if i.data_type == 1) / 1e6, 2)
 info = dict(name=name, which=a.which, stems=stems, chunk=chunk, chunk_s=chunk / 44100, hop=hop, n_fft=n_fft, T=T, F=Fq,
             in_shape=list(X.shape), out_shape=list(M.shape), bands=n_bands, slice_time=S_time, slice_freq=S_freq,
-            budget_mb=a.budget_mb, params_m=params_m, zero_dc=bool(a.which == 'mega' and getattr(model, 'zero_dc', False)),
+            budget_mb=a.budget_mb, params_m=params_m, widest_node=list(wide), zero_dc=bool(a.which == 'mega' and getattr(model, 'zero_dc', False)),
             onnx_mb=round(os.path.getsize(onnx_path) / 1e6, 1), nodes=len(om.graph.node), export_s=round(t_exp, 1),
             core_vs_full_snr_db=core_vs_full, wav=os.path.basename(os.path.dirname(a.wav)), start_s=a.start_s,
             torch_cpu4_core_s=round(t_core, 2))
