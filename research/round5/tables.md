@@ -414,3 +414,16 @@ Variants: see round5.md. Rows that would repeat another row's stem exactly are l
 | cmtx/Mistrusted_Polemic | -17.6 | 5.79 | 6.02 | 0.61 | 0.61 | 0.61 | 0.88 | 0.89 | 0.89 |
 | cmtx/PurpleHatMob_AccessDenied | -11.7 | 3.05 | 3.18 | 4.36 | 4.36 | 4.36 | 4.94 | 4.94 | 4.94 |
 
+## Cost runs (scores/cost.jsonl; CPU = user + sys of the process, s per audio s)
+
+| host | pass | device | threads | input | audio s | CPU-s / audio-s | wall-s / audio-s | Mega long-track rate (per-chunk CPU) | peak RSS GB | GPU mem GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| box-i5-12450H | mega5 | cuda | 2 | ex30 | 30.0 | 0.744 | 0.745 | 0.355 | 1.7 | 2.01 |
+| box-i5-12450H | mega1 | cuda | 2 | ex30 | 30.0 | 0.713 | 0.669 | 0.349 | 1.26 | 1.83 |
+| box-i5-12450H | mega5 | cuda | 2 | full | 210.11 | 0.432 | 0.425 | 0.356 | 3.03 | 2.01 |
+| mac-m1pro-shared | hyb6 | cpu | 1 | ex30 | 30.0 | 0.653 | 0.671 | – | 1.22 | – |
+| mac-m1pro-shared | chain | cpu | 1 | ex30 | 30.0 | 3.739 | 3.744 | – | 1.33 | – |
+| mac-m1pro-shared | kim | cpu | 1 | ex30 | 30.0 | 3.101 | 3.112 | – | 1.1 | – |
+| mac-m1pro-shared | mega5 | cpu | 1 | ex30 | 30.0 | 16.407 | 16.627 | 9.715 | 2.71 | – |
+| mac-m1pro-shared | mega1 | cpu | 1 | ex30 | 30.0 | 16.532 | 16.803 | 9.863 | 2.52 | – |
+
