@@ -6,7 +6,7 @@ const q = new URLSearchParams(location.search);
 const bundle = q.get('bundle') || 'native';
 const ort = await import(bundle === 'jsep' ? '/ort/ort.all.min.mjs' : '/ort/ort.webgpu.min.mjs');
 const model = q.get('model'), ep = q.get('ep') || 'webgpu', runs = +(q.get('runs') || 3), threads = +(q.get('threads') || 1);
-const ref = q.get('ref') || model.replace(/_(fp16|w16|q8)$/, '');
+const ref = q.get('ref') || model.replace(/_(fp16n?|w16|q8)$/, '');
 const tag = q.get('tag') || `${model}_${ep}${ep === 'wasm' ? threads : ''}`;
 const logEl = document.getElementById('log'); const lines = [];
 const log = (...a) => { lines.push(a.join(' ')); logEl.textContent = lines.join('\n'); console.log(...a); };

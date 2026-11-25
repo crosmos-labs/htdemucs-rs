@@ -1,4 +1,5 @@
 """Smaller variants of an exported core (inputs and outputs stay float32):
+  <name>_fp16n.onnx as fp16 but ReduceL2 (the RMSNorm's norm) in float32
   <name>_fp16.onnx  every op in float16 (onnxconverter_common, keep_io_types); the GPU computes in f16 (needs shader-f16)
   <name>_w16.onnx   weights stored in float16, each followed by a Cast to float32: half the download, float32 compute
   <name>_q8.onnx    weight-only int8 (onnxruntime.quantization.quantize_dynamic would quantize activations too; this
@@ -18,9 +19,12 @@ def big_float_inits(g, min_elems=1024):
 
 for kind in kinds:
     t0 = time.time(); m = onnx.load(src); g = m.graph
-    if kind == 'fp16':
+    if kind in ('fp16', 'fp16n'):
+        # fp16n: as fp16 but the RMSNorm's ReduceL2 stays float32 (a sum of 384 squares overflows float16's 65504:
+        # plain fp16 Kim measured 14 dB SNR vs float32 / -1 dB uSDR)
         from onnxconverter_common import float16
-        m = float16.convert_float_to_float16(m, keep_io_types=True, disable_shape_infer=False)
+        m = float16.convert_float_to_float16(m, keep_io_types=True, disable_shape_infer=False,
+                                             op_block_list=['ReduceL2'] if kind == 'fp16n' else None)
     elif kind in ('w16', 'q8'):
         new_nodes = []
         for init in big_float_inits(g):

@@ -129,3 +129,7 @@ Sources:
 - https://www.cpu-monkey.com/en/igpu-apple_a17_pro_6_gpu_cores
 
 A hand-tuned WebGPU matmul reached about 1 TFLOPS on an M2 Pro, roughly 17 % of its peak: https://www.nuss-and-bolts.com/p/optimizing-a-webgpu-matmul-kernel
+
+## Design sketch for Fretboard (DRAFT)
+
+(numbers filled in from the measurements above)
