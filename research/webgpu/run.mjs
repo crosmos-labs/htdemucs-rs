@@ -4,6 +4,7 @@
 import { createRequire } from 'node:module'; import { execFileSync } from 'node:child_process'; import fs from 'node:fs';
 const require = createRequire(process.env.NODE_PATH + '/'); const puppeteer = require('puppeteer-core');
 const qs = process.argv[2]; const headful = process.argv.includes('--headful');
+const pageName = process.argv.includes("--page") ? process.argv[process.argv.indexOf("--page") + 1] : "bench";
 const port = process.argv.includes('--port') ? process.argv[process.argv.indexOf('--port') + 1] : '8765';
 const prof = fs.mkdtempSync('/Users/divyansh/work/mac-testing/webgpu/profile-');
 const browser = await puppeteer.launch({ executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -24,7 +25,7 @@ function sample() {
 const timer = setInterval(sample, 1500);
 const page = await browser.newPage(); page.setDefaultTimeout(0);
 page.on('console', m => process.stderr.write(`[page] ${m.text()}\n`));
-await page.goto(`http://127.0.0.1:${port}/bench.html?${qs}`);
+await page.goto(`http://127.0.0.1:${port}/${pageName}.html?${qs}`);
 await page.waitForFunction('window.__result', { timeout: 0, polling: 1000 });
 const r = await page.evaluate('window.__result'); clearInterval(timer); sample();
 r.peak_footprint_mb = Object.fromEntries(Object.entries(peak).map(([k, v]) => [k, Math.round(v)]));
