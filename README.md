@@ -560,8 +560,27 @@ chain's Kim) and Mega's four heads 1142 s (6.3 per audio-s; one head's chunk rat
 **kimmega costs 2.5x the chain** on this CPU. 8 threads on 4 SMT cores cost 1.4-2.2x the CPU of 1
 thread for 2.8-5.4x less wall time (kimmega gains most: 5.4x).
 
-Apple M1 Pro (shared machine, Angels In Amplifiers 179.6 s and the Al James 30 s excerpt): see the
-table below (measurements in progress).
+Apple M1 Pro (8 cores: 6 performance + 2 efficiency; shared with another job, run one at a time;
+MUSDB18-HQ Angels In Amplifiers 179.6 s and the Al James 30 s excerpt; `VECLIB_MAXIMUM_THREADS` =
+threads). Peak memory footprint (what macOS charges the process) / max RSS:
+
+| build | recipe | 30 s, 1 thread | 30 s, 8 threads (wall) | 179.6 s, 1 thread (wall) | 179.6 s, 8 threads (wall) | footprint / max RSS |
+|---|---|---|---|---|---|---|
+| `--features accelerate` | **`-n kimmega`** | **11.0** | 20.4 (86 s) | **7.6** (1370 s) | 14.2 (358 s) | 1.03-1.11 / 1.19-2.17 GB |
+| | `-n chain` | 3.8 | 7.6 (37 s) | 3.0 (542 s) | 5.9 (179 s) | 1.03-1.15 / 1.35-2.11 GB |
+| | `-n ensemble` | 0.68 | 1.2 (9 s) | 0.61 (109 s) | 1.05 (48 s) | 0.58-0.70 / 1.36-1.93 GB |
+| default (NEON) | **`-n kimmega`** | 39.0 | 51.5 (224 s) | 27.4 (4936 s) | 36.5 (914 s) | 1.04-1.16 / 1.20-1.91 GB |
+| | `-n chain` | 15.4 | 19.4 (90 s) | 12.1 (2179 s) | 15.8 (424 s) | 1.03-1.19 / 1.34-1.88 GB |
+| | `-n ensemble` | 1.85 | 2.5 (15 s) | 1.60 (288 s) | 2.1 (76 s) | 0.61-0.69 / 1.33-1.65 GB |
+
+On the Mac, kimmega costs 2.3-2.5x the chain, as on x86; build with `--features accelerate` (3.6x
+less CPU than the default build for kimmega: Accelerate's AMX GEMMs). For comparison, PyTorch
+(2.2.2 Kim, 2.6.0 Mega, CPU) took 2081 + 4173 = 6254 CPU-s for the same recipe on Angels at 8
+threads, the NEON build 6435 and the Accelerate build 2556. Kim finishes at 32 % (Accelerate) to
+38 % (NEON) of a full-song run; the rest is Mega. Memory: the footprint is 1.0-1.2 GB at 30 s and at 3 min (not
+measured on longer tracks; what grows with length is the decoded mix + the instrumental, 2 x 2 x 4
+bytes a sample, 0.17 GB at 4 min). Kim's weights widened to float32 (0.91 GB) are its largest
+part, and are freed before Mega's (0.30 GB) are loaded.
 
 ### Cheaper Mega settings
 
@@ -570,7 +589,17 @@ table below (measurements in progress).
 head): 10 s chunks (`--mega-chunk-size 441000`) cost -0.03 dB guitar for 32 % less of Mega's CPU,
 10 s chunks at overlap 1 (`--mega-num-overlap 1`) -0.12 dB for 69 % less. Kim's half of the recipe
 is unchanged by them. The defaults are the reference settings (20 s, overlap 2), the ones round 5
-scored.
+scored. Measured on the whole recipe (Angels, M1 Pro Accelerate build, 8 threads; "SNR vs default"
+is how far each stem moves from the default settings' stem, not its quality):
+
+| Mega setting | CPU-s per audio-s | wall | SNR vs default: drums / bass / guitar / piano / other |
+|---|---|---|---|
+| default: 20 s, overlap 2 | 14.2 | 358 s | - |
+| `--mega-chunk-size 441000` | 11.1 (-22 %) | 285 s | 17.8 / 22.4 / 22.3 / 22.8 / 10.4 dB |
+| `--mega-chunk-size 441000 --mega-num-overlap 1` | 7.9 (-45 %) | 200 s | 16.7 / 20.6 / 20.8 / 21.1 / 9.2 dB |
+
+(other moves most because it is quiet and carries every head's change.) The heads' quality cost
+on the other stems than guitar is not measured.
 
 ## Chain (`-n chain`): Kim vocals, then the ensemble on the instrumental
 
