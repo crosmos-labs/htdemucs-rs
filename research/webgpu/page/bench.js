@@ -30,7 +30,17 @@ try {
   let t = now(); const mbuf = await bin(`/models/${model}.onnx`); R.model_mb = mbuf.byteLength / 1e6; R.fetch_ms = now() - t;
   const X = new Float32Array(await bin(`/models/${ref}_in.bin`)); const Mref = new Float32Array(await bin(`/models/${ref}_ref.bin`));
   ort.env.wasm.wasmPaths = '/ort/'; ort.env.wasm.numThreads = ep === 'wasm' ? threads : 1;
-  const opts = { executionProviders: [ep], graphOptimizationLevel: 'all' };
+  // native WebGPU EP options: cache=disabled|lazyRelease|simple|bucket (storage buffer cache), validation=disabled|basic|...,
+  // f32acc=1 (fp32 accumulation in fp16 MatMuls)
+  let epo = ep;
+  if (ep === 'webgpu' && bundle === 'native') {
+    epo = { name: 'webgpu' };
+    if (q.get('cache')) epo.storageBufferCacheMode = q.get('cache');
+    if (q.get('validation')) epo.validationMode = q.get('validation');
+    if (q.get('f32acc')) epo.enableMatmulFp32Accumulation = q.get('f32acc') === '1';
+  }
+  R.ep_options = epo;
+  const opts = { executionProviders: [epo], graphOptimizationLevel: 'all' };
   if (ep === 'webgpu') ort.env.webgpu.powerPreference = 'high-performance';
   t = now(); const sess = await ort.InferenceSession.create(new Uint8Array(mbuf), opts); R.session_ms = now() - t;
   log(`session ${R.session_ms.toFixed(0)} ms, model ${R.model_mb.toFixed(0)} MB`);
