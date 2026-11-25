@@ -6,6 +6,7 @@ pub mod audio;
 pub mod chain;
 pub mod config;
 pub mod ensemble;
+pub mod kimmega;
 pub mod model;
 pub mod ops;
 pub mod pyrandom;

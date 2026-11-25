@@ -17,15 +17,33 @@ PyTorch pipeline to 108-132 dB per stem (see *Chain*). `-n megaguitar` runs the 
 MVSEP's Mega 53 BS-RoFormer (the best guitar stem measured: +2.6 dB over htdemucs_6s on 26/26
 Cambridge-MT songs), matching PyTorch to 109.7-119.4 dB (guitar) on a chunk and full tracks with 9-65% less CPU
 than PyTorch on x86 (on Apple silicon only with `--features accelerate`; see *Mega 53*).
+**`-n kimmega` is the recommended recipe** (research round 5): Kim's vocals, then Mega 53's
+drums, bass, guitar and keys heads on Kim's instrumental from one backbone pass, other = the rest -
+vocals +2.2, bass +0.9, guitar +2.65, keys +4.5 dB over the Demucs ensemble on 26 Cambridge-MT
+songs, drums and other level, all weights MIT; 108-131 dB per stem against the PyTorch recipe on a
+full song (see *Kim + Mega 53*). It costs about 2.5x the CPU of `-n chain`.
 
 ## Usage
 
 ```sh
 cargo build --release                         # Linux / any CPU
 cargo build --release --features accelerate   # macOS: Accelerate BLAS (faster)
+htdemucs-rs separate -n kimmega --flac --clip-mode clamp -o out song.m4a   # recommended
+# -> out/kimmega/song/{vocals,drums,bass,guitar,piano,other}.flac
 htdemucs-rs separate -n htdemucs_6s --shifts 2 --seed 0 --flac --clip-mode clamp -o out song.m4a
 # -> out/htdemucs_6s/song/{drums,bass,other,vocals,guitar,piano}.flac
 ```
+
+Recipes (`-n`), best quality first (research round 5, 26 Cambridge-MT songs; CPU on x86 at one
+thread, full song):
+
+| `-n` | stems | models (weights licence) | quality | CPU-s per audio-s |
+|---|---|---|---|---|
+| **`kimmega`** | vocals, drums, bass, guitar, piano, other | Kim Mel-RoFormer + Mega 53, 4 heads (MIT) | best on vocals, bass, guitar, keys; level on drums, other | 10.6 |
+| `chain` | 4-stem + 6-stem views | Kim (MIT) + htdemucs + htdemucs_6s ("for scientific purposes only", round 1) | vocals as kimmega; guitar -2.2, keys -4.5, bass -0.8 dB | 4.2 |
+| `ensemble` | 4-stem + 6-stem views | htdemucs + htdemucs_6s (scientific purposes only) | vocals -2.2 dB vs kimmega | 0.8 |
+| `htdemucs` / `htdemucs_6s` | 4 / 6 | one Demucs model | below the ensemble (round 2) | ~0.4 per shift (half the ensemble) |
+| `melroformer`, `megaguitar`, `mega` | vocals + rest; guitar + rest; 4 heads + rest | the parts | | |
 
 Same options and defaults as demucs where they exist (`-n`, `--shifts` (1), `--overlap` (0.25),
 `-o` (separated), `--float32`, `--flac`, `--clip-mode` rescale|clamp, output layout), plus
@@ -142,8 +160,11 @@ src/chain.rs         -n chain: Kim vocals, then the ensemble on the instrumental
 tools/chain_ref.py   its PyTorch reference (round 3's k+chain_avg on CPU float32)
 tools/chain_box.sh, chain_musdb.sh, measure.sh   its parity / uSDR / memory / CPU runs on Linux
 .github/workflows/bench-roformer.yml   its x86 parity / speed runs (settings: .github/bench/mr_run.env)
-tools/bsroformer.py  Mega 53 BS-RoFormer (-n megaguitar): converter (backbone + one head), PyTorch
-                     references (chunk dump, full song as r4_mega.py, float64), timing
+tools/bsroformer.py  Mega 53 BS-RoFormer (-n megaguitar, -n mega): converter (backbone + one head or
+                     a list of heads), PyTorch references (chunk dump, full song as r4_mega.py /
+                     r5_mega.py, --minus / --recipe for kimmega, float64), timing
+src/kimmega.rs       -n kimmega: Kim vocals, then Mega's 4 heads on the instrumental, other = rest
+.github/workflows/bench-kimmega.yml   its x86 parity / CPU runs (settings: .github/bench/km_run.env)
 .github/workflows/bench-megaguitar.yml   its x86 parity / speed runs (settings: .github/bench/mg_run.env)
 ```
 
@@ -403,6 +424,182 @@ footprint** (1.44 GB max RSS); before streaming the loader and the output, 1.83 
 2.4 GB on Aerials (4 threads); on the 12 s CI clip (Linux) 2.35 GB vs 1.09 GB here.
 
 Binary: 2.5 MB (macOS) / 4.4 MB (Linux x86-64) with both models and the AVX-512 kernels.
+
+## Kim + Mega 53 (`-n kimmega`): the recommended recipe
+
+```sh
+PY="uv run --quiet --python 3.11.17 --with-requirements research/round4/r4_msst_env.txt python"
+$PY tools/bsroformer.py convert mvsep_mega_model_bs_roformer_53_stems_v1.ckpt mvsep_mega_model_bs_roformer_53_stems.yaml --name mega
+# -> weights/mega.safetensors (152 MB, float16: the backbone + the drums, bass, guitar and keys heads)
+#    + weights/mega.json; Kim's weights/melroformer.* as in *Mel-Band RoFormer*
+htdemucs-rs separate -n kimmega --flac --clip-mode clamp -o out song.m4a      # alias: -n kim_mega_keys
+# -> out/kimmega/song/{vocals,drums,bass,guitar,piano,other}.flac
+```
+
+Research round 5's pick, `kim_mega_keys` ([research/round5/round5.md](research/round5/round5.md)),
+in one command, every model MIT-licensed:
+
+1. **vocals**: Kim's Mel-Band RoFormer (`-n melroformer`, upstream `demix_track`);
+2. **drums, bass, guitar, piano**: MVSEP's Mega 53 BS-RoFormer on Kim's instrumental (mix - vocals,
+   float32), its backbone run **once** per chunk and four mask heads off it: `drums`, `bass`,
+   `guitar` and `keys` (written as `piano`). `keys`, not `piano`: on the 10 round-5 songs with
+   keyboards it scores 5.24 dB against 3.33 for the `piano` head (both on the instrumental), because it also catches organ and
+   e-piano (Impossible Colours 0.4 -> 8.4 dB), and is within 0.1 dB of `piano` on piano-only songs
+   but one (Al James 2.78 vs 3.47);
+3. **other** = instrumental - (drums + bass + guitar + keys), summed in float64. Mega has no
+   "other" head, so the six stems sum to the mix exactly up to float32 rounding (`-v` prints the
+   residual; about -150 dB).
+
+Against the other recipes, on round 5's 26 Cambridge-MT remixes (uSDR, Δ vs `hyb6` = `-n ensemble`
+at shifts 0 with its 6-stem view, 95 % CI, items better):
+
+| stem | `-n ensemble` (hyb6) | `-n chain` | **`-n kimmega`** | Δ vs hyb6 | Δ vs chain |
+|---|---|---|---|---|---|
+| vocals (26) | 9.91 | 12.13 | **12.13** (Kim) | **+2.22** [+1.65, +2.80] 24/26 | same model |
+| drums (26) | 9.11 | 9.48 | 9.46 | +0.35 [-0.29, +0.87] 20/26 | -0.02 |
+| bass (26) | 8.82 | 8.96 | **9.74** | **+0.92** [+0.45, +1.42] 20/26 | **+0.78** |
+| guitar (26) | 4.27 | 4.76 | **6.92** | **+2.65** [+2.04, +3.29] 26/26 | **+2.16** |
+| piano vs true keys (10) | 0.73 | 0.77 | **5.24** | **+4.51** [+3.38, +5.71] 10/10 | **+4.47** |
+| other (9) | 1.33 | 1.62 | 1.38 | +0.05 [-1.45, +1.40] 7/9 | -0.23 |
+
+Drums and other are ties; see round 5 for the caveats (Mega's `drums` head misses brushes /
+percussion on two songs; other is a residual).
+
+Options: `--mega-chunk-size N` / `--mega-num-overlap N` set Mega's chunking (default 882000
+samples = 20 s, overlap 2: the reference settings), `--chunk-size` / `--num-overlap` Kim's (8 s,
+2), as for `-n melroformer`. No `--shifts` / `--overlap`. Output formats and clip modes as
+elsewhere.
+
+**Several heads, one backbone.** `src/roformer.rs` runs a model with N mask heads (`num_stems` N
+in its JSON, heads listed in `instruments`): STFT, band split, the 12 transformer layers and the
+final norm once per chunk; then per head its 62 band MLPs, the mask, the masked STFT and the
+iSTFT. Each head's output is exactly what a one-head model of that head computes (`tests/roformer.rs`:
+`mega`'s guitar stem is bit-identical to `-n megaguitar`'s). `separate_stream_n` overlap-adds the N
+stems with the same operations in the same order as one stem. `-n mega` runs the four heads
+alone on its input (+ `rest` = input - the four), the building block `kimmega` runs on Kim's
+instrumental. `tools/bsroformer.py convert --stems a,b,...` exports any list of heads;
+`megaguitar` (`convert` with no `--stems`) is unchanged, byte for byte.
+
+**Memory**, as the chain: the instrumental is the one track-long buffer besides the decoded mix
+(freed once Kim is done); Kim's weights (0.91 GB as float32) are freed before Mega's (0.30 GB);
+all six stems are written as they are finalised.
+
+### Parity (vs PyTorch CPU float32: tools/bsroformer.py, the inference of research/round5/r5_mega.py)
+
+**One chunk, the four heads** (`mr_parity`, chunk 1 of the Al James 30 s excerpt's instrumental -
+mix minus this crate's Kim vocals - as `bsroformer.py segment --name mega --minus` feeds it; M1 Pro,
+NEON build):
+
+| head | output vs PyTorch float32 | vs PyTorch float64 | PyTorch float32 vs float64 | mask |
+|---|---|---|---|---|
+| drums | 120.3 dB | 122.2 | 120.4 | 111.5 |
+| bass | 119.4 | 120.9 | 120.8 | 111.6 |
+| guitar | 110.2 | 111.8 | 110.7 | 107.4 |
+| keys (piano) | 111.6 | 112.7 | 112.8 | 107.4 |
+
+The shared part: STFT 136.5 dB, final norm 102.6 dB; each transformer run alone on PyTorch's input
+to it 125-126 dB. This crate is as close to a float64 run as PyTorch float32 itself is.
+
+**Full path** (`htdemucs-rs separate -n kimmega` vs `bsroformer.py separate --name mega --minus
+<vocals> --recipe`; SNR per stem over the whole file; M1 Pro, NEON build, float32 Kim weights):
+
+| input | reference | vocals | drums | bass | guitar | piano | other |
+|---|---|---|---|---|---|---|---|
+| Al James excerpt (30 s) | PyTorch Mega on this crate's Kim instrumental | identical | 122.3 | 123.4 | 113.9 | 115.2 | 111.4 |
+| | PyTorch end to end (PyTorch Kim, then PyTorch Mega) | 129.2 | 110.8 | 119.5 | 105.7 | 108.2 | 101.6 |
+| MUSDB18-HQ Angels In Amplifiers, I'm Alright (179.6 s) | PyTorch Mega on this crate's Kim instrumental | identical | 118.2 | 119.1 | 119.0 | 118.0 | 109.1 |
+| | PyTorch end to end | 131.4 | 118.0 | 118.6 | 118.2 | 116.2 | 108.6 |
+| synthetic CI clip + -60 dBFS noise (30 s), Blacksmith EPYC (AVX-512) | PyTorch Mega on this crate's Kim instrumental | identical | 117.9 | 109.3 | 98.3 | 100.3 | 108.2 |
+| | PyTorch end to end | 97.4 | 116.9 | 108.4 | 98.1 | 99.6 | 107.6 |
+| the same clip, M1 Pro | PyTorch Mega on this crate's Kim instrumental | identical | 113.4 | 110.8 | 99.0 | 101.3 | 108.4 |
+
+Errors are -143 to -152 dBFS on the music. "End to end" also carries Kim's float32 differences
+(vocals 129-131 dB) into Mega's input, which costs a few dB on the excerpt. The synthetic clip has
+almost no guitar (-80 dBFS: the error is -178 dBFS) and near-empty bands, and Kim finds no vocals in
+it (-114 dBFS), so its lower figures are the clip's, not the CPU's: the M1 Pro gives the same ones
+(one chunk there: guitar 97.3, keys 101.1 dB; on the EPYC 95.7 and 98.8).
+
+**Same computation as the parts.** On the 30 s excerpt (M1 Pro): kimmega's vocals are bit-identical
+to `-n melroformer`'s; `-n mega`'s guitar is bit-identical to `-n megaguitar`'s (one chunk:
+`tests/roformer.rs`); all six stems are bit-identical at 1, 4 and 8 threads, and with float32 Mega
+weights (`MEGA_WEIGHTS=mega-f32`) instead of float16. `-n megaguitar` and `-n melroformer` give
+bit-identical stems to `main` before this change (1afee2c).
+
+### CPU and memory
+
+**Four heads cost what one does.** One 20 s chunk forward (`mr_bench`), `mega` (4 heads) against
+`megaguitar` (1 head), M1 Pro:
+
+| build | threads | 1 head | 4 heads | |
+|---|---|---|---|---|
+| `--features accelerate` | 1 | 46.2 CPU-s | 46.7 | +1.2 % |
+| same | 8 | 83.2 CPU-s, 12.2 s wall | 82.0, 12.6 s wall | |
+| default (NEON) | 1 | 157.6 CPU-s | 153.7 | within noise |
+| same | 8 | 211.6 CPU-s, 29.5 s wall | 210.3, 29.3 s wall | |
+
+The profile puts the three extra heads' mask MLPs at 0.36 s of 46.7 (Accelerate) and 1.6 s of 154
+(NEON) per chunk, under 1 %; their iSTFTs are a few tenths of a percent more. The backbone - 12
+time + frequency transformer pairs over 62 x 1723 tokens - is everything else.
+
+**Whole tracks**, CPU seconds per second of audio (user + sys, decode and writing included) and
+peak RSS, `--flac --clip-mode clamp`, float16 Kim weights. The 30 s excerpt pays for Kim's 4 s and
+Mega's 10 s of padding at each end, so its per-second figures run high; the full song is the rate to
+plan with.
+
+x86-64, Blacksmith runners (AMD EPYC, AVX-512; synthetic clips, `bench-kimmega.yml`; 8 threads on 8
+vCPU = 4 cores with SMT, 1 thread on 2 vCPU):
+
+| recipe | 30 s, 1 thread | 30 s, 8 threads (wall) | 180 s, 1 thread | 180 s, 8 threads (wall) | peak RSS |
+|---|---|---|---|---|---|
+| **`-n kimmega`** | **14.9** | 28.2 (115 s) | **10.6** | 14.6 (350 s) | 1.08-1.30 GB |
+| `-n chain` | 6.7 | 12.6 (53 s) | 4.2 | 7.7 (194 s) | 1.09-1.29 GB |
+| `-n ensemble` (shifts 0) | 0.86 | 2.2 (11 s) | 0.78 | 1.7 (50 s) | 0.92-1.12 GB |
+
+At one thread on the full clip, Kim took 762 s of kimmega's 1905 (4.2 CPU-s per audio-s, the
+chain's Kim) and Mega's four heads 1142 s (6.3 per audio-s; one head's chunk rate on this CPU, 3.02 per audio-s of chunk, makes about 6 per second of a song):
+**kimmega costs 2.5x the chain** on this CPU. 8 threads on 4 SMT cores cost 1.4-2.2x the CPU of 1
+thread for 2.8-5.4x less wall time (kimmega gains most: 5.4x).
+
+Apple M1 Pro (8 cores: 6 performance + 2 efficiency; shared with another job, run one at a time;
+MUSDB18-HQ Angels In Amplifiers 179.6 s and the Al James 30 s excerpt; `VECLIB_MAXIMUM_THREADS` =
+threads). Peak memory footprint (what macOS charges the process) / max RSS:
+
+| build | recipe | 30 s, 1 thread | 30 s, 8 threads (wall) | 179.6 s, 1 thread (wall) | 179.6 s, 8 threads (wall) | footprint / max RSS |
+|---|---|---|---|---|---|---|
+| `--features accelerate` | **`-n kimmega`** | **11.0** | 20.4 (86 s) | **7.6** (1370 s) | 14.2 (358 s) | 1.03-1.11 / 1.19-2.17 GB |
+| | `-n chain` | 3.8 | 7.6 (37 s) | 3.0 (542 s) | 5.9 (179 s) | 1.03-1.15 / 1.35-2.11 GB |
+| | `-n ensemble` | 0.68 | 1.2 (9 s) | 0.61 (109 s) | 1.05 (48 s) | 0.58-0.70 / 1.36-1.93 GB |
+| default (NEON) | **`-n kimmega`** | 39.0 | 51.5 (224 s) | 27.4 (4936 s) | 36.5 (914 s) | 1.04-1.16 / 1.20-1.91 GB |
+| | `-n chain` | 15.4 | 19.4 (90 s) | 12.1 (2179 s) | 15.8 (424 s) | 1.03-1.19 / 1.34-1.88 GB |
+| | `-n ensemble` | 1.85 | 2.5 (15 s) | 1.60 (288 s) | 2.1 (76 s) | 0.61-0.69 / 1.33-1.65 GB |
+
+On the Mac, kimmega costs 2.3-2.5x the chain, as on x86; build with `--features accelerate` (3.6x
+less CPU than the default build for kimmega: Accelerate's AMX GEMMs). For comparison, PyTorch
+(2.2.2 Kim, 2.6.0 Mega, CPU) took 2081 + 4173 = 6254 CPU-s for the same recipe on Angels at 8
+threads, the NEON build 6435 and the Accelerate build 2556. Kim finishes at 32 % (Accelerate) to
+38 % (NEON) of a full-song run; the rest is Mega. Memory: the footprint is 1.0-1.2 GB at 30 s and at 3 min (not
+measured on longer tracks; what grows with length is the decoded mix + the instrumental, 2 x 2 x 4
+bytes a sample, 0.17 GB at 4 min). Kim's weights widened to float32 (0.91 GB) are its largest
+part, and are freed before Mega's (0.30 GB) are loaded.
+
+### Cheaper Mega settings
+
+`--mega-chunk-size` / `--mega-num-overlap` trade Mega's quality for CPU exactly as `-n megaguitar`'s
+`--chunk-size` / `--num-overlap` do (see *Mega 53 ... Cheaper settings*: measured there on the guitar
+head): 10 s chunks (`--mega-chunk-size 441000`) cost -0.03 dB guitar for 32 % less of Mega's CPU,
+10 s chunks at overlap 1 (`--mega-num-overlap 1`) -0.12 dB for 69 % less. Kim's half of the recipe
+is unchanged by them. The defaults are the reference settings (20 s, overlap 2), the ones round 5
+scored. Measured on the whole recipe (Angels, M1 Pro Accelerate build, 8 threads; "SNR vs default"
+is how far each stem moves from the default settings' stem, not its quality):
+
+| Mega setting | CPU-s per audio-s | wall | SNR vs default: drums / bass / guitar / piano / other |
+|---|---|---|---|
+| default: 20 s, overlap 2 | 14.2 | 358 s | - |
+| `--mega-chunk-size 441000` | 11.1 (-22 %) | 285 s | 17.8 / 22.4 / 22.3 / 22.8 / 10.4 dB |
+| `--mega-chunk-size 441000 --mega-num-overlap 1` | 7.9 (-45 %) | 200 s | 16.7 / 20.6 / 20.8 / 21.1 / 9.2 dB |
+
+(other moves most because it is quiet and carries every head's change.) The heads' quality cost
+on the other stems than guitar is not measured.
 
 ## Chain (`-n chain`): Kim vocals, then the ensemble on the instrumental
 

@@ -4,7 +4,8 @@
 //!
 //! Prints, for every activation both sides produce, SNR (dB) and max abs error of ours vs PyTorch
 //! CPU float32, then each transformer run alone on PyTorch's own input to it. Exits 1 if the
-//! output's SNR is below 90 dB.
+//! output's SNR is below 90 dB (several mask heads: `mask.<h>` / `output.<h>` per head, the worst
+//! output counts).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -46,13 +47,15 @@ fn main() {
     eprintln!("forward (traced) in {:.1}s", t1.elapsed().as_secs_f64());
     println!("| activation | shape | SNR dB | max abs err | ref max |");
     println!("|---|---|---|---|---|");
-    let mut out_snr = 0.0;
+    let mut out_snr = f64::INFINITY;
+    let mut outputs = 0;
     for n in &order {
         let Some(theirs) = r.get(n) else { continue };
         let (s, mx, rm) = snr(&ours[n].data, &theirs.data);
         println!("| {n} | {:?} | {s:.1} | {mx:.2e} | {rm:.2e} |", theirs.shape);
-        if n == "output" {
-            out_snr = s;
+        if n == "output" || n.starts_with("output.") {
+            out_snr = f64::min(out_snr, s);
+            outputs += 1;
         }
     }
     println!("\nisolated (each transformer on PyTorch's own input):\n");
@@ -82,8 +85,8 @@ fn main() {
         let (s, mx, _) = snr(&y.data, &get(&format!("layers.{i}.freq")).data);
         println!("| layers.{i}.freq | {s:.1} | {mx:.2e} |");
     }
-    println!("\nfinal output: {out_snr:.1} dB");
-    if out_snr < 90.0 {
+    println!("\nfinal output: {out_snr:.1} dB{}", if outputs > 1 { format!(" (worst of {outputs} heads)") } else { String::new() });
+    if outputs == 0 || out_snr < 90.0 {
         std::process::exit(1);
     }
 }

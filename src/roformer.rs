@@ -3,9 +3,10 @@
 //!
 //! * Kim's Mel-Band RoFormer vocal model (github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model,
 //!   lucidrains' `MelBandRoformer`), with upstream's `demix_track`. Weights: tools/melroformer.py.
-//! * MVSEP's "Mega 53" BS-RoFormer (Music-Source-Separation-Training's `BSRoformer` @1523206), one
-//!   mask head kept (guitar), with research/round4/r4_mega.py's chunking (MSST's generic demix).
-//!   Weights: tools/bsroformer.py.
+//! * MVSEP's "Mega 53" BS-RoFormer (Music-Source-Separation-Training's `BSRoformer` @1523206), the
+//!   shared backbone with one mask head (`-n megaguitar`: guitar) or several (`-n mega`: drums, bass,
+//!   guitar, keys, run off one backbone pass), with research/round4/r4_mega.py's chunking (MSST's
+//!   generic demix). Weights: tools/bsroformer.py.
 //!
 //! The two differ only where the config says so (`Config`): which bins form each band (mel bands
 //! that overlap, or fixed non-overlapping ranges), whether every transformer ends with its own
@@ -26,6 +27,9 @@
 //! 4. Mask estimator per band: Linear -> tanh -> ... -> Linear -> GLU, giving a complex mask per
 //!    (bin, channel) of the band; bins in two bands average their two masks.
 //! 5. Masked STFT (BS: DC bin zeroed) -> iSTFT (to T samples) -> the target stem.
+//!
+//! With several mask heads (`num_stems` > 1), steps 1-3 run once and steps 4-5 once per head, on
+//! the same transformer output: each head's stem is what a one-head model of that head gives.
 //!
 //! RMSNorm is `F.normalize(x) * sqrt(dim) * gamma` (L2-normalise, then scale): computed as
 //! x / max(||x||, 1e-12) with the norm accumulated in f64, then the two multiplies in float32.
@@ -150,6 +154,10 @@ pub struct Config {
     pub chunk_size: usize,
     pub num_overlap: usize,
     pub target_instrument: String,
+    /// The mask heads' stems, in `mask_estimators` order (several-head weights); empty: one head,
+    /// `target_instrument`.
+    #[serde(default)]
+    pub instruments: Vec<String>,
     /// Bins of each band, ascending.
     pub bands: Vec<Vec<usize>>,
     pub num_bands_per_freq: Vec<usize>,
@@ -170,9 +178,9 @@ pub struct Config {
     /// The chunking's edge rules: "kim" (demix_track) or "msst" (r4_mega.py, MSST's generic demix).
     #[serde(default = "kim")]
     pub demix: String,
-    /// Output stems: the model's target and the mix minus it.
+    /// Output stems: each head's stem, then the mix minus all of them.
     #[serde(default = "kim_sources")]
-    pub sources: [String; 2],
+    pub sources: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -184,17 +192,25 @@ fn three() -> usize {
 fn kim() -> String {
     "kim".into()
 }
-fn kim_sources() -> [String; 2] {
-    ["vocals".into(), "instrumental".into()]
+fn kim_sources() -> Vec<String> {
+    vec!["vocals".into(), "instrumental".into()]
 }
 
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let cfg: Config = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut cfg: Config = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        if cfg.instruments.is_empty() {
+            cfg.instruments = vec![cfg.target_instrument.clone()];
+        }
         cfg.check()?;
         Ok(cfg)
+    }
+
+    /// The mask heads' stems (one per head).
+    pub fn heads(&self) -> &[String] {
+        &self.instruments
     }
 
     /// The configurations this port computes; refuse others rather than compute something else.
@@ -205,7 +221,8 @@ impl Config {
                 bad.push(what.to_string())
             }
         };
-        need(self.stereo && self.num_stems == 1, "stereo, one stem");
+        need(self.stereo && self.num_stems >= 1, "stereo, one stem or more");
+        need(self.instruments.len() == self.num_stems && self.sources.len() == self.num_stems + 1, "a name per stem, plus the rest");
         need(self.time_transformer_depth == 1 && self.freq_transformer_depth == 1, "transformer depth 1");
         need(self.mask_estimator_linears >= 2, "mask estimator of 2+ linear layers");
         need(self.stft_win_length == self.stft_n_fft && !self.stft_normalized, "win = n_fft, not normalised");
@@ -728,7 +745,8 @@ pub struct Roformer {
     band_in: Vec<BandIn>,
     layers: Vec<(Block, Block)>,
     final_norm: Option<Vec<f32>>,
-    band_out: Vec<BandOut>,
+    /// Per mask head, per band.
+    band_out: Vec<Vec<BandOut>>,
 }
 
 /// The name this port started with (Kim's model only).
@@ -778,7 +796,7 @@ impl Roformer {
             Ok(t.data)
         };
         let mut band_in = vec![];
-        let mut band_out = vec![];
+        let mut band_out: Vec<Vec<BandOut>> = (0..cfg.num_stems).map(|_| vec![]).collect();
         let hid = cfg.mask_estimator_hidden;
         for (b, bins) in cfg.bands.iter().enumerate() {
             let din = 4 * bins.len();
@@ -790,15 +808,17 @@ impl Roformer {
                 w: need(format!("{p}.1.weight"), &[dim, din])?,
                 b: need(format!("{p}.1.bias"), &[dim])?,
             });
-            let p = format!("mask_estimators.0.to_freqs.{b}.0");
-            let nl = cfg.mask_estimator_linears;
-            let layers = (0..nl)
-                .map(|j| {
-                    let (o, i) = (if j + 1 == nl { 2 * din } else { hid }, if j == 0 { dim } else { hid });
-                    Ok((need(format!("{p}.{}.weight", 2 * j), &[o, i])?, need(format!("{p}.{}.bias", 2 * j), &[o])?))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            band_out.push(BandOut { layers });
+            for (h, head) in band_out.iter_mut().enumerate() {
+                let p = format!("mask_estimators.{h}.to_freqs.{b}.0");
+                let nl = cfg.mask_estimator_linears;
+                let layers = (0..nl)
+                    .map(|j| {
+                        let (o, i) = (if j + 1 == nl { 2 * din } else { hid }, if j == 0 { dim } else { hid });
+                        Ok((need(format!("{p}.{}.weight", 2 * j), &[o, i])?, need(format!("{p}.{}.bias", 2 * j), &[o])?))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                head.push(BandOut { layers });
+            }
         }
         let final_norm = if cfg.final_norm { Some(need("final_norm.gamma".into(), &[dim])?) } else { None };
         let no = cfg.transformer_norm_output;
@@ -877,13 +897,50 @@ impl Roformer {
         }
     }
 
-    /// The output stems: the target (vocals, guitar) and the mix minus it.
-    pub fn sources(&self) -> [&str; 2] {
-        [&self.cfg.sources[0], &self.cfg.sources[1]]
+    /// The output stems: each head's target (vocals, guitar; drums, bass, ...), then the mix minus
+    /// all of them.
+    pub fn sources(&self) -> &[String] {
+        &self.cfg.sources
     }
 
-    /// One chunk: `mix` is 2 channels x len samples; returns the target stem, 2 x len.
+    /// Number of mask heads (stems per forward).
+    pub fn num_heads(&self) -> usize {
+        self.band_out.len()
+    }
+
+    /// One chunk: `mix` is 2 channels x len samples; returns every head's stem, (heads, 2, len).
+    /// The backbone runs once; each head masks the same STFT (`head`).
     pub fn forward(&self, mix: &[f32], tr: &mut Tracer) -> Vec<f32> {
+        let len = mix.len() / 2;
+        let (spec, x, frames) = self.backbone(mix, tr);
+        let n = self.num_heads();
+        let mut x = Some(x);
+        let mut spec = Some(spec);
+        let mut out = Vec::with_capacity(n * 2 * len);
+        for h in 0..n {
+            let tag = if n == 1 { String::new() } else { format!(".{h}") };
+            let masks = self.masks(h, x.as_deref().unwrap(), frames, &tag, tr);
+            // The last head takes the spectrum and frees the tokens first (one head: as before
+            // there were several).
+            let y = if h + 1 == n {
+                x = None;
+                spec.take().unwrap()
+            } else {
+                spec.clone().unwrap()
+            };
+            let stem = self.apply(&masks, y, frames, len, &tag, tr);
+            if n == 1 {
+                return stem;
+            }
+            out.extend_from_slice(&stem);
+        }
+        drop(x);
+        out
+    }
+
+    /// STFT, band split, transformers and final norm of one chunk: (spectrum (frames, bins, 2,
+    /// 2), tokens (band, frame, dim), frames).
+    fn backbone(&self, mix: &[f32], tr: &mut Tracer) -> (Vec<f32>, Vec<f32>, usize) {
         let cfg = &self.cfg;
         let len = mix.len() / 2;
         let (dim, nb) = (cfg.dim, cfg.num_bands);
@@ -953,11 +1010,18 @@ impl Roformer {
             }
         }
 
+        (spec, x, frames)
+    }
+
+    /// Mask head `h` on the backbone's tokens `x`: per band, (frames, dim_in) complex masks. `tag`
+    /// suffixes the traced name ("" for one head).
+    fn masks(&self, h: usize, x: &[f32], frames: usize, tag: &str, tr: &mut Tracer) -> Vec<Vec<f32>> {
+        let dim = self.cfg.dim;
         // Mask estimators: per band (frames, dim_in) complex masks, (bin, channel, re/im) per frame.
         prof::part(3);
         let masks: Vec<Vec<f32>> = {
             x.par_chunks(frames * dim)
-                .zip(self.band_out.par_iter().zip(&self.band_in))
+                .zip(self.band_out[h].par_iter().zip(&self.band_in))
                 .map_init(
                     || (Vec::new(), Vec::new()),
                     |(h1, h2), (xb, (bo, bi))| {
@@ -1004,7 +1068,6 @@ impl Roformer {
                 )
                 .collect()
         };
-        drop(x);
         if tr.on() {
             let tot: usize = masks.iter().map(|m| m.len() / frames).sum();
             let mut t = Vec::with_capacity(frames * tot);
@@ -1014,9 +1077,16 @@ impl Roformer {
                     t.extend_from_slice(&m[fr * din..(fr + 1) * din]);
                 }
             }
-            tr.emit("mask", &Tensor::new(&[frames, tot], t));
+            tr.emit(&format!("mask{tag}"), &Tensor::new(&[frames, tot], t));
         }
+        masks
+    }
 
+    /// One head's masks applied to the chunk's spectrum `spec` (consumed), then the iSTFT: the
+    /// head's stem, 2 x len.
+    fn apply(&self, masks: &[Vec<f32>], spec: Vec<f32>, frames: usize, len: usize, tag: &str, tr: &mut Tracer) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let bins = self.spec.bins();
         // Average the masks of bins in several bands, apply (complex multiply), iSTFT.
         prof::part(0);
         let mut y = spec;
@@ -1048,7 +1118,7 @@ impl Roformer {
             });
         }
         let out = self.spec.istft(&y, frames, len);
-        tr.emit("output", &Tensor::new(&[2, len], out.clone()));
+        tr.emit(&format!("output{tag}"), &Tensor::new(&[2, len], out.clone()));
         out
     }
 }
@@ -1161,7 +1231,15 @@ pub fn separate_with(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec<f
 /// `separate_with`, handing the vocals out as they are finalised: `emit(t0, left, right)` gets
 /// track samples [t0, t0 + left.len()) of both channels, in order, covering the track once.
 pub fn separate_stream(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec<f32>, progress: &mut dyn FnMut(), emit: &mut dyn FnMut(usize, &[f32], &[f32])) {
+    separate_stream_n(wav, ch, 1, model, progress, &mut |t0, rows| emit(t0, rows[0], rows[1]));
+}
+
+/// `separate_stream` for a model with `nout` stems per forward ((nout, 2, chunk) out):
+/// `emit(t0, rows)` gets rows[2 * stem + channel], each the same span of track samples. Each stem
+/// is overlap-added exactly as a one-stem model's output would be (same operations, same order).
+pub fn separate_stream_n(wav: &[f32], ch: &Chunking, nout: usize, model: &dyn Fn(&[f32]) -> Vec<f32>, progress: &mut dyn FnMut(), emit: &mut dyn FnMut(usize, &[&[f32]])) {
     let len = wav.len() / 2;
+    let rows = 2 * nout;
     let c = ch.chunk;
     let total = ch.total(len);
     let border = if ch.padded(len) { ch.border } else { 0 };
@@ -1177,11 +1255,11 @@ pub fn separate_stream(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec
         wav[s * len + j as usize]
     };
     let base = ch.window();
-    // Window [wbase, wbase + c) of upstream's result (2 rows) and counter.
-    let mut res = vec![0.0f32; 2 * c];
+    // Window [wbase, wbase + c) of upstream's result (2 rows per stem) and counter.
+    let mut res = vec![0.0f32; rows * c];
     let mut cnt = vec![0.0f32; c];
     let mut wbase = 0usize;
-    let mut fin = vec![0.0f32; 2 * c];
+    let mut fin = vec![0.0f32; rows * c];
     let mut flush = |res: &mut Vec<f32>, cnt: &mut Vec<f32>, wbase: &mut usize, upto: usize| {
         let w = upto - *wbase;
         if w == 0 {
@@ -1190,7 +1268,7 @@ pub fn separate_stream(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec
         assert!(w <= c);
         // The part of [wbase, upto) inside the track (padded positions border .. border + len).
         let (k0, k1) = (border.saturating_sub(*wbase).min(w), (border + len).saturating_sub(*wbase).min(w));
-        for s in 0..2 {
+        for s in 0..rows {
             for k in k0..k1 {
                 let v = res[s * c + k] / cnt[k];
                 fin[s * c + k] = if v.is_nan() { 0.0 } else { v.clamp(f32::MIN, f32::MAX) };
@@ -1199,7 +1277,8 @@ pub fn separate_stream(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec
             res[(s + 1) * c - w..(s + 1) * c].fill(0.0);
         }
         if k0 < k1 {
-            emit(*wbase + k0 - border, &fin[k0..k1], &fin[c + k0..c + k1]);
+            let out: Vec<&[f32]> = (0..rows).map(|s| &fin[s * c + k0..s * c + k1]).collect();
+            emit(*wbase + k0 - border, &out);
         }
         cnt.copy_within(w.., 0);
         cnt[c - w..].fill(0.0);
@@ -1223,11 +1302,12 @@ pub fn separate_stream(wav: &[f32], ch: &Chunking, model: &dyn Fn(&[f32]) -> Vec
             }
         });
         let y = model(&part);
+        assert_eq!(y.len(), rows * c, "model output: {nout} stems x 2 x chunk");
         progress();
         let mut w = base.clone();
         ch.edges(&mut w, i, total);
         let rel = i - wbase;
-        for s in 0..2 {
+        for s in 0..rows {
             for q in 0..length {
                 res[s * c + rel + q] += y[s * c + q] * w[q];
             }
@@ -1365,6 +1445,36 @@ mod tests {
                 let b = demix_reference(&wav, &ch, &model);
                 assert_eq!(calls, ch.chunks(len), "chunk {chunk} n {n} len {len} msst {msst}");
                 assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "chunk {chunk} n {n} len {len} msst {msst}");
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_demix_several_stems() {
+        // Two stems per forward: each must come out exactly as a one-stem model of it would.
+        let m0 = |x: &[f32]| -> Vec<f32> { x.iter().enumerate().map(|(i, v)| v * 0.5 + (i % 7) as f32 * 1e-3).collect() };
+        let m1 = |x: &[f32]| -> Vec<f32> { x.iter().enumerate().map(|(i, v)| v * -0.25 + (i % 5) as f32 * 3e-3).collect() };
+        let both = |x: &[f32]| -> Vec<f32> { m0(x).into_iter().chain(m1(x)).collect() };
+        for (chunk, n, msst) in [(100usize, 2usize, true), (120, 3, true), (100, 2, false), (101, 1, true)] {
+            let step = chunk / n;
+            let ch = Chunking { chunk, step, fade: chunk / 10, border: chunk - step, msst };
+            for len in [1usize, 52, 100, 201, 333, 1037] {
+                let wav: Vec<f32> = (0..2 * len).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+                let mut got = vec![vec![0.0f32; 2 * len]; 2];
+                let mut next = 0;
+                separate_stream_n(&wav, &ch, 2, &both, &mut || {}, &mut |t0, rows| {
+                    assert_eq!(t0, next);
+                    next += rows[0].len();
+                    for (k, r) in rows.iter().enumerate() {
+                        let (stem, c) = (k / 2, k % 2);
+                        got[stem][c * len + t0..c * len + t0 + r.len()].copy_from_slice(r);
+                    }
+                });
+                assert_eq!(next, len);
+                for (stem, m) in [(0, &m0 as &dyn Fn(&[f32]) -> Vec<f32>), (1, &m1)] {
+                    let want = separate_with(&wav, &ch, m, &mut || {});
+                    assert!(got[stem].iter().zip(&want).all(|(x, y)| x.to_bits() == y.to_bits()), "stem {stem} chunk {chunk} n {n} len {len}");
+                }
             }
         }
     }
