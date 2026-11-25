@@ -76,11 +76,11 @@ Pooled over the 26 songs it compares with the current candidate `hyb6` (Demucs o
 - **GPU (RTX 4060, fp32), measured:**
   - Mega with 5 heads takes 0.36 s per audio second (1 head: 0.35).
   - A 3.5 min song took 89 s wall including the model load, with 2.0 GB of GPU memory.
-- **x86 CPU at 1 thread, estimated** (Rust; the box measurements are still to come):
-  - `kim_mega_keys` ≈ 20–21 CPU-s per audio second;
-  - the chain ≈ 11–12;
-  - `hyb6` ≈ 2.
-  - So the Demucs-free recipe costs **about 1.8× the chain's CPU**. The extra is Mega's backbone, about 10.5 CPU-s per audio second.
+- **x86 CPU (box i5-12450H), 1 thread, measured on a full 210 s song** (2026-11-25):
+  - `hyb6` 1.14 CPU-s per audio second; the chain 8.51; PyTorch Mega with 5 heads 15.3 (13.3 long-track).
+  - `kim_mega_keys` ≈ Kim 7.5 + Mega 4 heads ≈ **18 CPU-s per audio second with the Rust Mega port**, ≈ 21 with PyTorch Mega (parts measured; the whole recipe is timed with `-n kimmega` on branch `mega5`).
+  - So the Demucs-free recipe costs **about 2.1× the chain's CPU** (the earlier estimate of 11–12 for the chain was high).
+  - 8 threads cost 1.9–2.3× more CPU-s than 1 thread for the same song (chain 15.9, Mega 35.7): on a box billed per vCPU, one thread per song is the cheapest way to run.
 - **Mac (M1 Pro, 1 thread, shared machine), measured:** Rust `hyb6` 0.65, chain 3.74 and Kim 3.10 CPU-s per audio-s on a 30 s excerpt. PyTorch Mega with 5 heads 9.7 long-track, the same as 1 head.
   - With the Rust `-n megaguitar` rate on the Mac (4.7) standing in for Mega, `kim_mega_keys` ≈ 3.1 + 4.8 ≈ 8 CPU-s per audio-s, against 3.7 for the chain: the same ≈ 2× ratio.
 
@@ -162,28 +162,39 @@ CPU-s per audio-s means CPU seconds per second of audio. "Long-track" rates leav
 - By FLOP count, one head is 0.42 % of a 1-head model: 21 GMAC per chunk against 5.04 TMAC for the backbone. 4 extra heads therefore add about 1.7 % of compute.
 - Round 4's PyTorch measurement on the box was steeper: 0.09 CPU-s per audio-s per head, i.e. 53 heads vs 1 head, 16.0 vs 11.4. That is about +3 % for 4 heads.
 
-### Per recipe, x86 CPU (box), 1 thread: estimates from the parts above
+### x86 CPU (box i5-12450H), measured 2026-11-25
 
-Full songs, Rust. None of these were measured as whole recipes on the box: the box was needed back before the cost runs got that far.
+`r5_box.sh cost` (`r5_cost.sh rust8 mega8 rust1 mega1 rust1full mega1full`), nothing else running on the box. Full song = MUSDB18-HQ test "AM Contra - Heart Peripheral" (210.1 s); excerpt = 30 s. Rust = `main` x86 build, Kim f16 weights; Mega = PyTorch 2.6.0 CPU fp32 (`r5_mega.py`).
 
-| recipe | parts | CPU-s per audio-s (estimate) | weights |
-|---|---|---|---|
-| `hyb6` | htdemucs + htdemucs_6s | ≈ 2 | 139 MB fp16 |
-| `chain` | Kim + both Demucs | ≈ 11–12 | 596 MB |
-| `mega_mix_keys` (Mega only) | Mega, 5 heads | ≈ 10.4 × 1.02–1.03 ≈ **10.7** | 26.3 M + 5 × 12.4 M = 88 M params, **177 MB fp16** |
-| `kim_mega_keys` | Kim + Mega with 4 heads on the instrumental | ≈ 10 + 10.6 ≈ **20–21** | Kim 457 MB + Mega 4 heads 152 MB = 609 MB |
-| round 4's pick (`chain` + Mega guitar) | chain + Mega, 1 head | ≈ 22 | 673 MB |
+| pass | threads | full song: CPU-s / wall-s per audio-s | 30 s excerpt: CPU-s / wall-s | peak RSS |
+|---|---|---|---|---|
+| `hyb6`, Rust | 1 | **1.14** / 1.16 | 1.34 / 1.35 | 0.9 GB |
+| chain, Rust | 1 | **8.51** / 8.54 | 10.73 / 10.77 | 1.2 GB |
+| Kim alone, Rust | 1 | – | 9.40 / 9.42 | 1.0 GB |
+| Mega 5 heads, PyTorch | 1 | **15.3** / 15.3 (13.3 long-track) | 20.3 (12.0 long-track) | 3.5 GB |
+| Mega 1 head, PyTorch | 1 | – | 19.7 (11.7 long-track) | 2.7 GB |
+| `hyb6`, Rust | 8 | 2.43 / **0.44** | 2.83 / 0.52 | 1.1 GB |
+| chain, Rust | 8 | 15.9 / **2.22** | 20.0 / 2.80 | 1.3 GB |
+| Kim alone, Rust | 8 | 13.5 / 1.77 | 17.2 / 2.27 | 1.2 GB |
+| Mega 5 heads, PyTorch | 8 | 35.7 / **4.91** (31.2 long-track) | 51.4 / 7.14 | 3.5 GB |
+| Mega 4 heads on Kim's instrumental, PyTorch | 8 | – | 50.9 / 7.08 | 3.0 GB |
+| Mega 1 head, PyTorch | 8 | – | 50.2 / 6.97 | 2.7 GB |
 
-**Rust port, 5 heads (estimate only; the port was not changed).**
-- `-n megaguitar` runs the backbone plus one head. Exporting four or five heads should cost about 2–3 % more CPU (from the head share above), so ≈ 10.7 CPU-s per audio-s at 1 thread on the box and ≈ 22 at 8 threads.
-- The memory cost is the extra heads: + 50 MB fp16 each (+ 100 MB widened to fp32 at load), and the output buffers grow from two stems to five.
-- The cheaper settings in the README carry over to every head: 10 s chunks keep all but 0.03 dB of guitar for 32 % less CPU.
+- **Heads are almost free on x86 too:** 5 heads vs 1 cost +3 % at 1 thread and +2 % at 8 threads.
+- **Threads cost CPU.** The same song at 8 threads takes 1.9× (chain) to 2.3× (Mega) the CPU-s it takes at 1 thread (the i5-12450H has 4 P-cores with hyper-threading and 4 E-cores). Billed per vCPU, one thread per song is the cheapest.
 
-**Still to come, on the box tonight:**
-- x86 1-thread and 8-thread timings of `hyb6`, the chain and Kim alone, on the 30 s excerpt and the full song (`r5_cost.sh rust8 rust1 rust1full`);
-- PyTorch Mega with 5 heads at 1 and 8 threads (`mega8 mega1 mega1full`).
+### Per recipe, x86, 1 thread
 
-Only the three GPU lines above were measured before the box was needed back.
+| recipe | CPU-s per audio-s | how | weights | 4-min song, vCPU-min | songs per 375 vCPU-min ($5 Cloudflare plan) |
+|---|---|---|---|---|---|
+| `hyb6` | **1.14** | measured | 139 MB fp16 | 4.6 | ≈ 82 |
+| `chain` | **8.51** | measured | 596 MB | 34 | ≈ 11 |
+| `kim_mega_keys`, Rust Mega | ≈ **18** | Kim 7.5 (chain × 9.40/10.73, the excerpt ratio) + Rust `megaguitar` 10.4 × 1.02 | Kim 457 MB + Mega 4 heads 152 MB = 609 MB | ≈ 72 | ≈ 5 |
+| `kim_mega_keys`, Rust Mega, 10 s chunks + overlap 1 (−0.12 dB guitar) | ≈ 11 | Mega × 0.31 (README) | same | ≈ 43 | ≈ 9 |
+| `kim_mega_keys`, PyTorch Mega | ≈ 21 | Kim 7.5 + 13.3 | same | ≈ 84 | ≈ 4.5 |
+| `mega_mix_keys` (Mega only), Rust | ≈ 10.6 | | 177 MB fp16 | ≈ 42 | ≈ 9 |
+
+The whole `kim_mega_keys` recipe in Rust is `-n kimmega` (branch `mega5`, being timed on x86 there).
 
 ## Caveats
 
@@ -203,7 +214,7 @@ Only the three GPU lines above were measured before the box was needed back.
 - **Unity remixes.** These are unity-gain sums with no EQ, compression or reverb, drier than released mixes. Absolute dB will differ on commercial songs; the ranking is what carries over (round 4).
 - **Short items.** `cmtx` excerpts are 18–39 s, and `cmt8` is 90 s of each song.
 - **Cost.**
-  - The x86 CPU figures per recipe are estimates from separately measured parts. The direct box runs are still to come.
+  - x86 timings of `hyb6`, the chain, Kim and PyTorch Mega were measured on the box. `kim_mega_keys` in Rust is still the sum of measured parts until `-n kimmega` is timed.
   - The Mac timings ran on a shared machine (another agent was using it). Treat them as indicative and the CPU time as the more reliable number.
 
 ## Recommendation
@@ -225,12 +236,12 @@ Only the three GPU lines above were measured before the box was needed back.
 4. **Before shipping:**
    - ~~Check the drum loss on brushes / percussion~~: done, adding percussion heads does not help (item 5).
    - Do a blind listen of the "other" stem on two or three songs without "other" parts.
-   - Re-time on x86.
+   - ~~Re-time on x86~~: done (*Cost*).
 
 ## What to try next
 
 1. ~~**Drums + percussion heads.**~~ Done: −0.10 dB, no gain (see *Findings* 5).
-2. **The box cost runs** (`r5_box.sh cost`), as listed above.
+2. ~~**The box cost runs**~~: done (*Cost*).
 3. **Vocals ensemble.** Mega's vocals beat Kim's on 5 of 26 songs, by up to 3.7 dB (JetB). Averaging the two might beat either, but it needs Mega's `vocal` head on the mix, a second Mega pass of about 10 CPU-s per audio-s. Score it on these 26 songs before paying for it.
 4. **A Rust export of 4–5 Mega heads** (backbone + `drums`, `bass`, `guitar`, `keys`), and parity against `r5_mega.py`.
 
